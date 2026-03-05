@@ -58,6 +58,10 @@ class CreateQuickReply(BaseModel):
     title: str
     content: str
 
+class UpdateCopilotPrompt(BaseModel):
+    tenant_id: str
+    copilot_prompt: str
+
 # ── Health ───────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -124,14 +128,12 @@ async def process_message(payload: dict):
         if conv_res.data:
             conversation = conv_res.data[0]
             conv_id = conversation["id"]
-            # Atualiza last_message_at e unread_count
             supabase.table("conversations").update({
                 "last_message_at": datetime.utcnow().isoformat(),
                 "unread_count": conversation["unread_count"] + 1,
                 "updated_at": datetime.utcnow().isoformat(),
             }).eq("id", conv_id).execute()
         else:
-            # Cria nova conversa
             new_conv = supabase.table("conversations").insert({
                 "tenant_id": tenant_id,
                 "contact_id": contact_id,
@@ -208,7 +210,6 @@ async def resolve_conversation(conv_id: str):
 # ── MESSAGES ─────────────────────────────────────────────
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str):
-    # Zera unread
     supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
     res = supabase.table("messages")\
         .select("*, users!sent_by(name)")\
@@ -218,7 +219,6 @@ async def get_messages(conv_id: str):
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def send_message(conv_id: str, body: SendMessage):
-    # Busca conversa + contato
     conv = supabase.table("conversations")\
         .select("*, contacts(phone), tenants(waha_session)")\
         .eq("id", conv_id).single().execute().data
@@ -227,10 +227,8 @@ async def send_message(conv_id: str, body: SendMessage):
     session = conv["tenants"]["waha_session"]
     chat_id = f"{phone}@c.us"
 
-    # Envia pelo WAHA
     await waha_send(session, chat_id, body.text)
 
-    # Salva no banco
     res = supabase.table("messages").insert({
         "conversation_id": conv_id,
         "tenant_id": conv["tenant_id"],
@@ -240,7 +238,6 @@ async def send_message(conv_id: str, body: SendMessage):
         "sent_by": body.sent_by,
     }).execute()
 
-    # Atualiza last_message_at
     supabase.table("conversations").update({
         "last_message_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
@@ -297,11 +294,13 @@ async def ai_suggest(conv_id: str):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
 
-    # Busca últimas 10 mensagens + info do tenant
+    # Busca últimas 10 mensagens
     msgs = supabase.table("messages")\
         .select("direction, content, created_at")\
         .eq("conversation_id", conv_id)\
-        .order("created_at", desc=True).limit(10).execute().data
+        .order("created_at", desc=True)\
+        .limit(10)\
+        .execute().data
     msgs.reverse()
 
     conv = supabase.table("conversations")\
@@ -334,13 +333,27 @@ async def ai_suggest(conv_id: str):
         data = r.json()
         suggestion = data["content"][0]["text"]
 
-    # Salva sugestão na última mensagem inbound
-    last_inbound = next((m for m in reversed(msgs) if m["direction"] == "inbound"), None)
-    if last_inbound:
-        supabase.table("messages")\
-            .update({"ai_suggestion": suggestion})\
-            .eq("conversation_id", conv_id)\
-            .eq("direction", "inbound")\
-            .order("created_at", desc=True).limit(1).execute()
+    # ✅ CORRIGIDO: sem .order().limit() no update
+    supabase.table("messages")\
+        .update({"ai_suggestion": suggestion})\
+        .eq("conversation_id", conv_id)\
+        .eq("direction", "inbound")\
+        .execute()
 
     return {"suggestion": suggestion}
+
+# ── TENANT CONFIG ─────────────────────────────────────────
+@app.get("/tenant", dependencies=[Depends(verify_key)])
+async def get_tenant(tenant_id: str):
+    res = supabase.table("tenants")\
+        .select("id, name, plan, copilot_prompt")\
+        .eq("id", tenant_id).single().execute()
+    return res.data
+
+@app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
+async def update_copilot_prompt(body: UpdateCopilotPrompt):
+    res = supabase.table("tenants").update({
+        "copilot_prompt": body.copilot_prompt,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", body.tenant_id).execute()
+    return {"ok": True, "tenant": res.data[0]}
