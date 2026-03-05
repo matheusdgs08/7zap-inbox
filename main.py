@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, json
+import httpx, os, json, uuid
 from datetime import datetime
 
 app = FastAPI(title="7zap Inbox API", version="1.0.0")
@@ -42,12 +42,16 @@ class SendMessage(BaseModel):
     conversation_id: str
     text: str
     sent_by: Optional[str] = None
+    is_internal_note: Optional[bool] = False
 
 class AssignConversation(BaseModel):
     user_id: Optional[str] = None
 
 class UpdateKanban(BaseModel):
     stage: str
+
+class UpdateLabels(BaseModel):
+    labels: List[dict]
 
 class CreateTask(BaseModel):
     title: str
@@ -67,10 +71,9 @@ class UpdateCopilotPrompt(BaseModel):
 async def health():
     return {"status": "ok", "service": "7zap-inbox"}
 
-# ── WEBHOOK (recebe mensagens do WAHA via relay) ─────────
+# ── WEBHOOK ──────────────────────────────────────────────
 @app.post("/webhook/inbox")
 async def webhook_inbox(payload: dict, background_tasks: BackgroundTasks):
-    """Recebe eventos do WAHA e processa em background"""
     event = payload.get("event", "")
     if event in ("message", "message.any"):
         background_tasks.add_task(process_message, payload)
@@ -81,7 +84,6 @@ async def process_message(payload: dict):
         session = payload.get("session", "default")
         msg = payload.get("payload", {})
 
-        # Ignora mensagens enviadas pelo próprio número
         if msg.get("fromMe"):
             return
 
@@ -95,7 +97,6 @@ async def process_message(payload: dict):
         if not phone or not body:
             return
 
-        # Busca tenant pela sessão WAHA
         tenant_res = supabase.table("tenants").select("*").eq("waha_session", session).single().execute()
         if not tenant_res.data:
             print(f"[INBOX] Tenant não encontrado para sessão: {session}")
@@ -104,7 +105,6 @@ async def process_message(payload: dict):
         tenant = tenant_res.data
         tenant_id = tenant["id"]
 
-        # Upsert contact
         contact_res = supabase.table("contacts").upsert({
             "tenant_id": tenant_id,
             "phone": phone,
@@ -115,7 +115,6 @@ async def process_message(payload: dict):
         contact = contact_res.data[0]
         contact_id = contact["id"]
 
-        # Busca conversa aberta ou cria nova
         conv_res = supabase.table("conversations")\
             .select("*")\
             .eq("tenant_id", tenant_id)\
@@ -144,7 +143,6 @@ async def process_message(payload: dict):
             }).execute()
             conv_id = new_conv.data[0]["id"]
 
-        # Salva mensagem (evita duplicata)
         existing = supabase.table("messages").select("id").eq("waha_message_id", waha_msg_id).execute()
         if not existing.data:
             supabase.table("messages").insert({
@@ -173,7 +171,14 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, stage
     if stage:
         query = query.eq("kanban_stage", stage)
     res = query.execute()
-    return {"conversations": res.data}
+
+    convs = []
+    for c in (res.data or []):
+        c["assigned_agent"] = (c.get("users") or {}).get("name")
+        if not isinstance(c.get("labels"), list):
+            c["labels"] = []
+        convs.append(c)
+    return {"conversations": convs}
 
 @app.get("/conversations/{conv_id}", dependencies=[Depends(verify_key)])
 async def get_conversation(conv_id: str):
@@ -207,6 +212,14 @@ async def resolve_conversation(conv_id: str):
     }).eq("id", conv_id).execute()
     return res.data[0]
 
+@app.put("/conversations/{conv_id}/labels", dependencies=[Depends(verify_key)])
+async def update_labels(conv_id: str, body: UpdateLabels):
+    res = supabase.table("conversations").update({
+        "labels": body.labels,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", conv_id).execute()
+    return res.data[0]
+
 # ── MESSAGES ─────────────────────────────────────────────
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str):
@@ -223,11 +236,12 @@ async def send_message(conv_id: str, body: SendMessage):
         .select("*, contacts(phone), tenants(waha_session)")\
         .eq("id", conv_id).single().execute().data
 
-    phone = conv["contacts"]["phone"]
-    session = conv["tenants"]["waha_session"]
-    chat_id = f"{phone}@c.us"
-
-    await waha_send(session, chat_id, body.text)
+    # Notas internas NÃO são enviadas pelo WhatsApp
+    if not body.is_internal_note:
+        phone = conv["contacts"]["phone"]
+        session = conv["tenants"]["waha_session"]
+        chat_id = f"{phone}@c.us"
+        await waha_send(session, chat_id, body.text)
 
     res = supabase.table("messages").insert({
         "conversation_id": conv_id,
@@ -236,6 +250,7 @@ async def send_message(conv_id: str, body: SendMessage):
         "content": body.text,
         "type": "chat",
         "sent_by": body.sent_by,
+        "is_internal_note": body.is_internal_note or False,
     }).execute()
 
     supabase.table("conversations").update({
@@ -249,28 +264,35 @@ async def send_message(conv_id: str, body: SendMessage):
 @app.get("/tasks", dependencies=[Depends(verify_key)])
 async def list_tasks(tenant_id: str, assigned_to: Optional[str] = None):
     query = supabase.table("tasks")\
-        .select("*, conversations(id), users!assigned_to(name)")\
-        .eq("tenant_id", tenant_id).eq("done", False)
+        .select("*, conversations(id, tenant_id), users!assigned_to(name)")\
+        .eq("done", False)
     if assigned_to:
         query = query.eq("assigned_to", assigned_to)
     res = query.order("due_at").execute()
-    return {"tasks": res.data}
+    tasks = [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]
+    return {"tasks": tasks}
 
 @app.post("/conversations/{conv_id}/tasks", dependencies=[Depends(verify_key)])
 async def create_task(conv_id: str, body: CreateTask, tenant_id: str):
     res = supabase.table("tasks").insert({
-        "tenant_id": tenant_id,
         "conversation_id": conv_id,
         "title": body.title,
-        "assigned_to": body.assigned_to,
-        "due_at": body.due_at,
+        "assigned_to": body.assigned_to or None,
+        "due_at": body.due_at or None,
+        "done": False,
     }).execute()
-    return res.data[0]
+    return {"task": res.data[0]}
 
 @app.put("/tasks/{task_id}/done", dependencies=[Depends(verify_key)])
 async def complete_task(task_id: str):
-    res = supabase.table("tasks").update({"done": True}).eq("id", task_id).execute()
-    return res.data[0]
+    supabase.table("tasks").update({"done": True}).eq("id", task_id).execute()
+    return {"ok": True}
+
+# ── USERS ─────────────────────────────────────────────────
+@app.get("/users", dependencies=[Depends(verify_key)])
+async def list_users(tenant_id: str):
+    res = supabase.table("users").select("id, name, email, role").eq("tenant_id", tenant_id).execute()
+    return {"users": res.data}
 
 # ── QUICK REPLIES ─────────────────────────────────────────
 @app.get("/quick-replies", dependencies=[Depends(verify_key)])
@@ -290,18 +312,19 @@ async def create_quick_reply(body: CreateQuickReply, tenant_id: str):
 # ── CO-PILOT IA ───────────────────────────────────────────
 @app.get("/conversations/{conv_id}/suggest", dependencies=[Depends(verify_key)])
 async def ai_suggest(conv_id: str):
-    """Co-pilot: sugere resposta baseada no histórico da conversa"""
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
 
-    # Busca últimas 10 mensagens
     msgs = supabase.table("messages")\
-        .select("direction, content, created_at")\
+        .select("direction, content, created_at, is_internal_note")\
         .eq("conversation_id", conv_id)\
         .order("created_at", desc=True)\
         .limit(10)\
         .execute().data
     msgs.reverse()
+
+    # Ignora notas internas no contexto do co-pilot
+    msgs = [m for m in msgs if not m.get("is_internal_note")]
 
     conv = supabase.table("conversations")\
         .select("*, tenants(copilot_prompt, name)")\
@@ -333,7 +356,6 @@ async def ai_suggest(conv_id: str):
         data = r.json()
         suggestion = data["content"][0]["text"]
 
-    # ✅ CORRIGIDO: sem .order().limit() no update
     supabase.table("messages")\
         .update({"ai_suggestion": suggestion})\
         .eq("conversation_id", conv_id)\
