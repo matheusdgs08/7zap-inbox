@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, uuid
+import httpx, os
 from datetime import datetime
 
 app = FastAPI(title="7zap Inbox API", version="1.0.0")
@@ -168,6 +168,10 @@ async def resolve_conversation(conv_id: str):
 async def reopen_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "open", "kanban_stage": "new", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
+@app.put("/conversations/{conv_id}/pending", dependencies=[Depends(verify_key)])
+async def pending_conversation(conv_id: str):
+    return supabase.table("conversations").update({"status": "pending", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
+
 @app.put("/conversations/{conv_id}/labels", dependencies=[Depends(verify_key)])
 async def update_labels(conv_id: str, body: UpdateLabels):
     return supabase.table("conversations").update({"labels": body.labels, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
@@ -176,8 +180,7 @@ async def update_labels(conv_id: str, body: UpdateLabels):
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str):
     supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
-    res = supabase.table("messages").select("*, users!sent_by(name)").eq("conversation_id", conv_id).order("created_at").execute()
-    return {"messages": res.data}
+    return {"messages": supabase.table("messages").select("*, users!sent_by(name)").eq("conversation_id", conv_id).order("created_at").execute().data}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def send_message(conv_id: str, body: SendMessage):
@@ -198,18 +201,15 @@ async def list_tasks(tenant_id: str, assigned_to: Optional[str] = None):
     query = supabase.table("tasks").select("*, conversations(id, tenant_id), users!assigned_to(name)").eq("done", False)
     if assigned_to: query = query.eq("assigned_to", assigned_to)
     res = query.order("due_at").execute()
-    tasks = [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]
-    return {"tasks": tasks}
+    return {"tasks": [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]}
 
 @app.post("/conversations/{conv_id}/tasks", dependencies=[Depends(verify_key)])
 async def create_task(conv_id: str, body: CreateTask, tenant_id: str):
     res = supabase.table("tasks").insert({
-        "conversation_id": conv_id,
-        "title": body.title,
+        "conversation_id": conv_id, "title": body.title,
         "description": body.description or None,
         "assigned_to": body.assigned_to or None,
-        "due_at": body.due_at or None,
-        "done": False,
+        "due_at": body.due_at or None, "done": False,
     }).execute()
     return {"task": res.data[0]}
 
@@ -221,14 +221,12 @@ async def complete_task(task_id: str):
 # ── TASK UPDATES ──────────────────────────────────────────
 @app.get("/tasks/{task_id}/updates", dependencies=[Depends(verify_key)])
 async def get_task_updates(task_id: str):
-    res = supabase.table("task_updates").select("*").eq("task_id", task_id).order("created_at").execute()
-    return {"updates": res.data or []}
+    return {"updates": supabase.table("task_updates").select("*").eq("task_id", task_id).order("created_at").execute().data or []}
 
 @app.post("/tasks/{task_id}/updates", dependencies=[Depends(verify_key)])
 async def add_task_update(task_id: str, body: CreateTaskUpdate):
     res = supabase.table("task_updates").insert({
-        "task_id": task_id,
-        "content": body.content,
+        "task_id": task_id, "content": body.content,
         "created_by": body.created_by or "Atendente",
     }).execute()
     return {"update": res.data[0]}
@@ -236,19 +234,16 @@ async def add_task_update(task_id: str, body: CreateTaskUpdate):
 # ── USERS ─────────────────────────────────────────────────
 @app.get("/users", dependencies=[Depends(verify_key)])
 async def list_users(tenant_id: str):
-    res = supabase.table("users").select("id, name, email, role").eq("tenant_id", tenant_id).execute()
-    return {"users": res.data}
+    return {"users": supabase.table("users").select("id, name, email, role").eq("tenant_id", tenant_id).execute().data}
 
 # ── QUICK REPLIES ─────────────────────────────────────────
 @app.get("/quick-replies", dependencies=[Depends(verify_key)])
 async def list_quick_replies(tenant_id: str):
-    res = supabase.table("quick_replies").select("*").eq("tenant_id", tenant_id).execute()
-    return {"quick_replies": res.data}
+    return {"quick_replies": supabase.table("quick_replies").select("*").eq("tenant_id", tenant_id).execute().data}
 
 @app.post("/quick-replies", dependencies=[Depends(verify_key)])
 async def create_quick_reply(body: CreateQuickReply, tenant_id: str):
-    res = supabase.table("quick_replies").insert({"tenant_id": tenant_id, "title": body.title, "content": body.content}).execute()
-    return res.data[0]
+    return supabase.table("quick_replies").insert({"tenant_id": tenant_id, "title": body.title, "content": body.content}).execute().data[0]
 
 # ── CO-PILOT IA ───────────────────────────────────────────
 @app.get("/conversations/{conv_id}/suggest", dependencies=[Depends(verify_key)])
@@ -256,8 +251,7 @@ async def ai_suggest(conv_id: str):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
     msgs = supabase.table("messages").select("direction, content, is_internal_note").eq("conversation_id", conv_id).order("created_at", desc=True).limit(10).execute().data
-    msgs.reverse()
-    msgs = [m for m in msgs if not m.get("is_internal_note")]
+    msgs = [m for m in reversed(msgs) if not m.get("is_internal_note")]
     conv = supabase.table("conversations").select("*, tenants(copilot_prompt, name)").eq("id", conv_id).single().execute().data
     system_prompt = conv["tenants"].get("copilot_prompt") or f"Você é um atendente da empresa {conv['tenants']['name']}. Seja simpático e objetivo."
     history = "\n".join([f"{'Cliente' if m['direction']=='inbound' else 'Atendente'}: {m['content']}" for m in msgs])
@@ -265,7 +259,9 @@ async def ai_suggest(conv_id: str):
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 300, "system": system_prompt + "\n\nSugira apenas a próxima resposta do atendente, sem explicações. Seja breve e natural.", "messages": [{"role": "user", "content": f"Histórico:\n{history}\n\nSugira a próxima resposta do atendente:"}]},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 300,
+                  "system": system_prompt + "\n\nSugira apenas a próxima resposta do atendente, sem explicações. Seja breve e natural.",
+                  "messages": [{"role": "user", "content": f"Histórico:\n{history}\n\nSugira a próxima resposta do atendente:"}]},
         )
         suggestion = r.json()["content"][0]["text"]
     supabase.table("messages").update({"ai_suggestion": suggestion}).eq("conversation_id", conv_id).eq("direction", "inbound").execute()
