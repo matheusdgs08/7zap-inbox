@@ -236,6 +236,17 @@ async def receive_message(payload: dict):
             dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
             if dup: continue
 
+        # Fallback dedup: mesma mensagem na mesma conversa nos últimos 15s
+        # (cobre casos onde WAHA dispara webhook 2x com IDs diferentes)
+        recent_cutoff = (datetime.utcnow() - timedelta(seconds=15)).isoformat()
+        dup_recent = supabase.table("messages").select("id") \
+            .eq("conversation_id", conv_id) \
+            .eq("content", content) \
+            .eq("direction", "inbound") \
+            .gte("created_at", recent_cutoff) \
+            .execute().data
+        if dup_recent: continue
+
         supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
         # Invalida cache para forçar reload no frontend
