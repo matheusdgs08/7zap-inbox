@@ -668,22 +668,30 @@ async def whatsapp_sync(body: dict):
 
         for chat in chats:
             try:
-                chat_id = chat.get("id", "")
-                if not chat_id or "@g.us" in chat_id:  # Pula grupos
+                # O id pode ser string ou objeto {server, user, _serialized}
+                raw_id = chat.get("id", "")
+                if isinstance(raw_id, dict):
+                    serialized = raw_id.get("_serialized", "")
+                    phone_raw  = raw_id.get("user", "")
+                    is_group   = raw_id.get("server", "") == "g.us"
+                else:
+                    serialized = str(raw_id)
+                    phone_raw  = serialized
+                    is_group   = "@g.us" in serialized
+
+                # Pula grupos
+                if is_group or chat.get("isGroup"):
                     continue
 
-                # Extrai telefone — remove sufixos do WhatsApp
-                # chat_id pode vir como "5511999999999@s.whatsapp.net" ou "5511999999999@c.us"
-                phone = chat_id.replace("@s.whatsapp.net", "").replace("@c.us", "").replace("+", "").strip()
-                # Remove qualquer caracter não numérico que não seja dígito
-                phone = "".join(c for c in phone if c.isdigit())
+                # Extrai só os dígitos do telefone
+                phone = "".join(c for c in phone_raw if c.isdigit())
                 if not phone or len(phone) < 8:
                     stats["skipped"] += 1
                     continue
 
                 name = chat.get("name") or chat.get("displayName") or phone
 
-                # Upsert contato — cria se não existir, atualiza nome se existir
+                # Upsert contato
                 existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
                 if existing:
                     contact_id = existing[0]["id"]
@@ -697,73 +705,70 @@ async def whatsapp_sync(body: dict):
                 if existing_conv:
                     conv_id = existing_conv[0]["id"]
                 else:
-                    conv = supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": 0}).execute().data
+                    conv = supabase.table("conversations").insert({
+                        "tenant_id": tenant_id,
+                        "contact_id": contact_id,
+                        "status": "open",
+                        "kanban_stage": "new",
+                        "unread_count": chat.get("unreadCount", 0)
+                    }).execute().data
                     conv_id = conv[0]["id"]
                     stats["conversations_created"] += 1
 
-                # Busca mensagens — tenta as duas rotas
-                messages = []
-                for msg_route in [
-                    f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=100",
-                    f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=100&downloadMedia=false",
-                ]:
-                    try:
-                        msgs_r = await client.get(msg_route, headers=waha_headers(), timeout=15)
-                        if msgs_r.status_code == 200:
-                            data = msgs_r.json()
-                            messages = data if isinstance(data, list) else data.get("messages", [])
-                            break
-                    except:
-                        continue
+                # Usa lastMessage que já vem no chat — evita segunda requisição que falha
+                # A WAHA não suporta buscar histórico completo por chat via API
+                last_msg = chat.get("lastMessage")
+                if last_msg:
+                    msg_ts = last_msg.get("timestamp", 0)
+                    if isinstance(msg_ts, int) and msg_ts < 10000000000:
+                        msg_ts = msg_ts * 1000  # segundos → ms
 
-                for msg in messages:
-                    # Filtra por data — só importa mensagens dentro do período do plano
-                    msg_ts = msg.get("timestamp", 0)
-                    if isinstance(msg_ts, float):
-                        msg_ts = int(msg_ts * 1000)
-                    elif isinstance(msg_ts, int) and msg_ts < 10000000000:
-                        msg_ts = msg_ts * 1000  # converte segundos para ms
-                    if msg_ts and msg_ts < since_ts:
-                        continue
+                    if msg_ts >= since_ts:
+                        # id da mensagem pode ser string ou objeto
+                        raw_msg_id = last_msg.get("id", {})
+                        if isinstance(raw_msg_id, dict):
+                            waha_id = raw_msg_id.get("_serialized", "")
+                        else:
+                            waha_id = str(raw_msg_id)
 
-                    # Extrai conteúdo da mensagem
-                    msg_type = "text"
-                    body_field = msg.get("body") or msg.get("text") or msg.get("content") or ""
-                    caption = msg.get("caption", "")
-                    msg_content = body_field or caption or ""
+                        # Evita duplicata
+                        already = False
+                        if waha_id:
+                            dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
+                            already = bool(dup)
 
-                    if not msg_content:
-                        media_type = msg.get("type", msg.get("mediaType", ""))
-                        if "image" in media_type:    msg_content = "[Imagem]";    msg_type = "image"
-                        elif "audio" in media_type:  msg_content = "[Áudio]";     msg_type = "audio"
-                        elif "video" in media_type:  msg_content = "[Vídeo]";     msg_type = "video"
-                        elif "doc" in media_type or "pdf" in media_type: msg_content = "[Documento]"; msg_type = "document"
-                        elif "sticker" in media_type: msg_content = "[Sticker]"
-                        else: msg_content = "[Mensagem]"
+                        if not already:
+                            msg_content = last_msg.get("body") or last_msg.get("text") or ""
+                            msg_type_raw = last_msg.get("type", "chat")
+                            if not msg_content:
+                                if "image" in msg_type_raw:    msg_content = "[Imagem]";    msg_type = "image"
+                                elif "audio" in msg_type_raw:  msg_content = "[Áudio]";     msg_type = "audio"
+                                elif "video" in msg_type_raw:  msg_content = "[Vídeo]";     msg_type = "video"
+                                elif "document" in msg_type_raw: msg_content = "[Documento]"; msg_type = "document"
+                                elif "sticker" in msg_type_raw: msg_content = "[Sticker]";  msg_type = "text"
+                                else: msg_content = "[Mensagem]"; msg_type = "text"
+                            else:
+                                msg_type = "text"
 
-                    direction  = "outbound" if msg.get("fromMe") else "inbound"
-                    waha_id    = str(msg.get("id", ""))
-                    created_at = datetime.utcfromtimestamp(msg_ts / 1000).isoformat() if msg_ts else datetime.utcnow().isoformat()
+                            direction  = "outbound" if last_msg.get("fromMe") else "inbound"
+                            created_at = datetime.utcfromtimestamp(msg_ts / 1000).isoformat()
 
-                    # Evita duplicatas pelo waha_id
-                    if waha_id:
-                        dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
-                        if dup:
-                            continue
+                            supabase.table("messages").insert({
+                                "conversation_id": conv_id,
+                                "direction": direction,
+                                "content": msg_content,
+                                "type": msg_type,
+                                "is_internal_note": False,
+                                "waha_id": waha_id,
+                                "created_at": created_at,
+                            }).execute()
+                            stats["messages_saved"] += 1
 
-                    supabase.table("messages").insert({
-                        "conversation_id": conv_id,
-                        "direction": direction,
-                        "content": msg_content,
-                        "type": msg_type,
-                        "is_internal_note": False,
-                        "waha_id": waha_id,
-                        "created_at": created_at,
-                    }).execute()
-                    stats["messages_saved"] += 1
-
-                # Atualiza timestamp da última mensagem na conversa
-                supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
+                # Atualiza last_message_at da conversa
+                last_ts = chat.get("timestamp", 0)
+                if last_ts:
+                    last_dt = datetime.utcfromtimestamp(last_ts).isoformat()
+                    supabase.table("conversations").update({"last_message_at": last_dt}).eq("id", conv_id).execute()
 
             except Exception as e:
                 stats["skipped"] += 1
