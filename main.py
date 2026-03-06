@@ -920,3 +920,198 @@ async def sync_single_chat(body: dict):
             saved += 1
 
     return {"ok": True, "messages_saved": saved}
+
+# ── RECUPERAÇÃO DE SENHA ──────────────────────────────────
+
+@app.post("/auth/forgot-password")
+async def forgot_password(body: dict):
+    """Gera token de reset e envia email (ou retorna link para admin compartilhar)."""
+    email = (body.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email obrigatório")
+
+    # Busca usuário
+    users = supabase.table("users").select("id,name,email,tenant_id").eq("email", email).eq("is_active", True).execute().data
+    if not users:
+        # Não revela se email existe ou não (segurança)
+        return {"ok": True, "message": "Se o email existir, você receberá as instruções."}
+
+    user = users[0]
+
+    # Gera token único
+    token = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=48))
+    expires_at = (datetime.utcnow() + timedelta(hours=2)).isoformat()
+
+    # Salva token no banco
+    supabase.table("password_resets").upsert({
+        "user_id": user["id"],
+        "token": token,
+        "expires_at": expires_at,
+        "used": False
+    }, on_conflict="user_id").execute()
+
+    reset_url = f"https://7zap-inbox-frontend.vercel.app/?reset={token}"
+
+    # Tenta enviar email via SMTP se configurado
+    SMTP_HOST = os.getenv("SMTP_HOST", "")
+    SMTP_USER = os.getenv("SMTP_USER", "")
+    SMTP_PASS = os.getenv("SMTP_PASS", "")
+    SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+
+    email_sent = False
+    if SMTP_HOST and SMTP_USER and SMTP_PASS:
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = "Recuperação de senha — 7CRM"
+            msg["From"] = f"7CRM <{SMTP_FROM}>"
+            msg["To"] = user["email"]
+            html = f"""
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#0d0d18;color:#e8e8f0;border-radius:12px">
+              <h2 style="color:#00c853">🔐 Recuperar senha</h2>
+              <p>Olá, <strong>{user['name']}</strong>!</p>
+              <p>Clique no botão abaixo para redefinir sua senha. O link expira em <strong>2 horas</strong>.</p>
+              <a href="{reset_url}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:#00c853;color:#000;border-radius:8px;font-weight:700;text-decoration:none">Redefinir senha</a>
+              <p style="color:#555;font-size:12px">Se você não solicitou isso, ignore este email. Sua senha não será alterada.</p>
+              <p style="color:#555;font-size:12px">Link: {reset_url}</p>
+            </div>"""
+            msg.attach(MIMEText(html, "html"))
+            with smtplib.SMTP_SSL(SMTP_HOST, 465) as smtp:
+                smtp.login(SMTP_USER, SMTP_PASS)
+                smtp.sendmail(SMTP_FROM, user["email"], msg.as_string())
+            email_sent = True
+        except Exception as e:
+            pass
+
+    return {
+        "ok": True,
+        "message": "Se o email existir, você receberá as instruções.",
+        "reset_url": reset_url if not email_sent else None,  # retorna URL se email não enviado
+        "email_sent": email_sent
+    }
+
+
+@app.post("/auth/reset-password")
+async def reset_password(body: dict):
+    """Valida token e redefine a senha."""
+    token = (body.get("token") or "").strip()
+    new_password = body.get("password") or ""
+
+    if not token or not new_password:
+        raise HTTPException(status_code=400, detail="Token e senha obrigatórios")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+
+    # Busca token válido
+    resets = supabase.table("password_resets").select("*").eq("token", token).eq("used", False).execute().data
+    if not resets:
+        raise HTTPException(status_code=400, detail="Link inválido ou expirado")
+
+    reset = resets[0]
+    expires_at = datetime.fromisoformat(reset["expires_at"].replace("Z", ""))
+    if datetime.utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="Link expirado. Solicite um novo.")
+
+    # Atualiza senha
+    pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    supabase.table("users").update({"password_hash": pw_hash}).eq("id", reset["user_id"]).execute()
+
+    # Marca token como usado
+    supabase.table("password_resets").update({"used": True}).eq("token", token).execute()
+
+    return {"ok": True, "message": "Senha redefinida com sucesso!"}
+
+
+# ── CONVITES ──────────────────────────────────────────────
+
+@app.post("/auth/invite", dependencies=[Depends(verify_key)])
+async def create_invite(body: dict, admin=Depends(require_admin)):
+    """Admin gera código de convite para novo atendente."""
+    tenant_id = admin["tenant_id"]
+
+    code = "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=8))
+    expires_at = (datetime.utcnow() + timedelta(days=7)).isoformat()
+
+    supabase.table("invite_codes").insert({
+        "code": code,
+        "tenant_id": tenant_id,
+        "created_by": admin["sub"],
+        "expires_at": expires_at,
+        "used": False
+    }).execute()
+
+    invite_url = f"https://7zap-inbox-frontend.vercel.app/?invite={code}"
+    return {"ok": True, "code": code, "invite_url": invite_url, "expires_at": expires_at}
+
+
+@app.get("/auth/invite/{code}")
+async def validate_invite(code: str):
+    """Valida se código de convite é válido antes de mostrar o formulário."""
+    invites = supabase.table("invite_codes").select("*, tenants(name)").eq("code", code.upper()).eq("used", False).execute().data
+    if not invites:
+        raise HTTPException(status_code=404, detail="Convite inválido ou já utilizado")
+    invite = invites[0]
+    expires_at = datetime.fromisoformat(invite["expires_at"].replace("Z", ""))
+    if datetime.utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="Convite expirado")
+    return {
+        "ok": True,
+        "tenant_name": (invite.get("tenants") or {}).get("name", ""),
+        "tenant_id": invite["tenant_id"],
+        "code": code.upper()
+    }
+
+
+@app.post("/auth/register")
+async def register_with_invite(body: dict):
+    """Novo usuário se cadastra usando código de convite."""
+    code    = (body.get("invite_code") or "").strip().upper()
+    name    = (body.get("name") or "").strip()
+    email   = (body.get("email") or "").lower().strip()
+    password = body.get("password") or ""
+
+    if not all([code, name, email, password]):
+        raise HTTPException(status_code=400, detail="Todos os campos são obrigatórios")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+
+    # Valida convite
+    invites = supabase.table("invite_codes").select("*").eq("code", code).eq("used", False).execute().data
+    if not invites:
+        raise HTTPException(status_code=404, detail="Convite inválido ou já utilizado")
+    invite = invites[0]
+    expires_at = datetime.fromisoformat(invite["expires_at"].replace("Z", ""))
+    if datetime.utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="Convite expirado")
+
+    # Verifica email duplicado
+    if supabase.table("users").select("id").eq("email", email).execute().data:
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
+
+    # Cria usuário como agent
+    colors = ["#00c853", "#2979ff", "#ff6d00", "#e91e63", "#9c27b0", "#00bcd4"]
+    pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user = supabase.table("users").insert({
+        "tenant_id": invite["tenant_id"],
+        "name": name,
+        "email": email,
+        "role": "agent",
+        "password_hash": pw_hash,
+        "is_active": True,
+        "avatar_color": random.choice(colors)
+    }).execute().data[0]
+
+    # Marca convite como usado
+    supabase.table("invite_codes").update({"used": True, "used_by": user["id"]}).eq("code", code).execute()
+
+    user.pop("password_hash", None)
+    return {"ok": True, "user": user, "message": "Conta criada com sucesso!"}
+
+
+@app.get("/auth/invites", dependencies=[Depends(verify_key)])
+async def list_invites(admin=Depends(require_admin)):
+    """Lista convites gerados pelo tenant."""
+    invites = supabase.table("invite_codes").select("*, users!created_by(name)").eq("tenant_id", admin["tenant_id"]).order("created_at", desc=True).limit(20).execute().data
+    return {"invites": invites}
