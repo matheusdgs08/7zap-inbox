@@ -34,6 +34,8 @@ WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
 WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
 INBOX_API_KEY     = os.getenv("INBOX_API_KEY", "7zap_inbox_secret")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+PAGARME_API_KEY   = os.getenv("PAGARME_API_KEY", "")
+SUPER_ADMIN_TENANT = os.getenv("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9")
 JWT_SECRET        = os.getenv("JWT_SECRET", "7crm_super_secret_change_in_prod")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -72,6 +74,11 @@ async def require_admin(user=Depends(get_current_user)):
     if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Apenas admins")
     return user
 
+async def require_super_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Apenas admins")
+    if user.get("tenant_id") != SUPER_ADMIN_TENANT: raise HTTPException(status_code=403, detail="Acesso negado")
+    return user
+
 def verify_key(x_api_key: str = Header(...)):
     if x_api_key != INBOX_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -85,11 +92,11 @@ class LoginRequest(BaseModel):
     password: str
 
 class CreateUser(BaseModel):
-    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"
+    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"; permissions: str = "read_write"
 
 class UpdateUser(BaseModel):
     name: Optional[str] = None; email: Optional[str] = None; password: Optional[str] = None
-    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None
+    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None; permissions: Optional[str] = None
 
 class SendMessage(BaseModel):
     conversation_id: str; text: str; sent_by: Optional[str] = None; is_internal_note: Optional[bool] = False
@@ -158,20 +165,20 @@ async def change_password(body: dict, user=Depends(get_current_user)):
 # ── ADMIN ────────────────────────────────────────────────
 @app.get("/admin/users")
 async def list_users_admin(admin=Depends(require_admin)):
-    return {"users": supabase.table("users").select("id,name,email,role,is_active,avatar_color,last_login,tenant_id").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
+    return {"users": supabase.table("users").select("id,name,email,role,is_active,avatar_color,last_login,tenant_id,permissions").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
 
 @app.post("/admin/users")
 async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
     if supabase.table("users").select("id").eq("email", body.email.lower()).execute().data:
         raise HTTPException(status_code=400, detail="Email já cadastrado")
     pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color}).execute().data[0]
+    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions}).execute().data[0]
     user.pop("password_hash", None)
     return {"user": user}
 
 @app.put("/admin/users/{user_id}")
 async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
-    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color}.items() if v is not None}
+    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions}.items() if v is not None}
     if body.password:
         if len(body.password) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
         updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
