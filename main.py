@@ -781,3 +781,39 @@ async def sync_status(tenant_id: str):
     convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
     msgs  = supabase.table("messages").select("id", count="exact").execute()
     return {"conversations": convs.count, "messages": msgs.count}
+
+# ── DEBUG — ver formato real da WAHA ─────────────────────
+@app.get("/whatsapp/debug", dependencies=[Depends(verify_key)])
+async def whatsapp_debug(instance: str = "default"):
+    """
+    Busca o primeiro chat e mostra o formato real que a WAHA retorna.
+    Usar só para diagnóstico.
+    """
+    result = {}
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Testa rota de chats
+        for route in [
+            f"{WAHA_URL}/api/chats?session={instance}&limit=2",
+            f"{WAHA_URL}/api/{instance}/chats?limit=2",
+        ]:
+            r = await client.get(route, headers=waha_headers())
+            result[f"chats_route_{route[-30:]}"] = {
+                "status": r.status_code,
+                "sample": r.json() if r.status_code == 200 else r.text[:300]
+            }
+            if r.status_code == 200:
+                chats = r.json() if isinstance(r.json(), list) else []
+                if chats:
+                    chat_id = chats[0].get("id", "")
+                    # Testa rota de mensagens com esse chat_id
+                    for msg_route in [
+                        f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=3",
+                        f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=3",
+                    ]:
+                        mr = await client.get(msg_route, headers=waha_headers())
+                        result[f"msgs_{msg_route[-40:]}"] = {
+                            "status": mr.status_code,
+                            "sample": mr.json() if mr.status_code == 200 else mr.text[:300]
+                        }
+                break
+    return result
