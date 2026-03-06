@@ -822,3 +822,84 @@ async def whatsapp_debug(instance: str = "default"):
                         }
                 break
     return result
+
+# ── LAZY LOAD — mensagens de um chat específico ───────────
+@app.post("/whatsapp/sync-chat", dependencies=[Depends(verify_key)])
+async def sync_single_chat(body: dict):
+    """
+    Busca mensagens de UM chat específico na WAHA e salva no Supabase.
+    Chamado quando o atendente abre uma conversa.
+    """
+    tenant_id   = body.get("tenant_id")
+    conv_id     = body.get("conversation_id")
+    phone       = body.get("phone")  # telefone do contato
+    instance    = body.get("instance", "default")
+
+    if not all([tenant_id, conv_id, phone]):
+        raise HTTPException(status_code=422, detail="tenant_id, conversation_id e phone são obrigatórios")
+
+    chat_id = f"{phone}@c.us"
+    saved = 0
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Tenta buscar mensagens do chat específico
+        messages = []
+        for route in [
+            f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=50&downloadMedia=false",
+            f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=50",
+        ]:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    messages = data if isinstance(data, list) else data.get("messages", [])
+                    if messages:
+                        break
+            except:
+                continue
+
+        for msg in messages:
+            # Extrai ID da mensagem
+            raw_id = msg.get("id", {})
+            if isinstance(raw_id, dict):
+                waha_id = raw_id.get("_serialized", "")
+            else:
+                waha_id = str(raw_id)
+
+            # Evita duplicata
+            if waha_id:
+                dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
+                if dup:
+                    continue
+
+            # Extrai conteúdo
+            msg_content = msg.get("body") or msg.get("text") or ""
+            msg_type_raw = msg.get("type", "chat")
+            msg_type = "text"
+            if not msg_content:
+                if "image" in msg_type_raw:    msg_content = "[Imagem]";    msg_type = "image"
+                elif "audio" in msg_type_raw:  msg_content = "[Áudio]";     msg_type = "audio"
+                elif "video" in msg_type_raw:  msg_content = "[Vídeo]";     msg_type = "video"
+                elif "document" in msg_type_raw: msg_content = "[Documento]"; msg_type = "document"
+                elif "sticker" in msg_type_raw: msg_content = "[Sticker]"
+                else: msg_content = "[Mensagem]"
+
+            direction = "outbound" if msg.get("fromMe") else "inbound"
+
+            msg_ts = msg.get("timestamp", 0)
+            if isinstance(msg_ts, int) and msg_ts < 10000000000:
+                msg_ts = msg_ts * 1000
+            created_at = datetime.utcfromtimestamp(msg_ts / 1000).isoformat() if msg_ts else datetime.utcnow().isoformat()
+
+            supabase.table("messages").insert({
+                "conversation_id": conv_id,
+                "direction": direction,
+                "content": msg_content,
+                "type": msg_type,
+                "is_internal_note": False,
+                "waha_id": waha_id,
+                "created_at": created_at,
+            }).execute()
+            saved += 1
+
+    return {"ok": True, "messages_saved": saved}
