@@ -22,7 +22,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, jwt, bcrypt, asyncio, random, base64
+import httpx, os, jwt, bcrypt, asyncio, random, base64, io
+try:
+    from PIL import Image as PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
@@ -437,6 +442,22 @@ async def whatsapp_status(instance: str = "default"):
     except Exception as e:
         return {"state": "error", "connected": False, "error": str(e)}
 
+def crop_qr_from_screenshot(png_bytes: bytes) -> bytes:
+    """Recorta apenas o QR Code do screenshot do WhatsApp Web e amplia 2x"""
+    if not PIL_AVAILABLE:
+        return png_bytes
+    try:
+        img = PILImage.open(io.BytesIO(png_bytes))
+        w, h = img.size
+        # QR fica na metade direita da tela do WhatsApp Web login
+        qr = img.crop((w * 52 // 100, h * 2 // 100, w * 98 // 100, h * 98 // 100))
+        qr_big = qr.resize((qr.width * 2, qr.height * 2), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        qr_big.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return png_bytes
+
 @app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
 async def whatsapp_qrcode(instance: str = "default"):
     """Retorna QR Code para conexão via WAHA screenshot"""
@@ -462,7 +483,8 @@ async def whatsapp_qrcode(instance: str = "default"):
             for _ in range(5):
                 screenshot = await client.get(f"{WAHA_URL}/api/screenshot?session={instance}", headers=waha_headers())
                 if screenshot.status_code == 200 and screenshot.content:
-                    b64 = base64.b64encode(screenshot.content).decode()
+                    cropped = crop_qr_from_screenshot(screenshot.content)
+                    b64 = base64.b64encode(cropped).decode()
                     return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
                 await asyncio.sleep(3)
 
@@ -472,17 +494,17 @@ async def whatsapp_qrcode(instance: str = "default"):
 
 @app.post("/whatsapp/disconnect", dependencies=[Depends(verify_key)])
 async def whatsapp_disconnect(body: dict):
-    """Desconecta sessão WAHA — logout real remove dos dispositivos vinculados no WhatsApp"""
+    """Desconecta sessão WAHA — logout remove do celular, stop encerra processo"""
     instance = body.get("instance", "default")
     if not WAHA_URL:
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            # logout envia sinal de desconexão pro WhatsApp (remove de dispositivos vinculados)
-            r = await client.post(f"{WAHA_URL}/api/sessions/{instance}/logout", headers=waha_headers())
-            # Após logout, reinicia sessão para ficar pronta para novo QR
-            await asyncio.sleep(2)
-            await client.post(f"{WAHA_URL}/api/sessions/{instance}/start", headers=waha_headers())
+        async with httpx.AsyncClient(timeout=15) as client:
+            # logout derruba a sessão no celular (remove de Dispositivos conectados)
+            await client.post(f"{WAHA_URL}/api/sessions/{instance}/logout", headers=waha_headers())
+            await asyncio.sleep(1)
+            # stop encerra o processo local
+            await client.post(f"{WAHA_URL}/api/sessions/{instance}/stop", headers=waha_headers())
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
