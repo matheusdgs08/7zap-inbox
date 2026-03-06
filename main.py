@@ -22,27 +22,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, jwt, bcrypt, asyncio, random, base64, io
-try:
-    from PIL import Image as PILImage
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-def crop_qr_from_screenshot(png_bytes: bytes) -> bytes:
-    """Recorta só o QR Code do screenshot do WhatsApp Web"""
-    if not PIL_AVAILABLE:
-        return png_bytes
-    try:
-        img = PILImage.open(io.BytesIO(png_bytes))
-        w, h = img.size
-        # Crop apertado na área do QR (metade direita, centro)
-        qr = img.crop((w * 57 // 100, h * 8 // 100, w * 92 // 100, h * 88 // 100))
-        buf = io.BytesIO()
-        qr.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        return png_bytes
+import httpx, os, jwt, bcrypt, asyncio, random, base64
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
@@ -255,6 +235,17 @@ async def receive_message(payload: dict):
         if waha_id:
             dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
             if dup: continue
+
+        # Fallback dedup: mesmo conteúdo na mesma conversa nos últimos 30s
+        # (cobre casos onde WAHA dispara 2x com IDs diferentes)
+        recent_cutoff = (datetime.utcnow() - timedelta(seconds=30)).isoformat()
+        dup_recent = supabase.table("messages").select("id") \
+            .eq("conversation_id", conv_id) \
+            .eq("content", content) \
+            .eq("direction", "inbound") \
+            .gte("created_at", recent_cutoff) \
+            .execute().data
+        if dup_recent: continue
 
         supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
@@ -482,8 +473,7 @@ async def whatsapp_qrcode(instance: str = "default"):
             for _ in range(5):
                 screenshot = await client.get(f"{WAHA_URL}/api/screenshot?session={instance}", headers=waha_headers())
                 if screenshot.status_code == 200 and screenshot.content:
-                    cropped = crop_qr_from_screenshot(screenshot.content)
-                    b64 = base64.b64encode(cropped).decode()
+                    b64 = base64.b64encode(screenshot.content).decode()
                     return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
                 await asyncio.sleep(3)
 
