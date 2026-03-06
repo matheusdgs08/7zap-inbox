@@ -168,7 +168,7 @@ async def receive_message(payload: dict):
 async def list_conversations(tenant_id: str, status: Optional[str] = None):
     q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
     if status and status != "all": q = q.eq("status", status)
-    convs = q.order("last_message_at", desc=True).limit(100).execute().data
+    convs = q.order("last_message_at", desc=True).limit(200).execute().data
     for c in convs:
         labels_res = supabase.table("conversation_labels").select("labels(id,name,color)").eq("conversation_id", c["id"]).execute().data
         c["labels"] = [r["labels"] for r in labels_res if r.get("labels")]
@@ -492,20 +492,40 @@ async def onboarding_analyze(body: dict):
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
 
     # Busca tenant
-    tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt").eq("id", tenant_id).single().execute().data
-    if tenant.get("plan") not in ["pro", "business"]:
+    tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt, onboarding_last_run").eq("id", tenant_id).single().execute().data
+    plan = tenant.get("plan")
+
+    # Verifica plano
+    # Limites por plano: Pro=200 convs, Business=500 convs
+    plan_limits = {"pro": 200, "business": 500}
+    if plan not in plan_limits:
         raise HTTPException(status_code=403, detail="Onboarding Inteligente disponível apenas nos planos Pro e Business")
+
+    conv_limit = plan_limits[plan]
+
+    # Verifica se já usou no mês atual
+    last_run = tenant.get("onboarding_last_run")
+    if last_run:
+        last_run_dt = datetime.fromisoformat(last_run.replace("Z", ""))
+        now = datetime.utcnow()
+        if last_run_dt.year == now.year and last_run_dt.month == now.month:
+            next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
+            days_until = (next_month - now).days
+            raise HTTPException(status_code=429, detail=f"Você já usou o Onboarding este mês. Disponível novamente em {days_until} dia(s).")
 
     # Busca conversas dos últimos X dias
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    conversations = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since).limit(100).execute().data
+    conversations = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since).limit(conv_limit).execute().data
 
     if not conversations:
         raise HTTPException(status_code=404, detail="Nenhuma conversa encontrada no período. Conecte seu WhatsApp e aguarde mensagens chegarem.")
 
+    # Registra uso do mês
+    supabase.table("tenants").update({"onboarding_last_run": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
+
     # Busca mensagens de cada conversa (amostra representativa)
     all_samples = []
-    for conv in conversations[:50]:  # limita a 50 conversas
+    for conv in conversations[:conv_limit]:  # limite por plano
         msgs = supabase.table("messages").select("direction, content").eq("conversation_id", conv["id"]).eq("is_internal_note", False).order("created_at").limit(20).execute().data
         if len(msgs) < 2:
             continue
@@ -520,9 +540,9 @@ async def onboarding_analyze(body: dict):
         raise HTTPException(status_code=404, detail="Nenhuma conversa com conteúdo suficiente encontrada.")
 
     # Limita tokens — pega as primeiras N conversas que cabem
-    combined = "\n---\n".join(all_samples[:30])
-    if len(combined) > 80000:
-        combined = combined[:80000]
+    combined = "\n---\n".join(all_samples[:conv_limit])
+    if len(combined) > 150000:
+        combined = combined[:150000]
 
     total_convs = len(all_samples)
 
@@ -577,3 +597,19 @@ async def onboarding_save_prompt(body: dict):
         "updated_at": datetime.utcnow().isoformat()
     }).eq("id", tenant_id).execute()
     return {"ok": True}
+
+# ── PLAN INFO ────────────────────────────────────────────
+PLAN_FEATURES = {
+    "trial":    {"agents": 15, "numbers": 3,  "ai_credits": 1000, "onboarding_convs": 200, "disparos": True,  "copilot": True,  "onboarding": False, "white_label": False},
+    "starter":  {"agents": 5,  "numbers": 1,  "ai_credits": 0,    "onboarding_convs": 0,   "disparos": True,  "copilot": False, "onboarding": False, "white_label": False},
+    "pro":      {"agents": 15, "numbers": 3,  "ai_credits": 1000, "onboarding_convs": 200, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
+    "business": {"agents": 30, "numbers": 8,  "ai_credits": 3000, "onboarding_convs": 500, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
+    "enterprise":{"agents": 999,"numbers": 999,"ai_credits": 99999,"onboarding_convs": 999,"disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
+}
+
+@app.get("/plan/features", dependencies=[Depends(verify_key)])
+async def get_plan_features(tenant_id: str):
+    tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
+    plan = tenant.get("plan", "trial")
+    features = PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])
+    return {"plan": plan, "features": features}
