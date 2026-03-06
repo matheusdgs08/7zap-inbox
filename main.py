@@ -236,18 +236,7 @@ async def receive_message(payload: dict):
             dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
             if dup: continue
 
-        # Evita duplicata por waha_id (check rápido antes do insert)
-        if waha_id:
-            dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
-            if dup: continue
-
-        try:
-            supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
-        except Exception as e:
-            # Unique constraint violation — mensagem duplicada, ignora silenciosamente
-            if "23505" in str(e) or "unique" in str(e).lower():
-                continue
-            raise
+        supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
         # Invalida cache para forçar reload no frontend
         cache_del(f"msgs:{conv_id}")
@@ -350,6 +339,39 @@ async def update_conversation_labels(conv_id: str, body: UpdateLabels):
     supabase.table("conversation_labels").delete().eq("conversation_id", conv_id).execute()
     if body.label_ids:
         supabase.table("conversation_labels").insert([{"conversation_id": conv_id, "label_id": lid} for lid in body.label_ids]).execute()
+    return {"ok": True}
+
+# ── LABELS CRUD ──────────────────────────────────────────
+@app.get("/labels", dependencies=[Depends(verify_key)])
+async def list_labels(tenant_id: str):
+    labels = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
+    return {"labels": labels or []}
+
+@app.post("/labels", dependencies=[Depends(verify_key)])
+async def create_label(body: dict):
+    tenant_id = body.get("tenant_id")
+    name = (body.get("name") or "").strip()
+    color = body.get("color", "#00c853")
+    if not tenant_id or not name:
+        raise HTTPException(status_code=400, detail="tenant_id e name obrigatórios")
+    label = supabase.table("labels").insert({"tenant_id": tenant_id, "name": name, "color": color}).execute().data[0]
+    return {"label": label}
+
+@app.put("/labels/{label_id}", dependencies=[Depends(verify_key)])
+async def update_label(label_id: str, body: dict):
+    patch = {}
+    if "name" in body: patch["name"] = body["name"].strip()
+    if "color" in body: patch["color"] = body["color"]
+    if not patch:
+        raise HTTPException(status_code=400, detail="Nada para atualizar")
+    label = supabase.table("labels").update(patch).eq("id", label_id).execute().data[0]
+    return {"label": label}
+
+@app.delete("/labels/{label_id}", dependencies=[Depends(verify_key)])
+async def delete_label(label_id: str):
+    # Remove from all conversations first
+    supabase.table("conversation_labels").delete().eq("label_id", label_id).execute()
+    supabase.table("labels").delete().eq("id", label_id).execute()
     return {"ok": True}
 
 # ── CONTACTS ─────────────────────────────────────────────
