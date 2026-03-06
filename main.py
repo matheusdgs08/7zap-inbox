@@ -114,6 +114,9 @@ class CreateQuickReply(BaseModel):
 
 class UpdateCopilotPrompt(BaseModel):
     tenant_id: str; copilot_prompt: str
+    copilot_auto_mode: str = "off"
+    copilot_schedule_start: str = "18:00"
+    copilot_schedule_end: str = "09:00"
 
 class CreateBroadcast(BaseModel):
     tenant_id: str; name: str; message: str; interval_min: int = 60; interval_max: int = 120
@@ -341,39 +344,6 @@ async def update_conversation_labels(conv_id: str, body: UpdateLabels):
         supabase.table("conversation_labels").insert([{"conversation_id": conv_id, "label_id": lid} for lid in body.label_ids]).execute()
     return {"ok": True}
 
-# ── LABELS CRUD ──────────────────────────────────────────
-@app.get("/labels", dependencies=[Depends(verify_key)])
-async def list_labels(tenant_id: str):
-    labels = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
-    return {"labels": labels or []}
-
-@app.post("/labels", dependencies=[Depends(verify_key)])
-async def create_label(body: dict):
-    tenant_id = body.get("tenant_id")
-    name = (body.get("name") or "").strip()
-    color = body.get("color", "#00c853")
-    if not tenant_id or not name:
-        raise HTTPException(status_code=400, detail="tenant_id e name obrigatórios")
-    label = supabase.table("labels").insert({"tenant_id": tenant_id, "name": name, "color": color}).execute().data[0]
-    return {"label": label}
-
-@app.put("/labels/{label_id}", dependencies=[Depends(verify_key)])
-async def update_label(label_id: str, body: dict):
-    patch = {}
-    if "name" in body: patch["name"] = body["name"].strip()
-    if "color" in body: patch["color"] = body["color"]
-    if not patch:
-        raise HTTPException(status_code=400, detail="Nada para atualizar")
-    label = supabase.table("labels").update(patch).eq("id", label_id).execute().data[0]
-    return {"label": label}
-
-@app.delete("/labels/{label_id}", dependencies=[Depends(verify_key)])
-async def delete_label(label_id: str):
-    # Remove from all conversations first
-    supabase.table("conversation_labels").delete().eq("label_id", label_id).execute()
-    supabase.table("labels").delete().eq("id", label_id).execute()
-    return {"ok": True}
-
 # ── CONTACTS ─────────────────────────────────────────────
 @app.get("/contacts", dependencies=[Depends(verify_key)])
 async def list_contacts(tenant_id: str):
@@ -443,11 +413,11 @@ async def ai_suggest(conv_id: str):
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
 async def get_tenant(tenant_id: str):
-    return supabase.table("tenants").select("id,name,plan,copilot_prompt").eq("id", tenant_id).single().execute().data
+    return supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end").eq("id", tenant_id).single().execute().data
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
-    res = supabase.table("tenants").update({"copilot_prompt": body.copilot_prompt, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
+    res = supabase.table("tenants").update({"copilot_prompt": body.copilot_prompt, "copilot_auto_mode": body.copilot_auto_mode, "copilot_schedule_start": body.copilot_schedule_start, "copilot_schedule_end": body.copilot_schedule_end, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
     return {"ok": True, "tenant": res.data[0]}
 
 # ── WHATSAPP CONNECTION (WAHA) ────────────────────────────
