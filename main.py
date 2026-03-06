@@ -28,6 +28,21 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+def crop_qr_from_screenshot(png_bytes: bytes) -> bytes:
+    """Recorta só o QR Code do screenshot do WhatsApp Web"""
+    if not PIL_AVAILABLE:
+        return png_bytes
+    try:
+        img = PILImage.open(io.BytesIO(png_bytes))
+        w, h = img.size
+        # Crop apertado na área do QR (metade direita, centro)
+        qr = img.crop((w * 57 // 100, h * 8 // 100, w * 92 // 100, h * 88 // 100))
+        buf = io.BytesIO()
+        qr.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return png_bytes
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
@@ -442,22 +457,6 @@ async def whatsapp_status(instance: str = "default"):
     except Exception as e:
         return {"state": "error", "connected": False, "error": str(e)}
 
-def crop_qr_from_screenshot(png_bytes: bytes) -> bytes:
-    """Recorta apenas o QR Code do screenshot do WhatsApp Web e amplia 2x"""
-    if not PIL_AVAILABLE:
-        return png_bytes
-    try:
-        img = PILImage.open(io.BytesIO(png_bytes))
-        w, h = img.size
-        # QR fica na metade direita da tela do WhatsApp Web login
-        qr = img.crop((w * 52 // 100, h * 2 // 100, w * 98 // 100, h * 98 // 100))
-        qr_big = qr.resize((qr.width * 2, qr.height * 2), PILImage.LANCZOS)
-        buf = io.BytesIO()
-        qr_big.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        return png_bytes
-
 @app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
 async def whatsapp_qrcode(instance: str = "default"):
     """Retorna QR Code para conexão via WAHA screenshot"""
@@ -494,16 +493,12 @@ async def whatsapp_qrcode(instance: str = "default"):
 
 @app.post("/whatsapp/disconnect", dependencies=[Depends(verify_key)])
 async def whatsapp_disconnect(body: dict):
-    """Desconecta sessão WAHA — logout remove do celular, stop encerra processo"""
+    """Desconecta sessão WAHA"""
     instance = body.get("instance", "default")
     if not WAHA_URL:
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # logout derruba a sessão no celular (remove de Dispositivos conectados)
-            await client.post(f"{WAHA_URL}/api/sessions/{instance}/logout", headers=waha_headers())
-            await asyncio.sleep(1)
-            # stop encerra o processo local
+        async with httpx.AsyncClient(timeout=10) as client:
             await client.post(f"{WAHA_URL}/api/sessions/{instance}/stop", headers=waha_headers())
         return {"ok": True}
     except Exception as e:
