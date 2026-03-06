@@ -366,63 +366,68 @@ async def delete_scheduled_message(msg_id: str):
     supabase.table("scheduled_messages").delete().eq("id", msg_id).execute()
     return {"ok": True}
 
-# ── WHATSAPP CONNECTION ───────────────────────────────────
-EVOLUTION_URL = os.getenv("EVOLUTION_URL", "")
-EVOLUTION_KEY = os.getenv("EVOLUTION_KEY", "")
-
-def evo_headers():
-    return {"apikey": EVOLUTION_KEY, "Content-Type": "application/json"}
+# ── WHATSAPP CONNECTION (WAHA) ───────────────────────────
+def waha_headers():
+    return {"X-Api-Key": WAHA_KEY, "Content-Type": "application/json"}
 
 @app.get("/whatsapp/status", dependencies=[Depends(verify_key)])
 async def whatsapp_status(instance: str = "default"):
-    if not EVOLUTION_URL:
-        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    if not WAHA_URL:
+        raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{EVOLUTION_URL}/instance/connectionState/{instance}", headers=evo_headers())
+            r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
             data = r.json()
-            state = data.get("instance", {}).get("state", "unknown")
-            return {"state": state, "connected": state == "open", "instance": instance}
+            state = data.get("status", "STOPPED")
+            connected = state == "WORKING"
+            phone = ""
+            me = data.get("me", {})
+            if me:
+                phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+            return {"state": state, "connected": connected, "instance": instance, "phone": phone}
     except Exception as e:
         return {"state": "error", "connected": False, "error": str(e)}
 
 @app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
 async def whatsapp_qrcode(instance: str = "default"):
-    if not EVOLUTION_URL:
-        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    if not WAHA_URL:
+        raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Try to connect instance first
-            r = await client.get(f"{EVOLUTION_URL}/instance/connect/{instance}", headers=evo_headers())
-            data = r.json()
-            qr = data.get("qrcode", {})
-            return {
-                "qr_code": qr.get("base64", ""),
-                "code": qr.get("code", ""),
-                "state": data.get("instance", {}).get("state", "unknown")
-            }
+        async with httpx.AsyncClient(timeout=20) as client:
+            # Inicia sessão se não existir
+            await client.post(f"{WAHA_URL}/api/sessions/start", headers=waha_headers(), json={"name": instance})
+            # Busca QR Code
+            r = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers(), params={"format": "image"})
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                import base64
+                b64 = base64.b64encode(r.content).decode()
+                return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
+            # Tenta JSON
+            r2 = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers())
+            data = r2.json()
+            return {"qr_code": data.get("value", ""), "state": "SCAN_QR_CODE"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/whatsapp/disconnect", dependencies=[Depends(verify_key)])
 async def whatsapp_disconnect(body: dict):
     instance = body.get("instance", "default")
-    if not EVOLUTION_URL:
-        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    if not WAHA_URL:
+        raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.delete(f"{EVOLUTION_URL}/instance/logout/{instance}", headers=evo_headers())
+            await client.post(f"{WAHA_URL}/api/sessions/stop", headers=waha_headers(), json={"name": instance, "logout": True})
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/whatsapp/instances", dependencies=[Depends(verify_key)])
 async def whatsapp_instances():
-    if not EVOLUTION_URL:
-        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    if not WAHA_URL:
+        raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{EVOLUTION_URL}/instance/fetchInstances", headers=evo_headers())
+            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
             return {"instances": r.json()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
