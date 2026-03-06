@@ -4,7 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, jwt, bcrypt, asyncio, random
+import httpx, os, jwt, bcrypt, asyncio, random, base64
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
@@ -399,7 +399,6 @@ async def whatsapp_qrcode(instance: str = "default"):
             # Busca QR Code
             r = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers(), params={"format": "image"})
             if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-                import base64
                 b64 = base64.b64encode(r.content).decode()
                 return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
             # Tenta JSON
