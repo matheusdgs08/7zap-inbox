@@ -21,6 +21,24 @@ JWT_SECRET        = os.getenv("JWT_SECRET", "7crm_super_secret_change_in_prod")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 security = HTTPBearer(auto_error=False)
 
+# ── KEEP-ALIVE — mantém Supabase aquecido ────────────────
+@app.on_event("startup")
+async def start_keepalive():
+    asyncio.create_task(keepalive_loop())
+
+async def keepalive_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            supabase.table("tenants").select("id").limit(1).execute()
+        except:
+            pass
+        await asyncio.sleep(240)
+
+@app.get("/ping")
+async def ping():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
+
 def create_jwt(user):
     payload = {"sub": user["id"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "name": user["name"], "exp": datetime.utcnow() + timedelta(hours=168)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
