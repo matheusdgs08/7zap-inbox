@@ -236,18 +236,18 @@ async def receive_message(payload: dict):
             dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
             if dup: continue
 
-        # Fallback dedup: mesmo conteúdo na mesma conversa nos últimos 30s
-        # (cobre casos onde WAHA dispara 2x com IDs diferentes)
-        recent_cutoff = (datetime.utcnow() - timedelta(seconds=30)).isoformat()
-        dup_recent = supabase.table("messages").select("id") \
-            .eq("conversation_id", conv_id) \
-            .eq("content", content) \
-            .eq("direction", "inbound") \
-            .gte("created_at", recent_cutoff) \
-            .execute().data
-        if dup_recent: continue
+        # Evita duplicata por waha_id (check rápido antes do insert)
+        if waha_id:
+            dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
+            if dup: continue
 
-        supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
+        try:
+            supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
+        except Exception as e:
+            # Unique constraint violation — mensagem duplicada, ignora silenciosamente
+            if "23505" in str(e) or "unique" in str(e).lower():
+                continue
+            raise
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
         # Invalida cache para forçar reload no frontend
         cache_del(f"msgs:{conv_id}")
