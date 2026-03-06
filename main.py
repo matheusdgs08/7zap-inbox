@@ -1,4 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+import concurrent.futures
+_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -109,7 +111,9 @@ async def login(body: LoginRequest):
     if not users: raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     user = users[0]
     if not user.get("password_hash"): raise HTTPException(status_code=401, detail="Usuário sem senha definida")
-    if not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()): raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+    loop = asyncio.get_event_loop()
+    pw_ok = await loop.run_in_executor(_thread_pool, lambda: bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()))
+    if not pw_ok: raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     supabase.table("users").update({"last_login": datetime.utcnow().isoformat()}).eq("id", user["id"]).execute()
     return {"token": create_jwt(user), "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}}
 
@@ -122,8 +126,11 @@ async def change_password(body: dict, user=Depends(get_current_user)):
     new_pw = body.get("new_password", "")
     if len(new_pw) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
     db = supabase.table("users").select("password_hash").eq("id", user["sub"]).single().execute().data
-    if not bcrypt.checkpw(body.get("current_password", "").encode(), db["password_hash"].encode()): raise HTTPException(status_code=401, detail="Senha atual incorreta")
-    supabase.table("users").update({"password_hash": bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()}).eq("id", user["sub"]).execute()
+    loop = asyncio.get_event_loop()
+    pw_ok = await loop.run_in_executor(_thread_pool, lambda: bcrypt.checkpw(body.get("current_password", "").encode(), db["password_hash"].encode()))
+    if not pw_ok: raise HTTPException(status_code=401, detail="Senha atual incorreta")
+    new_hash = await loop.run_in_executor(_thread_pool, lambda: bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode())
+    supabase.table("users").update({"password_hash": new_hash}).eq("id", user["sub"]).execute()
     return {"ok": True}
 
 # ── ADMIN ────────────────────────────────────────────────
