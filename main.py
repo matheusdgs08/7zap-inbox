@@ -12,8 +12,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
-WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
-WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
+WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")  # agora aponta para Evolution API
+WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")  # AUTHENTICATION_API_KEY da Evolution
 INBOX_API_KEY     = os.getenv("INBOX_API_KEY", "7zap_inbox_secret")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 JWT_SECRET        = os.getenv("JWT_SECRET", "7crm_super_secret_change_in_prod")
@@ -210,7 +210,7 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
 async def waha_send_msg(phone: str, text: str):
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(f"{WAHA_URL}/api/sendText", headers={"X-Api-Key": WAHA_KEY}, json={"session": "default", "chatId": f"{phone}@s.whatsapp.net", "text": text})
+            await client.post(f"{WAHA_URL}/message/sendText/default", headers=waha_headers(), json={"number": f"{phone}@s.whatsapp.net", "text": text})
     except: pass
 
 @app.put("/conversations/{conv_id}/assign", dependencies=[Depends(verify_key)])
@@ -358,7 +358,7 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
         ok = False
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.post(f"{WAHA_URL}/api/sendText", headers={"X-Api-Key": WAHA_KEY}, json={"session": "default", "chatId": f"{rec['phone']}@s.whatsapp.net", "text": msg})
+                r = await client.post(f"{WAHA_URL}/message/sendText/default", headers=waha_headers(), json={"number": f"{rec['phone']}@s.whatsapp.net", "text": msg})
                 ok = r.status_code in [200, 201]
         except: pass
         supabase.table("broadcast_recipients").update({"status": "sent" if ok else "failed", "sent_at": datetime.utcnow().isoformat() if ok else None}).eq("id", rec["id"]).execute()
@@ -386,7 +386,7 @@ async def delete_scheduled_message(msg_id: str):
 
 # ── WHATSAPP CONNECTION (WAHA) ───────────────────────────
 def waha_headers():
-    return {"X-Api-Key": WAHA_KEY, "Content-Type": "application/json"}
+    return {"apikey": WAHA_KEY, "Content-Type": "application/json"}
 
 @app.get("/whatsapp/status", dependencies=[Depends(verify_key)])
 async def whatsapp_status(instance: str = "default"):
@@ -394,7 +394,7 @@ async def whatsapp_status(instance: str = "default"):
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
+            r = await client.get(f"{WAHA_URL}/instance/connectionState/{instance}", headers=waha_headers())
             data = r.json()
             state = data.get("status", "STOPPED")
             connected = state == "WORKING"
@@ -413,7 +413,7 @@ async def whatsapp_qrcode(instance: str = "default"):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             # Inicia sessão se não existir
-            await client.post(f"{WAHA_URL}/api/sessions/start", headers=waha_headers(), json={"name": instance})
+            await client.post(f"{WAHA_URL}/instance/create", headers=waha_headers(), json={"instanceName": instance, "integration": "WHATSAPP-BAILEYS"})
             # Busca QR Code
             r = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers(), params={"format": "image"})
             if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
@@ -433,7 +433,7 @@ async def whatsapp_disconnect(body: dict):
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(f"{WAHA_URL}/api/sessions/stop", headers=waha_headers(), json={"name": instance, "logout": True})
+            await client.delete(f"{WAHA_URL}/instance/logout/{instance}", headers=waha_headers())
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -444,7 +444,7 @@ async def whatsapp_instances():
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            r = await client.get(f"{WAHA_URL}/instance/fetchInstances", headers=waha_headers())
             return {"instances": r.json()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -815,8 +815,8 @@ async def whatsapp_debug(instance: str = "default"):
     async with httpx.AsyncClient(timeout=20) as client:
         # Testa rota de chats
         for route in [
-            f"{WAHA_URL}/api/chats?session={instance}&limit=2",
-            f"{WAHA_URL}/api/{instance}/chats?limit=2",
+            f"{WAHA_URL}/chat/findChats/{instance}",
+            f"{WAHA_URL}/chat/findChats/{instance}?limit=100",
         ]:
             r = await client.get(route, headers=waha_headers())
             result[f"chats_route_{route[-30:]}"] = {
@@ -829,8 +829,8 @@ async def whatsapp_debug(instance: str = "default"):
                     chat_id = chats[0].get("id", "")
                     # Testa rota de mensagens com esse chat_id
                     for msg_route in [
-                        f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=3",
-                        f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=3",
+                        f"{WAHA_URL}/chat/findMessages/{instance}?limit=3&chatId={chat_id}",
+                        f"{WAHA_URL}/message/findMessages/{instance}?chatId={chat_id}&limit=3",
                     ]:
                         mr = await client.get(msg_route, headers=waha_headers())
                         result[f"msgs_{msg_route[-40:]}"] = {
@@ -862,8 +862,8 @@ async def sync_single_chat(body: dict):
         # Tenta buscar mensagens do chat específico
         messages = []
         for route in [
-            f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=50&downloadMedia=false",
-            f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=50",
+            f"{WAHA_URL}/chat/findMessages/{instance}?limit=50&chatId={chat_id}",
+            f"{WAHA_URL}/message/findMessages/{instance}?chatId={chat_id}&limit=50",
         ]:
             try:
                 r = await client.get(route, headers=waha_headers(), timeout=15)
