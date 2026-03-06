@@ -195,8 +195,13 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None):
     if status and status != "all": q = q.eq("status", status)
     convs = q.order("last_message_at", desc=True).limit(200).execute().data
     for c in convs:
-        labels_res = supabase.table("conversation_labels").select("labels(id,name,color)").eq("conversation_id", c["id"]).execute().data
-        c["labels"] = [r["labels"] for r in labels_res if r.get("labels")]
+        cl_res = supabase.table("conversation_labels").select("label_id").eq("conversation_id", c["id"]).execute().data
+        label_ids = [r["label_id"] for r in cl_res if r.get("label_id")]
+        if label_ids:
+            labels_res = supabase.table("labels").select("id,name,color").in_("id", label_ids).execute().data
+            c["labels"] = labels_res
+        else:
+            c["labels"] = []
     return {"conversations": convs}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
