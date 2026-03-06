@@ -419,23 +419,34 @@ async def whatsapp_qrcode(instance: str = "default"):
     if not WAHA_URL:
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            # Evolution API: GET /instance/connect/{instance} retorna o QR Code
-            r = await client.get(f"{WAHA_URL}/instance/connect/{instance}", headers=waha_headers())
-            if r.status_code == 404:
-                # Instância não existe — cria e tenta de novo
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Garante que a instância existe
+            instances = await client.get(f"{WAHA_URL}/instance/fetchInstances", headers=waha_headers())
+            inst_list = instances.json() if isinstance(instances.json(), list) else []
+            exists = any(i.get("name") == instance for i in inst_list)
+            if not exists:
                 await client.post(f"{WAHA_URL}/instance/create", headers=waha_headers(), json={"instanceName": instance, "integration": "WHATSAPP-BAILEYS"})
+                await asyncio.sleep(2)
+
+            # Polling: tenta até 8x com 2s de intervalo para QR aparecer
+            for attempt in range(8):
                 r = await client.get(f"{WAHA_URL}/instance/connect/{instance}", headers=waha_headers())
-            data = r.json()
-            # Evolution API retorna: {"code": "...", "base64": "data:image/png;base64,...", "count": 0}
-            qr_base64 = data.get("base64", "")
-            qr_code = data.get("code", "")
-            if qr_base64:
-                return {"qr_code": qr_base64, "state": "SCAN_QR_CODE"}
-            elif qr_code:
-                return {"qr_code": qr_code, "state": "SCAN_QR_CODE"}
-            else:
-                return {"qr_code": "", "state": data.get("state", "close"), "data": data}
+                data = r.json()
+                qr_base64 = data.get("base64", "")
+                qr_code = data.get("code", "")
+                if qr_base64:
+                    return {"qr_code": qr_base64, "state": "SCAN_QR_CODE"}
+                if qr_code:
+                    return {"qr_code": qr_code, "state": "SCAN_QR_CODE"}
+                # Verifica se já está conectado
+                state_r = await client.get(f"{WAHA_URL}/instance/connectionState/{instance}", headers=waha_headers())
+                state_data = state_r.json()
+                state = state_data.get("instance", {}).get("state", "close")
+                if state == "open":
+                    return {"qr_code": "", "state": "open", "connected": True}
+                await asyncio.sleep(2)
+
+            return {"qr_code": "", "state": "timeout", "error": "QR Code não gerado após tentativas"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
