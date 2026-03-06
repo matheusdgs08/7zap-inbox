@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
 import httpx, os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI(title="7zap Inbox API", version="1.0.0")
 
@@ -215,8 +215,14 @@ async def create_task(conv_id: str, body: CreateTask, tenant_id: str):
 
 @app.put("/tasks/{task_id}/done", dependencies=[Depends(verify_key)])
 async def complete_task(task_id: str):
-    supabase.table("tasks").update({"done": True}).eq("id", task_id).execute()
+    supabase.table("tasks").update({"done": True, "done_at": datetime.utcnow().isoformat()}).eq("id", task_id).execute()
     return {"ok": True}
+
+@app.get("/tasks/completed", dependencies=[Depends(verify_key)])
+async def list_completed_tasks(tenant_id: str, days: int = 7):
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    res = supabase.table("tasks").select("*, conversations(id, tenant_id, contacts(name, phone)), users!assigned_to(name)").eq("done", True).gte("done_at", since).order("done_at", desc=True).execute()
+    return {"tasks": [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]}
 
 # ── TASK UPDATES ──────────────────────────────────────────
 @app.get("/tasks/{task_id}/updates", dependencies=[Depends(verify_key)])
