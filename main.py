@@ -477,3 +477,103 @@ async def activate_plan(body: dict):
         "activated_at": datetime.utcnow().isoformat()
     }).eq("id", tenant_id).execute()
     return {"ok": True, "plan": plan}
+
+# ── ONBOARDING INTELIGENTE ────────────────────────────────
+@app.post("/onboarding/analyze", dependencies=[Depends(verify_key)])
+async def onboarding_analyze(body: dict):
+    """
+    Lê o histórico de conversas do tenant e gera um Co-pilot prompt
+    personalizado baseado no tom de voz, produtos e padrões da empresa.
+    """
+    tenant_id = body.get("tenant_id")
+    days = body.get("days", 90)
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+
+    # Busca tenant
+    tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt").eq("id", tenant_id).single().execute().data
+    if tenant.get("plan") not in ["pro", "business"]:
+        raise HTTPException(status_code=403, detail="Onboarding Inteligente disponível apenas nos planos Pro e Business")
+
+    # Busca conversas dos últimos X dias
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    conversations = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since).limit(100).execute().data
+
+    if not conversations:
+        raise HTTPException(status_code=404, detail="Nenhuma conversa encontrada no período. Conecte seu WhatsApp e aguarde mensagens chegarem.")
+
+    # Busca mensagens de cada conversa (amostra representativa)
+    all_samples = []
+    for conv in conversations[:50]:  # limita a 50 conversas
+        msgs = supabase.table("messages").select("direction, content").eq("conversation_id", conv["id"]).eq("is_internal_note", False).order("created_at").limit(20).execute().data
+        if len(msgs) < 2:
+            continue
+        contact_name = (conv.get("contacts") or {}).get("name", "Cliente")
+        sample = f"[Conversa com {contact_name}]\n"
+        for m in msgs:
+            role = "Atendente" if m["direction"] == "outbound" else "Cliente"
+            sample += f"{role}: {m['content']}\n"
+        all_samples.append(sample)
+
+    if not all_samples:
+        raise HTTPException(status_code=404, detail="Nenhuma conversa com conteúdo suficiente encontrada.")
+
+    # Limita tokens — pega as primeiras N conversas que cabem
+    combined = "\n---\n".join(all_samples[:30])
+    if len(combined) > 80000:
+        combined = combined[:80000]
+
+    total_convs = len(all_samples)
+
+    # Gera o prompt com Claude
+    analysis_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.
+
+Analise as conversas abaixo da empresa "{tenant['name']}" e gere um prompt de sistema detalhado para um Co-pilot de IA que vai ajudar os atendentes dessa empresa.
+
+O prompt deve incluir:
+1. **Tom de voz** — como a empresa se comunica (formal/informal, use exemplos reais)
+2. **Produtos/serviços** — o que a empresa oferece, preços se mencionados
+3. **Perguntas frequentes** — as dúvidas mais comuns dos clientes e como responder
+4. **Fluxo de vendas** — como a empresa conduz o processo de venda
+5. **Regras importantes** — horários, políticas, informações críticas
+6. **Instruções para o Co-pilot** — como ele deve se comportar, o que evitar
+
+Escreva o prompt em primeira pessoa, como se fosse instrução direta para a IA atendente.
+Seja específico com exemplos reais das conversas. Não invente informações que não estejam nas conversas.
+
+CONVERSAS DA EMPRESA ({total_convs} conversas analisadas, últimos {days} dias):
+
+{combined}
+
+PROMPT GERADO (escreva apenas o prompt, sem explicações adicionais):"""
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": analysis_prompt}]
+            }
+        )
+        generated_prompt = r.json()["content"][0]["text"]
+
+    return {
+        "generated_prompt": generated_prompt,
+        "conversations_analyzed": total_convs,
+        "days_analyzed": days,
+        "tenant_name": tenant["name"]
+    }
+
+@app.post("/onboarding/save-prompt", dependencies=[Depends(verify_key)])
+async def onboarding_save_prompt(body: dict):
+    tenant_id = body.get("tenant_id")
+    prompt = body.get("prompt")
+    supabase.table("tenants").update({
+        "copilot_prompt": prompt,
+        "onboarding_done": True,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", tenant_id).execute()
+    return {"ok": True}
