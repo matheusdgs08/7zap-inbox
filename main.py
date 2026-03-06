@@ -400,15 +400,16 @@ async def whatsapp_status(instance: str = "default"):
     if not WAHA_URL:
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(f"{WAHA_URL}/instance/connectionState/{instance}", headers=waha_headers())
+            if r.status_code == 404:
+                return {"state": "not_found", "connected": False, "instance": instance, "phone": ""}
             data = r.json()
-            state = data.get("status", "STOPPED")
-            connected = state == "WORKING"
-            phone = ""
-            me = data.get("me", {})
-            if me:
-                phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+            # Evolution API retorna: {"instance": {"instanceName": "...", "state": "open"}}
+            inst = data.get("instance", data)
+            state = inst.get("state", data.get("status", "close"))
+            connected = state in ("open", "WORKING", "AUTHENTICATED", "connected")
+            phone = inst.get("owner", "").replace("@s.whatsapp.net", "").replace("@c.us", "")
             return {"state": state, "connected": connected, "instance": instance, "phone": phone}
     except Exception as e:
         return {"state": "error", "connected": False, "error": str(e)}
