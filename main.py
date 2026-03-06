@@ -1,5 +1,12 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 import concurrent.futures
+
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+async def run_sync(fn):
+    """Roda função síncrona (ex: Supabase) sem bloquear o event loop"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, fn)
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -62,33 +69,6 @@ def verify_key(x_api_key: str = Header(...)):
 # ── WAHA HEADERS (X-Api-Key — formato correto WAHA) ──────
 def waha_headers():
     return {"X-Api-Key": WAHA_KEY, "Content-Type": "application/json"}
-
-# ── CACHE de status WAHA (evita flood de requests) ───────
-_waha_cache: dict = {}
-WAHA_CACHE_TTL = 15  # segundos
-
-async def get_waha_status_cached(instance: str = "default") -> dict:
-    now = datetime.utcnow().timestamp()
-    if instance in _waha_cache:
-        cached, ts = _waha_cache[instance]
-        if now - ts < WAHA_CACHE_TTL:
-            return cached
-    try:
-        async with httpx.AsyncClient(timeout=6) as client:
-            r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
-            if r.status_code == 404:
-                result = {"state": "not_found", "connected": False, "instance": instance, "phone": ""}
-            else:
-                data = r.json()
-                status = data.get("status", "STOPPED")
-                connected = status == "WORKING"
-                me = data.get("me") or {}
-                phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
-                result = {"state": status, "connected": connected, "instance": instance, "phone": phone}
-    except Exception as e:
-        result = {"state": "error", "connected": False, "error": str(e)}
-    _waha_cache[instance] = (result, now)
-    return result
 
 # ── Schemas ──────────────────────────────────────────────
 class LoginRequest(BaseModel):
@@ -254,23 +234,26 @@ async def receive_message(payload: dict):
 # ── CONVERSATIONS ────────────────────────────────────────
 @app.get("/conversations", dependencies=[Depends(verify_key)])
 async def list_conversations(tenant_id: str, status: Optional[str] = None):
-    q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
-    if status and status != "all": q = q.eq("status", status)
-    convs = q.order("last_message_at", desc=True).limit(200).execute().data
-    for c in convs:
-        cl_res = supabase.table("conversation_labels").select("label_id").eq("conversation_id", c["id"]).execute().data
-        label_ids = [r["label_id"] for r in cl_res if r.get("label_id")]
-        if label_ids:
-            labels_res = supabase.table("labels").select("id,name,color").in_("id", label_ids).execute().data
-            c["labels"] = labels_res
-        else:
-            c["labels"] = []
+    def _query():
+        q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
+        if status and status != "all": q = q.eq("status", status)
+        convs = q.order("last_message_at", desc=True).limit(200).execute().data
+        for c in convs:
+            cl_res = supabase.table("conversation_labels").select("label_id").eq("conversation_id", c["id"]).execute().data
+            label_ids = [r["label_id"] for r in cl_res if r.get("label_id")]
+            if label_ids:
+                labels_res = supabase.table("labels").select("id,name,color").in_("id", label_ids).execute().data
+                c["labels"] = labels_res
+            else:
+                c["labels"] = []
+        return convs
+    convs = await run_sync(_query)
     return {"conversations": convs}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str):
-    msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").execute().data
-    supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
+    msgs = await run_sync(lambda: supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").execute().data)
+    await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
     return {"messages": msgs}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
@@ -400,10 +383,22 @@ async def update_copilot_prompt(body: UpdateCopilotPrompt):
 # ── WHATSAPP CONNECTION (WAHA) ────────────────────────────
 @app.get("/whatsapp/status", dependencies=[Depends(verify_key)])
 async def whatsapp_status(instance: str = "default"):
-    """Consulta status da sessão WAHA — com cache de 15s"""
+    """Consulta status da sessão WAHA"""
     if not WAHA_URL:
         raise HTTPException(status_code=503, detail="WAHA não configurada")
-    return await get_waha_status_cached(instance)
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
+            if r.status_code == 404:
+                return {"state": "not_found", "connected": False, "instance": instance, "phone": ""}
+            data = r.json()
+            status = data.get("status", "STOPPED")
+            connected = status == "WORKING"
+            me = data.get("me") or {}
+            phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+            return {"state": status, "connected": connected, "instance": instance, "phone": phone}
+    except Exception as e:
+        return {"state": "error", "connected": False, "error": str(e)}
 
 @app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
 async def whatsapp_qrcode(instance: str = "default"):
