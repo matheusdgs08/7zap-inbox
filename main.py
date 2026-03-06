@@ -365,3 +365,115 @@ async def list_scheduled_messages(tenant_id: str, status: Optional[str] = None):
 async def delete_scheduled_message(msg_id: str):
     supabase.table("scheduled_messages").delete().eq("id", msg_id).execute()
     return {"ok": True}
+
+# ── WHATSAPP CONNECTION ───────────────────────────────────
+EVOLUTION_URL = os.getenv("EVOLUTION_URL", "")
+EVOLUTION_KEY = os.getenv("EVOLUTION_KEY", "")
+
+def evo_headers():
+    return {"apikey": EVOLUTION_KEY, "Content-Type": "application/json"}
+
+@app.get("/whatsapp/status", dependencies=[Depends(verify_key)])
+async def whatsapp_status(instance: str = "default"):
+    if not EVOLUTION_URL:
+        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{EVOLUTION_URL}/instance/connectionState/{instance}", headers=evo_headers())
+            data = r.json()
+            state = data.get("instance", {}).get("state", "unknown")
+            return {"state": state, "connected": state == "open", "instance": instance}
+    except Exception as e:
+        return {"state": "error", "connected": False, "error": str(e)}
+
+@app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
+async def whatsapp_qrcode(instance: str = "default"):
+    if not EVOLUTION_URL:
+        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Try to connect instance first
+            r = await client.get(f"{EVOLUTION_URL}/instance/connect/{instance}", headers=evo_headers())
+            data = r.json()
+            qr = data.get("qrcode", {})
+            return {
+                "qr_code": qr.get("base64", ""),
+                "code": qr.get("code", ""),
+                "state": data.get("instance", {}).get("state", "unknown")
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/whatsapp/disconnect", dependencies=[Depends(verify_key)])
+async def whatsapp_disconnect(body: dict):
+    instance = body.get("instance", "default")
+    if not EVOLUTION_URL:
+        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(f"{EVOLUTION_URL}/instance/logout/{instance}", headers=evo_headers())
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/whatsapp/instances", dependencies=[Depends(verify_key)])
+async def whatsapp_instances():
+    if not EVOLUTION_URL:
+        raise HTTPException(status_code=503, detail="Evolution API não configurada")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{EVOLUTION_URL}/instance/fetchInstances", headers=evo_headers())
+            return {"instances": r.json()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── TRIAL & BILLING ───────────────────────────────────────
+@app.get("/tenant/trial-status", dependencies=[Depends(verify_key)])
+async def trial_status(tenant_id: str):
+    tenant = supabase.table("tenants").select("id, name, plan, trial_ends_at, trial_used, is_blocked").eq("id", tenant_id).single().execute().data
+    
+    now = datetime.utcnow()
+    trial_ends_at = tenant.get("trial_ends_at")
+    plan = tenant.get("plan", "trial")
+    is_blocked = tenant.get("is_blocked", False)
+
+    if plan not in ["trial", None]:
+        return {"status": "paid", "plan": plan, "is_blocked": False, "days_left": None, "trial_ends_at": None}
+
+    if not trial_ends_at:
+        # First access — start trial now
+        ends = now + timedelta(days=7)
+        supabase.table("tenants").update({
+            "trial_ends_at": ends.isoformat(),
+            "trial_used": True,
+            "plan": "trial"
+        }).eq("id", tenant_id).execute()
+        return {"status": "trial", "plan": "trial", "is_blocked": False, "days_left": 7, "trial_ends_at": ends.isoformat()}
+
+    ends_dt = datetime.fromisoformat(trial_ends_at.replace("Z", ""))
+    days_left = max(0, (ends_dt - now).days)
+    expired = now > ends_dt
+
+    if expired and not is_blocked:
+        supabase.table("tenants").update({"is_blocked": True}).eq("id", tenant_id).execute()
+
+    return {
+        "status": "expired" if expired else "trial",
+        "plan": "trial",
+        "is_blocked": expired,
+        "days_left": days_left,
+        "trial_ends_at": trial_ends_at
+    }
+
+@app.post("/tenant/activate-plan", dependencies=[Depends(verify_key)])
+async def activate_plan(body: dict):
+    tenant_id = body.get("tenant_id")
+    plan = body.get("plan")  # starter | pro | business
+    if plan not in ["starter", "pro", "business"]:
+        raise HTTPException(status_code=400, detail="Plano inválido")
+    supabase.table("tenants").update({
+        "plan": plan,
+        "is_blocked": False,
+        "activated_at": datetime.utcnow().isoformat()
+    }).eq("id", tenant_id).execute()
+    return {"ok": True, "plan": plan}
