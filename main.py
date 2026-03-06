@@ -673,10 +673,13 @@ async def whatsapp_sync(body: dict):
                     continue
 
                 # Extrai telefone — remove sufixos do WhatsApp
-                phone = chat_id.replace("@s.whatsapp.net", "").replace("@c.us", "")
-                if not phone.replace("+", "").isdigit():
+                # chat_id pode vir como "5511999999999@s.whatsapp.net" ou "5511999999999@c.us"
+                phone = chat_id.replace("@s.whatsapp.net", "").replace("@c.us", "").replace("+", "").strip()
+                # Remove qualquer caracter não numérico que não seja dígito
+                phone = "".join(c for c in phone if c.isdigit())
+                if not phone or len(phone) < 8:
+                    stats["skipped"] += 1
                     continue
-                phone = phone.replace("+", "")
 
                 name = chat.get("name") or chat.get("displayName") or phone
 
