@@ -420,17 +420,22 @@ async def whatsapp_qrcode(instance: str = "default"):
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # Inicia sessão se não existir
-            await client.post(f"{WAHA_URL}/instance/create", headers=waha_headers(), json={"instanceName": instance, "integration": "WHATSAPP-BAILEYS"})
-            # Busca QR Code
-            r = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers(), params={"format": "image"})
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-                b64 = base64.b64encode(r.content).decode()
-                return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
-            # Tenta JSON
-            r2 = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers())
-            data = r2.json()
-            return {"qr_code": data.get("value", ""), "state": "SCAN_QR_CODE"}
+            # Evolution API: GET /instance/connect/{instance} retorna o QR Code
+            r = await client.get(f"{WAHA_URL}/instance/connect/{instance}", headers=waha_headers())
+            if r.status_code == 404:
+                # Instância não existe — cria e tenta de novo
+                await client.post(f"{WAHA_URL}/instance/create", headers=waha_headers(), json={"instanceName": instance, "integration": "WHATSAPP-BAILEYS"})
+                r = await client.get(f"{WAHA_URL}/instance/connect/{instance}", headers=waha_headers())
+            data = r.json()
+            # Evolution API retorna: {"code": "...", "base64": "data:image/png;base64,...", "count": 0}
+            qr_base64 = data.get("base64", "")
+            qr_code = data.get("code", "")
+            if qr_base64:
+                return {"qr_code": qr_base64, "state": "SCAN_QR_CODE"}
+            elif qr_code:
+                return {"qr_code": qr_code, "state": "SCAN_QR_CODE"}
+            else:
+                return {"qr_code": "", "state": data.get("state", "close"), "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
