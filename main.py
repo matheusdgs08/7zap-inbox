@@ -282,3 +282,152 @@ async def get_tenant(tenant_id: str):
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
     res = supabase.table("tenants").update({"copilot_prompt": body.copilot_prompt, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
     return {"ok": True, "tenant": res.data[0]}
+
+# ── BROADCASTS ────────────────────────────────────────────
+import asyncio, random
+
+class CreateBroadcast(BaseModel):
+    tenant_id: str
+    name: str
+    message: str
+    interval_min: int = 60
+    interval_max: int = 120
+    scheduled_at: Optional[str] = None
+    recipients: List[dict]  # [{phone, name, contact_id?}]
+
+class ScheduledMessageCreate(BaseModel):
+    tenant_id: str
+    conversation_id: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: str
+    message: str
+    scheduled_at: str
+    recurrence: Optional[str] = None  # daily, weekly, monthly
+
+@app.post("/broadcasts", dependencies=[Depends(verify_key)])
+async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
+    bcast = supabase.table("broadcasts").insert({
+        "tenant_id": body.tenant_id,
+        "name": body.name,
+        "message": body.message,
+        "status": "scheduled" if body.scheduled_at else "pending",
+        "scheduled_at": body.scheduled_at,
+        "interval_min": max(body.interval_min, 60),
+        "interval_max": max(body.interval_max, 90),
+        "total_recipients": len(body.recipients),
+        "sent_count": 0,
+        "failed_count": 0,
+    }).execute().data[0]
+
+    rows = [{"broadcast_id": bcast["id"], "phone": r["phone"], "name": r.get("name"), "contact_id": r.get("contact_id"), "status": "pending"} for r in body.recipients]
+    if rows:
+        supabase.table("broadcast_recipients").insert(rows).execute()
+
+    # If no scheduled time, start immediately
+    if not body.scheduled_at:
+        bg.add_task(run_broadcast, bcast["id"], body.interval_min, body.interval_max)
+
+    return {"broadcast": bcast}
+
+@app.get("/broadcasts", dependencies=[Depends(verify_key)])
+async def list_broadcasts(tenant_id: str):
+    return {"broadcasts": supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).execute().data}
+
+@app.get("/broadcasts/{broadcast_id}/recipients", dependencies=[Depends(verify_key)])
+async def list_recipients(broadcast_id: str):
+    return {"recipients": supabase.table("broadcast_recipients").select("*").eq("broadcast_id", broadcast_id).execute().data}
+
+@app.put("/broadcasts/{broadcast_id}/cancel", dependencies=[Depends(verify_key)])
+async def cancel_broadcast(broadcast_id: str):
+    supabase.table("broadcasts").update({"status": "cancelled"}).eq("id", broadcast_id).execute()
+    return {"ok": True}
+
+async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int):
+    """Background task: sends messages with random delay between each"""
+    supabase.table("broadcasts").update({"status": "sending", "started_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
+    recipients = supabase.table("broadcast_recipients").select("*").eq("broadcast_id", broadcast_id).eq("status", "pending").execute().data
+    bcast = supabase.table("broadcasts").select("*").eq("id", broadcast_id).single().execute().data
+
+    for rec in recipients:
+        # Check if cancelled
+        current = supabase.table("broadcasts").select("status").eq("id", broadcast_id).single().execute().data
+        if current["status"] == "cancelled":
+            break
+
+        message = bcast["message"].replace("{nome}", rec.get("name") or "").replace("{telefone}", rec.get("phone") or "")
+        success = False
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{WAHA_URL}/message/sendText",
+                    headers={"apikey": WAHA_KEY},
+                    json={"session": "default", "chatId": f"{rec['phone']}@s.whatsapp.net", "text": message}
+                )
+                success = r.status_code == 201
+        except Exception as e:
+            pass
+
+        supabase.table("broadcast_recipients").update({
+            "status": "sent" if success else "failed",
+            "sent_at": datetime.utcnow().isoformat() if success else None,
+            "error": None if success else "Falha no envio"
+        }).eq("id", rec["id"]).execute()
+
+        if success:
+            supabase.table("broadcasts").update({"sent_count": bcast["sent_count"] + 1}).eq("id", broadcast_id).execute()
+            bcast["sent_count"] += 1
+        else:
+            supabase.table("broadcasts").update({"failed_count": bcast["failed_count"] + 1}).eq("id", broadcast_id).execute()
+            bcast["failed_count"] += 1
+
+        # Random delay between messages (seconds)
+        delay = random.randint(interval_min, interval_max)
+        await asyncio.sleep(delay)
+
+    supabase.table("broadcasts").update({"status": "done", "finished_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
+
+# ── SCHEDULED MESSAGES ────────────────────────────────────
+@app.post("/scheduled-messages", dependencies=[Depends(verify_key)])
+async def create_scheduled_message(body: ScheduledMessageCreate):
+    row = supabase.table("scheduled_messages").insert({
+        "tenant_id": body.tenant_id,
+        "conversation_id": body.conversation_id,
+        "contact_name": body.contact_name,
+        "contact_phone": body.contact_phone,
+        "message": body.message,
+        "scheduled_at": body.scheduled_at,
+        "recurrence": body.recurrence,
+        "status": "pending",
+    }).execute().data[0]
+    return {"scheduled_message": row}
+
+@app.get("/scheduled-messages", dependencies=[Depends(verify_key)])
+async def list_scheduled_messages(tenant_id: str, status: Optional[str] = None):
+    q = supabase.table("scheduled_messages").select("*").eq("tenant_id", tenant_id)
+    if status:
+        q = q.eq("status", status)
+    return {"scheduled_messages": q.order("scheduled_at").execute().data}
+
+@app.delete("/scheduled-messages/{msg_id}", dependencies=[Depends(verify_key)])
+async def delete_scheduled_message(msg_id: str):
+    supabase.table("scheduled_messages").delete().eq("id", msg_id).execute()
+    return {"ok": True}
+
+# ── AI MESSAGE SUGGESTION FOR BROADCAST ──────────────────
+@app.post("/broadcasts/suggest-message", dependencies=[Depends(verify_key)])
+async def suggest_broadcast_message(body: dict):
+    tenant_id = body.get("tenant_id")
+    objective = body.get("objective", "")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+    tenant = supabase.table("tenants").select("copilot_prompt, name").eq("id", tenant_id).single().execute().data
+    system = tenant.get("copilot_prompt") or f"Você é um atendente da empresa {tenant['name']}."
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 400,
+                  "system": system + "\n\nCrie mensagens de WhatsApp curtas, naturais e sem parecer spam. Você pode usar {nome} para personalizar.",
+                  "messages": [{"role": "user", "content": f"Crie uma mensagem de disparo em massa para WhatsApp com o objetivo: {objective}\n\nRetorne apenas a mensagem, sem explicações."}]},
+        )
+        return {"suggestion": r.json()["content"][0]["text"]}
