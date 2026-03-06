@@ -55,103 +55,12 @@ async def require_admin(user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Acesso restrito a administradores")
     return user
 
-def verify_key(x_api_key: str = Header(...)):
-    if x_api_key != INBOX_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ── AUTH ENDPOINTS ───────────────────────────────────────
-@app.post("/auth/login")
-async def login(body: LoginRequest):
-    users = supabase.table("users").select("*").eq("email", body.email.lower().strip()).eq("is_active", True).execute().data
-    if not users:
-        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
-    user = users[0]
-    if not user.get("password_hash"):
-        raise HTTPException(status_code=401, detail="Usuário sem senha definida")
-    if not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
-        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
-    supabase.table("users").update({"last_login": datetime.utcnow().isoformat()}).eq("id", user["id"]).execute()
-    token = create_jwt(user)
-    return {
-        "token": token,
-        "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}
-    }
-
-@app.get("/auth/me")
-async def me(user=Depends(get_current_user)):
-    db_user = supabase.table("users").select("id, name, email, role, tenant_id, avatar_color, last_login").eq("id", user["sub"]).single().execute().data
-    return db_user
-
-@app.post("/auth/change-password")
-async def change_password(body: dict, user=Depends(get_current_user)):
-    current = body.get("current_password", "")
-    new_pw = body.get("new_password", "")
-    if len(new_pw) < 6:
-        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
-    db_user = supabase.table("users").select("password_hash").eq("id", user["sub"]).single().execute().data
-    if not bcrypt.checkpw(current.encode(), db_user["password_hash"].encode()):
-        raise HTTPException(status_code=401, detail="Senha atual incorreta")
-    new_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
-    supabase.table("users").update({"password_hash": new_hash}).eq("id", user["sub"]).execute()
-    return {"ok": True}
-
-# ── USER MANAGEMENT (admin only) ─────────────────────────
-@app.get("/admin/users")
-async def list_users_admin(admin=Depends(require_admin)):
-    return {"users": supabase.table("users").select("id, name, email, role, is_active, avatar_color, last_login, tenant_id").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
-
-@app.post("/admin/users")
-async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
-    existing = supabase.table("users").select("id").eq("email", body.email.lower()).execute().data
-    if existing:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
-    pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    user = supabase.table("users").insert({
-        "tenant_id": body.tenant_id,
-        "name": body.name,
-        "email": body.email.lower().strip(),
-        "role": body.role,
-        "password_hash": pw_hash,
-        "is_active": True,
-        "avatar_color": body.avatar_color,
-    }).execute().data[0]
-    user.pop("password_hash", None)
-    return {"user": user}
-
-@app.put("/admin/users/{user_id}")
-async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
-    updates = {}
-    if body.name is not None: updates["name"] = body.name
-    if body.email is not None: updates["email"] = body.email.lower().strip()
-    if body.role is not None: updates["role"] = body.role
-    if body.is_active is not None: updates["is_active"] = body.is_active
-    if body.avatar_color is not None: updates["avatar_color"] = body.avatar_color
-    if body.password is not None:
-        if len(body.password) < 6:
-            raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
-        updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    supabase.table("users").update(updates).eq("id", user_id).execute()
-    return {"ok": True}
-
-@app.delete("/admin/users/{user_id}")
-async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
-    if user_id == admin["sub"]:
-        raise HTTPException(status_code=400, detail="Você não pode excluir sua própria conta")
-    supabase.table("users").update({"is_active": False}).eq("id", user_id).execute()
-    return {"ok": True}
-
-async def waha_send(session: str, chat_id: str, text: str):
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(
-            f"{WAHA_URL}/api/sendText",
-            headers={"X-Api-Key": WAHA_KEY},
-            json={"session": session, "chatId": chat_id, "text": text},
-        )
-
-# ── Auth Schemas ────────────────────────────────────────
+# ── Schemas ─────────────────────────────────────────────
 class LoginRequest(BaseModel):
     email: str
     password: str
+
 
 class CreateUser(BaseModel):
     tenant_id: str
@@ -160,6 +69,7 @@ class CreateUser(BaseModel):
     password: str
     role: str = "agent"
     avatar_color: Optional[str] = "#00c853"
+
 
 class UpdateUser(BaseModel):
     name: Optional[str] = None
@@ -170,20 +80,25 @@ class UpdateUser(BaseModel):
     avatar_color: Optional[str] = None
 
 # ── Schemas ─────────────────────────────────────────────
+
 class SendMessage(BaseModel):
     conversation_id: str
     text: str
     sent_by: Optional[str] = None
     is_internal_note: Optional[bool] = False
 
+
 class AssignConversation(BaseModel):
     user_id: Optional[str] = None
+
 
 class UpdateKanban(BaseModel):
     stage: str
 
+
 class UpdateLabels(BaseModel):
     labels: List[dict]
+
 
 class CreateTask(BaseModel):
     title: str
@@ -191,13 +106,16 @@ class CreateTask(BaseModel):
     assigned_to: Optional[str] = None
     due_at: Optional[str] = None
 
+
 class CreateTaskUpdate(BaseModel):
     content: str
     created_by: Optional[str] = None
 
+
 class CreateQuickReply(BaseModel):
     title: str
     content: str
+
 
 class UpdateCopilotPrompt(BaseModel):
     tenant_id: str
@@ -419,6 +337,7 @@ async def update_copilot_prompt(body: UpdateCopilotPrompt):
 # ── BROADCASTS ────────────────────────────────────────────
 import asyncio, random
 
+
 class CreateBroadcast(BaseModel):
     tenant_id: str
     name: str
@@ -427,6 +346,7 @@ class CreateBroadcast(BaseModel):
     interval_max: int = 120
     scheduled_at: Optional[str] = None
     recipients: List[dict]  # [{phone, name, contact_id?}]
+
 
 class ScheduledMessageCreate(BaseModel):
     tenant_id: str
@@ -564,3 +484,99 @@ async def suggest_broadcast_message(body: dict):
                   "messages": [{"role": "user", "content": f"Crie uma mensagem de disparo em massa para WhatsApp com o objetivo: {objective}\n\nRetorne apenas a mensagem, sem explicações."}]},
         )
         return {"suggestion": r.json()["content"][0]["text"]}
+
+
+def verify_key(x_api_key: str = Header(...)):
+    if x_api_key != INBOX_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ── AUTH ENDPOINTS ───────────────────────────────────────
+@app.post("/auth/login")
+async def login(body: LoginRequest):
+    users = supabase.table("users").select("*").eq("email", body.email.lower().strip()).eq("is_active", True).execute().data
+    if not users:
+        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+    user = users[0]
+    if not user.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Usuário sem senha definida")
+    if not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+    supabase.table("users").update({"last_login": datetime.utcnow().isoformat()}).eq("id", user["id"]).execute()
+    token = create_jwt(user)
+    return {
+        "token": token,
+        "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}
+    }
+
+@app.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    db_user = supabase.table("users").select("id, name, email, role, tenant_id, avatar_color, last_login").eq("id", user["sub"]).single().execute().data
+    return db_user
+
+@app.post("/auth/change-password")
+async def change_password(body: dict, user=Depends(get_current_user)):
+    current = body.get("current_password", "")
+    new_pw = body.get("new_password", "")
+    if len(new_pw) < 6:
+        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+    db_user = supabase.table("users").select("password_hash").eq("id", user["sub"]).single().execute().data
+    if not bcrypt.checkpw(current.encode(), db_user["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Senha atual incorreta")
+    new_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
+    supabase.table("users").update({"password_hash": new_hash}).eq("id", user["sub"]).execute()
+    return {"ok": True}
+
+# ── USER MANAGEMENT (admin only) ─────────────────────────
+@app.get("/admin/users")
+async def list_users_admin(admin=Depends(require_admin)):
+    return {"users": supabase.table("users").select("id, name, email, role, is_active, avatar_color, last_login, tenant_id").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
+
+@app.post("/admin/users")
+async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
+    existing = supabase.table("users").select("id").eq("email", body.email.lower()).execute().data
+    if existing:
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
+    pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    user = supabase.table("users").insert({
+        "tenant_id": body.tenant_id,
+        "name": body.name,
+        "email": body.email.lower().strip(),
+        "role": body.role,
+        "password_hash": pw_hash,
+        "is_active": True,
+        "avatar_color": body.avatar_color,
+    }).execute().data[0]
+    user.pop("password_hash", None)
+    return {"user": user}
+
+@app.put("/admin/users/{user_id}")
+async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
+    updates = {}
+    if body.name is not None: updates["name"] = body.name
+    if body.email is not None: updates["email"] = body.email.lower().strip()
+    if body.role is not None: updates["role"] = body.role
+    if body.is_active is not None: updates["is_active"] = body.is_active
+    if body.avatar_color is not None: updates["avatar_color"] = body.avatar_color
+    if body.password is not None:
+        if len(body.password) < 6:
+            raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+        updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    supabase.table("users").update(updates).eq("id", user_id).execute()
+    return {"ok": True}
+
+@app.delete("/admin/users/{user_id}")
+async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
+    if user_id == admin["sub"]:
+        raise HTTPException(status_code=400, detail="Você não pode excluir sua própria conta")
+    supabase.table("users").update({"is_active": False}).eq("id", user_id).execute()
+    return {"ok": True}
+
+async def waha_send(session: str, chat_id: str, text: str):
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{WAHA_URL}/api/sendText",
+            headers={"X-Api-Key": WAHA_KEY},
+            json={"session": session, "chatId": chat_id, "text": text},
+        )
+
+# ── All Schemas ──────────────────────────────────────────
