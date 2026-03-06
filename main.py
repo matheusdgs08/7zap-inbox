@@ -618,3 +618,163 @@ async def get_plan_features(tenant_id: str):
     plan = tenant.get("plan", "trial")
     features = PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])
     return {"plan": plan, "features": features}
+
+# ── SINCRONIZAÇÃO DE HISTÓRICO WHATSAPP ──────────────────
+@app.post("/whatsapp/sync", dependencies=[Depends(verify_key)])
+async def whatsapp_sync(body: dict):
+    """
+    Importa histórico de conversas do WhatsApp para o 7CRM.
+    Limites por plano: Pro=90 dias, Business=180 dias.
+    """
+    tenant_id = body.get("tenant_id")
+    instance  = body.get("instance", "default")
+
+    # Verifica plano
+    tenant = supabase.table("tenants").select("plan, name").eq("id", tenant_id).single().execute().data
+    plan   = tenant.get("plan", "starter")
+
+    plan_days = {"pro": 90, "business": 180, "trial": 90, "enterprise": 365}
+    if plan == "starter":
+        raise HTTPException(status_code=403, detail="Sincronização de histórico disponível nos planos Pro e Business.")
+    days_limit = plan_days.get(plan, 90)
+    since_ts   = int((datetime.utcnow() - timedelta(days=days_limit)).timestamp() * 1000)
+
+    stats = {"chats": 0, "contacts_created": 0, "conversations_created": 0, "messages_saved": 0, "skipped": 0}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 1. Busca lista de chats — tenta as duas rotas possíveis da WAHA
+        chats = []
+        error_detail = ""
+        for route in [
+            f"{WAHA_URL}/api/chats?session={instance}",         # WAHA Core / Plus
+            f"{WAHA_URL}/api/{instance}/chats",                  # WAHA Legacy
+        ]:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
+                    break
+                else:
+                    error_detail = f"Rota {route} retornou {r.status_code}: {r.text[:200]}"
+            except Exception as e:
+                error_detail = str(e)
+                continue
+
+        if not chats:
+            raise HTTPException(status_code=502, detail=f"Não foi possível buscar os chats da WAHA. Detalhes: {error_detail}")
+
+        stats["chats"] = len(chats)
+
+        for chat in chats:
+            try:
+                chat_id = chat.get("id", "")
+                if not chat_id or "@g.us" in chat_id:  # Pula grupos
+                    continue
+
+                # Extrai telefone — remove sufixos do WhatsApp
+                phone = chat_id.replace("@s.whatsapp.net", "").replace("@c.us", "")
+                if not phone.replace("+", "").isdigit():
+                    continue
+                phone = phone.replace("+", "")
+
+                name = chat.get("name") or chat.get("displayName") or phone
+
+                # Upsert contato — cria se não existir, atualiza nome se existir
+                existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
+                if existing:
+                    contact_id = existing[0]["id"]
+                else:
+                    contact = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data
+                    contact_id = contact[0]["id"]
+                    stats["contacts_created"] += 1
+
+                # Upsert conversa
+                existing_conv = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
+                if existing_conv:
+                    conv_id = existing_conv[0]["id"]
+                else:
+                    conv = supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": 0}).execute().data
+                    conv_id = conv[0]["id"]
+                    stats["conversations_created"] += 1
+
+                # Busca mensagens — tenta as duas rotas
+                messages = []
+                for msg_route in [
+                    f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=100",
+                    f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=100&downloadMedia=false",
+                ]:
+                    try:
+                        msgs_r = await client.get(msg_route, headers=waha_headers(), timeout=15)
+                        if msgs_r.status_code == 200:
+                            data = msgs_r.json()
+                            messages = data if isinstance(data, list) else data.get("messages", [])
+                            break
+                    except:
+                        continue
+
+                for msg in messages:
+                    # Filtra por data — só importa mensagens dentro do período do plano
+                    msg_ts = msg.get("timestamp", 0)
+                    if isinstance(msg_ts, float):
+                        msg_ts = int(msg_ts * 1000)
+                    elif isinstance(msg_ts, int) and msg_ts < 10000000000:
+                        msg_ts = msg_ts * 1000  # converte segundos para ms
+                    if msg_ts and msg_ts < since_ts:
+                        continue
+
+                    # Extrai conteúdo da mensagem
+                    msg_type = "text"
+                    body_field = msg.get("body") or msg.get("text") or msg.get("content") or ""
+                    caption = msg.get("caption", "")
+                    msg_content = body_field or caption or ""
+
+                    if not msg_content:
+                        media_type = msg.get("type", msg.get("mediaType", ""))
+                        if "image" in media_type:    msg_content = "[Imagem]";    msg_type = "image"
+                        elif "audio" in media_type:  msg_content = "[Áudio]";     msg_type = "audio"
+                        elif "video" in media_type:  msg_content = "[Vídeo]";     msg_type = "video"
+                        elif "doc" in media_type or "pdf" in media_type: msg_content = "[Documento]"; msg_type = "document"
+                        elif "sticker" in media_type: msg_content = "[Sticker]"
+                        else: msg_content = "[Mensagem]"
+
+                    direction  = "outbound" if msg.get("fromMe") else "inbound"
+                    waha_id    = str(msg.get("id", ""))
+                    created_at = datetime.utcfromtimestamp(msg_ts / 1000).isoformat() if msg_ts else datetime.utcnow().isoformat()
+
+                    # Evita duplicatas pelo waha_id
+                    if waha_id:
+                        dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
+                        if dup:
+                            continue
+
+                    supabase.table("messages").insert({
+                        "conversation_id": conv_id,
+                        "direction": direction,
+                        "content": msg_content,
+                        "type": msg_type,
+                        "is_internal_note": False,
+                        "waha_id": waha_id,
+                        "created_at": created_at,
+                    }).execute()
+                    stats["messages_saved"] += 1
+
+                # Atualiza timestamp da última mensagem na conversa
+                supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
+
+            except Exception as e:
+                stats["skipped"] += 1
+                continue
+
+    return {
+        "ok": True,
+        "stats": stats,
+        "message": f"Sincronização concluída! {stats['messages_saved']} mensagens importadas de {stats['conversations_created']} conversas novas."
+    }
+
+@app.get("/whatsapp/sync-status", dependencies=[Depends(verify_key)])
+async def sync_status(tenant_id: str):
+    """Retorna stats rápidas para mostrar no painel."""
+    convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
+    msgs  = supabase.table("messages").select("id", count="exact").execute()
+    return {"conversations": convs.count, "messages": msgs.count}
