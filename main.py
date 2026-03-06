@@ -1,13 +1,22 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 import concurrent.futures
-
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 async def run_sync(fn):
-    """Roda função síncrona (ex: Supabase) sem bloquear o event loop"""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, fn)
-_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    return await loop.run_in_executor(_thread_pool, fn)
+
+# ── CACHE SIMPLES ─────────────────────────────────────────
+_cache: dict = {}
+def cache_get(key):
+    v = _cache.get(key)
+    if v and (datetime.utcnow().timestamp() - v["ts"]) < v["ttl"]:
+        return v["data"]
+    return None
+def cache_set(key, data, ttl=20):
+    _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
+def cache_del(key):
+    _cache.pop(key, None)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -229,31 +238,59 @@ async def receive_message(payload: dict):
 
         supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
+        # Invalida cache para forçar reload no frontend
+        cache_del(f"msgs:{conv_id}")
+        cache_del(f"convs:{tid}:open")
+        cache_del(f"convs:{tid}:None")
+        cache_del(f"convs:{tid}:all")
     return {"ok": True}
 
 # ── CONVERSATIONS ────────────────────────────────────────
 @app.get("/conversations", dependencies=[Depends(verify_key)])
 async def list_conversations(tenant_id: str, status: Optional[str] = None):
+    cache_key = f"convs:{tenant_id}:{status}"
+    cached = cache_get(cache_key)
+    if cached:
+        return {"conversations": cached}
+
     def _query():
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
         convs = q.order("last_message_at", desc=True).limit(200).execute().data
+        if not convs:
+            return convs
+        # Busca todos os labels de uma vez (sem N+1)
+        conv_ids = [c["id"] for c in convs]
+        all_cl = supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data
+        # Agrupa label_ids por conversa
+        cl_map: dict = {}
+        for row in all_cl:
+            cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
+        # Busca detalhes dos labels únicos
+        all_label_ids = list({r["label_id"] for r in all_cl if r.get("label_id")})
+        label_details = {}
+        if all_label_ids:
+            for lb in supabase.table("labels").select("id,name,color").in_("id", all_label_ids).execute().data:
+                label_details[lb["id"]] = lb
+        # Monta labels por conversa
         for c in convs:
-            cl_res = supabase.table("conversation_labels").select("label_id").eq("conversation_id", c["id"]).execute().data
-            label_ids = [r["label_id"] for r in cl_res if r.get("label_id")]
-            if label_ids:
-                labels_res = supabase.table("labels").select("id,name,color").in_("id", label_ids).execute().data
-                c["labels"] = labels_res
-            else:
-                c["labels"] = []
+            c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
         return convs
+
     convs = await run_sync(_query)
+    cache_set(cache_key, convs, ttl=20)
     return {"conversations": convs}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str):
+    cache_key = f"msgs:{conv_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
+        return {"messages": cached}
     msgs = await run_sync(lambda: supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").execute().data)
     await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
+    cache_set(cache_key, msgs, ttl=10)
     return {"messages": msgs}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
