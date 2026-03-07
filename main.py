@@ -933,3 +933,179 @@ async def register_with_invite(body: dict):
 async def list_invites(admin=Depends(require_admin)):
     invites = supabase.table("invite_codes").select("*, users!created_by(name)").eq("tenant_id", admin["tenant_id"]).order("created_at", desc=True).limit(20).execute().data
     return {"invites": invites}
+
+# ── RELATÓRIOS / ANALYTICS ────────────────────────────────
+
+@app.get("/reports/messages", dependencies=[Depends(verify_key)])
+async def report_messages(tenant_id: str, days: int = 30):
+    """Mensagens por dia e por hora — heatmap"""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    # Get conversations for this tenant
+    convs = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data
+    conv_ids = [c["id"] for c in convs]
+    if not conv_ids:
+        return {"by_day": [], "by_hour": [], "by_weekday": [], "total": 0}
+    
+    # Fetch messages
+    msgs = []
+    batch = 200
+    for i in range(0, len(conv_ids), batch):
+        chunk = conv_ids[i:i+batch]
+        r = supabase.table("messages").select("id,direction,created_at,conversation_id").in_("conversation_id", chunk).gte("created_at", since).execute().data
+        msgs.extend(r)
+    
+    # Aggregate by day
+    by_day = {}
+    by_hour = {str(h): 0 for h in range(24)}
+    by_weekday = {str(d): 0 for d in range(7)}
+    inbound = 0
+    outbound = 0
+    
+    for m in msgs:
+        try:
+            dt = datetime.fromisoformat(m["created_at"].replace("Z","").replace("+00:00",""))
+            day = dt.strftime("%Y-%m-%d")
+            by_day[day] = by_day.get(day, 0) + 1
+            by_hour[str(dt.hour)] = by_hour.get(str(dt.hour), 0) + 1
+            by_weekday[str(dt.weekday())] = by_weekday.get(str(dt.weekday()), 0) + 1
+            if m["direction"] == "inbound": inbound += 1
+            else: outbound += 1
+        except: pass
+    
+    by_day_list = [{"date": k, "count": v} for k,v in sorted(by_day.items())]
+    by_hour_list = [{"hour": int(k), "count": v} for k,v in sorted(by_hour.items(), key=lambda x: int(x[0]))]
+    by_weekday_list = [{"day": int(k), "label": ["Seg","Ter","Qua","Qui","Sex","Sáb","Dom"][int(k)], "count": v} for k,v in sorted(by_weekday.items(), key=lambda x: int(x[0]))]
+    
+    return {"by_day": by_day_list, "by_hour": by_hour_list, "by_weekday": by_weekday_list,
+            "total": len(msgs), "inbound": inbound, "outbound": outbound}
+
+@app.get("/reports/agents", dependencies=[Depends(verify_key)])
+async def report_agents(tenant_id: str, days: int = 30):
+    """Performance por atendente"""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    users = supabase.table("users").select("id,name,email,role").eq("tenant_id", tenant_id).execute().data
+    convs = supabase.table("conversations").select("id,assigned_to,status,created_at,last_message_at").eq("tenant_id", tenant_id).gte("created_at", since).execute().data
+    
+    agent_map = {u["id"]: {"id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"],
+                           "total_convs": 0, "resolved": 0, "active": 0, "msgs_sent": 0} for u in users}
+    
+    conv_ids = [c["id"] for c in convs]
+    msgs_sent = {}
+    if conv_ids:
+        for i in range(0, len(conv_ids), 200):
+            chunk = conv_ids[i:i+200]
+            ms = supabase.table("messages").select("conversation_id,direction").in_("conversation_id", chunk).eq("direction","outbound").execute().data
+            for m in ms:
+                msgs_sent[m["conversation_id"]] = msgs_sent.get(m["conversation_id"], 0) + 1
+    
+    for c in convs:
+        aid = c.get("assigned_to")
+        if aid and aid in agent_map:
+            agent_map[aid]["total_convs"] += 1
+            if c["status"] == "resolved": agent_map[aid]["resolved"] += 1
+            else: agent_map[aid]["active"] += 1
+            agent_map[aid]["msgs_sent"] += msgs_sent.get(c["id"], 0)
+    
+    agents_list = sorted(agent_map.values(), key=lambda x: x["total_convs"], reverse=True)
+    return {"agents": agents_list, "period_days": days}
+
+@app.get("/reports/broadcasts", dependencies=[Depends(verify_key)])
+async def report_broadcasts(tenant_id: str):
+    """Relatório de disparos — enviados vs respondidos"""
+    broadcasts = supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20).execute().data
+    result = []
+    for b in broadcasts:
+        sent = b.get("recipients_count", 0)
+        delivered = b.get("delivered_count", 0)
+        # Count replies: messages inbound after broadcast creation from broadcast contacts
+        result.append({
+            "id": b["id"], "message": (b.get("message","") or "")[:80],
+            "created_at": b.get("created_at"), "status": b.get("status"),
+            "sent": sent, "delivered": delivered,
+            "reply_rate": round(delivered/sent*100) if sent > 0 else 0
+        })
+    return {"broadcasts": result}
+
+@app.get("/reports/credits", dependencies=[Depends(verify_key)])
+async def report_credits(tenant_id: str, days: int = 30):
+    """Consumo de créditos de IA por período"""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    # Get AI suggestions used (messages with ai_suggestion set)
+    convs = supabase.table("conversations").select("id,assigned_to").eq("tenant_id", tenant_id).execute().data
+    conv_ids = [c["id"] for c in convs]
+    assigned = {c["id"]: c.get("assigned_to") for c in convs}
+    
+    ai_msgs = []
+    if conv_ids:
+        for i in range(0, len(conv_ids), 200):
+            chunk = conv_ids[i:i+200]
+            r = supabase.table("messages").select("conversation_id,created_at,ai_suggestion").in_("conversation_id", chunk).gte("created_at", since).not_.is_("ai_suggestion", "null").execute().data
+            ai_msgs.extend(r)
+    
+    # Per agent
+    users = supabase.table("users").select("id,name").eq("tenant_id", tenant_id).execute().data
+    user_names = {u["id"]: u["name"] for u in users}
+    by_agent = {}
+    by_day = {}
+    
+    for m in ai_msgs:
+        aid = assigned.get(m["conversation_id"], "unknown")
+        name = user_names.get(aid, "Sem atribuição")
+        by_agent[name] = by_agent.get(name, 0) + 1
+        try:
+            day = datetime.fromisoformat(m["created_at"].replace("Z","").replace("+00:00","")).strftime("%Y-%m-%d")
+            by_day[day] = by_day.get(day, 0) + 1
+        except: pass
+    
+    tenant_data = supabase.table("tenants").select("ai_credits,ai_credits_reset_at,plan").eq("id", tenant_id).single().execute().data
+    credits_remaining, plan, limit = get_tenant_credits(tenant_id)
+    
+    return {
+        "total_used": len(ai_msgs),
+        "credits_remaining": credits_remaining,
+        "credits_limit": limit,
+        "plan": plan,
+        "cost_estimate": round(len(ai_msgs) * 0.0007, 2),
+        "by_agent": [{"name": k, "used": v} for k,v in sorted(by_agent.items(), key=lambda x: x[1], reverse=True)],
+        "by_day": [{"date": k, "count": v} for k,v in sorted(by_day.items())],
+        "period_days": days
+    }
+
+@app.get("/reports/financial-forecast", dependencies=[Depends(verify_key)])
+async def report_financial_forecast(tenant_id: str):
+    """Previsão financeira — próximo mês"""
+    # Require super admin
+    if tenant_id != os.environ.get("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9"):
+        raise HTTPException(403, "Acesso restrito")
+    
+    all_tenants = supabase.table("tenants").select("id,name,plan,is_blocked,created_at").execute().data
+    plan_prices = {"trial": 0, "starter": 99, "pro": 149, "business": 299, "enterprise": 999}
+    
+    forecast = []
+    mrr_total = 0
+    for t in all_tenants:
+        if t.get("is_blocked"): continue
+        price = plan_prices.get(t.get("plan","starter"), 0)
+        if price == 0: continue
+        mrr_total += price
+        # Estimate renewal date (monthly from created_at)
+        try:
+            created = datetime.fromisoformat(t["created_at"].replace("Z","").replace("+00:00",""))
+            now = datetime.utcnow()
+            months_since = (now.year - created.year)*12 + now.month - created.month
+            renewal = created.replace(year=created.year + (created.month + months_since) // 12,
+                                      month=(created.month + months_since) % 12 or 12)
+            days_until = (renewal - now).days % 30
+        except: days_until = 15
+        forecast.append({"name": t["name"], "plan": t.get("plan"), "mrr": price, "days_until_renewal": days_until})
+    
+    forecast.sort(key=lambda x: x["days_until_renewal"])
+    
+    return {
+        "mrr_forecast": mrr_total,
+        "arr_forecast": mrr_total * 12,
+        "active_tenants": len(forecast),
+        "renewals_this_week": [f for f in forecast if f["days_until_renewal"] <= 7],
+        "renewals_this_month": forecast,
+        "plan_breakdown": {p: sum(1 for f in forecast if f["plan"]==p) for p in plan_prices}
+    }
