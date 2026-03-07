@@ -17,6 +17,40 @@ def cache_set(key, data, ttl=20):
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
 def cache_del(key):
     _cache.pop(key, None)
+# ── CREDIT HELPERS ───────────────────────────────────────
+def get_tenant_credits(tenant_id: str):
+    """Returns (credits_remaining, plan, credits_limit). Also resets if monthly."""
+    tenant = supabase.table("tenants").select("plan,ai_credits,ai_credits_reset_at,ai_credits_purchased").eq("id", tenant_id).single().execute().data
+    plan = tenant.get("plan", "starter")
+    limit = PLAN_CREDITS.get(plan, 10)
+    credits = tenant.get("ai_credits")
+    reset_at = tenant.get("ai_credits_reset_at")
+    now = datetime.utcnow()
+
+    # Initialize credits if never set
+    if credits is None:
+        supabase.table("tenants").update({"ai_credits": limit, "ai_credits_reset_at": now.isoformat()}).eq("id", tenant_id).execute()
+        return limit, plan, limit
+
+    # Monthly reset for Pro/Business
+    if PLAN_RESETS.get(plan) and reset_at:
+        reset_dt = datetime.fromisoformat(reset_at.replace("Z","").replace("+00:00",""))
+        if (now - reset_dt).days >= 30:
+            new_credits = limit + (tenant.get("ai_credits_purchased") or 0)
+            supabase.table("tenants").update({"ai_credits": new_credits, "ai_credits_reset_at": now.isoformat()}).eq("id", tenant_id).execute()
+            return new_credits, plan, limit
+
+    return credits, plan, limit
+
+def consume_credit(tenant_id: str, amount: int = 1):
+    """Deduct credits. Returns (ok, credits_remaining, error_detail)."""
+    credits, plan, limit = get_tenant_credits(tenant_id)
+    if credits < amount:
+        return False, credits, f"Créditos insuficientes. Restam {credits} crédito(s). Faça upgrade ou compre mais créditos."
+    new_val = credits - amount
+    supabase.table("tenants").update({"ai_credits": new_val}).eq("id", tenant_id).execute()
+    return True, new_val, None
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -58,8 +92,8 @@ async def keepalive_loop():
 async def ping():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-def create_jwt(user):
-    payload = {"sub": user["id"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "name": user["name"], "exp": datetime.utcnow() + timedelta(hours=168)}
+def create_jwt(user, session_id: str):
+    payload = {"sub": user["id"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "name": user["name"], "session_id": session_id, "exp": datetime.utcnow() + timedelta(hours=168)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def decode_jwt(token):
@@ -68,7 +102,16 @@ def decode_jwt(token):
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials: raise HTTPException(status_code=401, detail="Token necessário")
-    return decode_jwt(credentials.credentials)
+    payload = decode_jwt(credentials.credentials)
+    # Single-session check: verify session_id still matches DB
+    session_id = payload.get("session_id")
+    if session_id:
+        db_user = supabase.table("users").select("session_id,is_active").eq("id", payload["sub"]).single().execute().data
+        if not db_user or not db_user.get("is_active"):
+            raise HTTPException(status_code=401, detail="Usuário inativo")
+        if db_user.get("session_id") != session_id:
+            raise HTTPException(status_code=401, detail="Sessão encerrada. Outro dispositivo fez login com esta conta.")
+    return payload
 
 async def require_admin(user=Depends(get_current_user)):
     if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Apenas admins")
@@ -143,8 +186,10 @@ async def login(body: LoginRequest):
     loop = asyncio.get_event_loop()
     pw_ok = await loop.run_in_executor(_thread_pool, lambda: bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()))
     if not pw_ok: raise HTTPException(status_code=401, detail="Email ou senha incorretos")
-    supabase.table("users").update({"last_login": datetime.utcnow().isoformat()}).eq("id", user["id"]).execute()
-    return {"token": create_jwt(user), "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}}
+    import secrets as _secrets
+    session_id = _secrets.token_hex(16)
+    supabase.table("users").update({"last_login": datetime.utcnow().isoformat(), "session_id": session_id}).eq("id", user["id"]).execute()
+    return {"token": create_jwt(user, session_id), "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}}
 
 @app.get("/auth/me")
 async def me(user=Depends(get_current_user)):
@@ -403,8 +448,15 @@ async def create_quick_reply(body: CreateQuickReply, tenant_id: str):
 
 # ── CO-PILOT ─────────────────────────────────────────────
 @app.get("/conversations/{conv_id}/suggest", dependencies=[Depends(verify_key)])
-async def ai_suggest(conv_id: str):
+async def ai_suggest(conv_id: str, tenant_id: str = None):
     if not ANTHROPIC_API_KEY: raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+    # Get tenant_id from conversation if not provided
+    if not tenant_id:
+        conv_data = supabase.table("conversations").select("tenant_id").eq("id", conv_id).single().execute().data
+        tenant_id = conv_data.get("tenant_id") if conv_data else None
+    if tenant_id:
+        ok, remaining, err = consume_credit(tenant_id, 1)
+        if not ok: raise HTTPException(status_code=402, detail=err)
     msgs = supabase.table("messages").select("direction,content,is_internal_note").eq("conversation_id", conv_id).order("created_at", desc=True).limit(10).execute().data
     msgs = [m for m in reversed(msgs) if not m.get("is_internal_note")]
     conv = supabase.table("conversations").select("*, tenants(copilot_prompt,name)").eq("id", conv_id).single().execute().data
@@ -420,7 +472,29 @@ async def ai_suggest(conv_id: str):
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
 async def get_tenant(tenant_id: str):
-    return supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end").eq("id", tenant_id).single().execute().data
+    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
+    if tenant:
+        credits, plan, limit = get_tenant_credits(tenant_id)
+        tenant["ai_credits"] = credits
+        tenant["ai_credits_limit"] = limit
+        tenant["ai_credits_pct"] = round((credits / limit * 100) if limit > 0 else 100)
+    return tenant
+
+@app.get("/credits", dependencies=[Depends(verify_key)])
+async def get_credits(tenant_id: str):
+    credits, plan, limit = get_tenant_credits(tenant_id)
+    return {"credits": credits, "limit": limit, "plan": plan,
+            "pct": round(credits / limit * 100) if limit > 0 else 100,
+            "warning": credits < limit * 0.25,
+            "resets_monthly": PLAN_RESETS.get(plan, False)}
+
+@app.post("/credits/buy", dependencies=[Depends(verify_key)])
+async def buy_credits(body: dict):
+    tenant_id = body.get("tenant_id")
+    amount = int(body.get("amount", 500))
+    if amount not in [500, 1000, 2000]: raise HTTPException(400, "Pacote inválido")
+    supabase.table("tenants").update({"ai_credits": supabase.table("tenants").select("ai_credits").eq("id", tenant_id).single().execute().data.get("ai_credits", 0) + amount, "ai_credits_purchased": (supabase.table("tenants").select("ai_credits_purchased").eq("id", tenant_id).single().execute().data.get("ai_credits_purchased") or 0) + amount}).eq("id", tenant_id).execute()
+    return {"ok": True, "added": amount}
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
@@ -624,6 +698,9 @@ async def onboarding_analyze(body: dict):
             next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
             days_until = (next_month - now).days
             raise HTTPException(status_code=429, detail=f"Você já usou o Onboarding este mês. Disponível novamente em {days_until} dia(s).")
+    # Check and consume 1000 credits
+    ok, remaining, err = consume_credit(tenant_id, 1000)
+    if not ok: raise HTTPException(status_code=402, detail=f"São necessários 1.000 créditos para esta análise. {err}")
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     conversations = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since).limit(conv_limit).execute().data
     if not conversations:
