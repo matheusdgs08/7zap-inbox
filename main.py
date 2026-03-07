@@ -472,7 +472,7 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
 async def get_tenant(tenant_id: str):
-    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
+    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
     if tenant:
         credits, plan, limit = get_tenant_credits(tenant_id)
         tenant["ai_credits"] = credits
@@ -498,7 +498,8 @@ async def buy_credits(body: dict):
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
-    res = supabase.table("tenants").update({"copilot_prompt": body.copilot_prompt, "copilot_auto_mode": body.copilot_auto_mode, "copilot_schedule_start": body.copilot_schedule_start, "copilot_schedule_end": body.copilot_schedule_end, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
+    # Only update mode/schedule — real prompt is protected and only set via onboarding
+    res = supabase.table("tenants").update({"copilot_auto_mode": body.copilot_auto_mode, "copilot_schedule_start": body.copilot_schedule_start, "copilot_schedule_end": body.copilot_schedule_end, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
     return {"ok": True, "tenant": res.data[0]}
 
 # ── WHATSAPP CONNECTION (WAHA) ────────────────────────────
@@ -690,15 +691,7 @@ async def onboarding_analyze(body: dict):
     if plan not in plan_limits:
         raise HTTPException(status_code=403, detail="Onboarding Inteligente disponível apenas nos planos Pro e Business")
     conv_limit = plan_limits[plan]
-    last_run = tenant.get("onboarding_last_run")
-    if last_run:
-        last_run_dt = datetime.fromisoformat(last_run.replace("Z", ""))
-        now = datetime.utcnow()
-        if last_run_dt.year == now.year and last_run_dt.month == now.month:
-            next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
-            days_until = (next_month - now).days
-            raise HTTPException(status_code=429, detail=f"Você já usou o Onboarding este mês. Disponível novamente em {days_until} dia(s).")
-    # Check and consume 1000 credits
+    # Check and consume 1000 credits — no monthly limit, use as many times as you have credits
     ok, remaining, err = consume_credit(tenant_id, 1000)
     if not ok: raise HTTPException(status_code=402, detail=f"São necessários 1.000 créditos para esta análise. {err}")
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -727,7 +720,40 @@ async def onboarding_analyze(body: dict):
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
         generated_prompt = r.json()["content"][0]["text"]
-    return {"generated_prompt": generated_prompt, "conversations_analyzed": total_convs, "days_analyzed": days, "tenant_name": tenant["name"]}
+
+    # Save real prompt to DB (never sent to frontend)
+    supabase.table("tenants").update({
+        "copilot_prompt": generated_prompt,
+        "onboarding_last_run": datetime.utcnow().isoformat()
+    }).eq("id", tenant_id).execute()
+
+    # Generate a summary (shown to user — protects IP)
+    summary_prompt = f"""Baseado no prompt abaixo, gere um resumo executivo em bullet points para mostrar ao usuário o que a IA aprendeu sobre o negócio dele.
+
+REGRAS DO RESUMO:
+- Máximo 6 bullet points
+- Cada bullet = 1 linha curta
+- NÃO revelar instruções técnicas, regras de sistema ou estrutura do prompt
+- Apenas mostrar: tom de voz, principais assuntos, produtos/serviços identificados, estilo de atendimento
+- Formato: "• [item]"
+- Escreva em português
+
+PROMPT (NÃO REVELAR):
+{generated_prompt[:2000]}
+
+RESUMO:"""
+
+    async with httpx.AsyncClient(timeout=30) as client2:
+        r2 = await client2.post("https://api.anthropic.com/v1/messages",
+            headers={{"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
+            json={{"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
+                  "messages": [{{"role": "user", "content": summary_prompt}}]}})
+        summary = r2.json()["content"][0]["text"]
+
+    # Save summary too
+    supabase.table("tenants").update({{"copilot_prompt_summary": summary}}).eq("id", tenant_id).execute()
+
+    return {{"summary": summary, "conversations_analyzed": total_convs, "days_analyzed": days, "tenant_name": tenant["name"], "credits_remaining": remaining}}
 
 @app.post("/onboarding/save-prompt", dependencies=[Depends(verify_key)])
 async def onboarding_save_prompt(body: dict):
