@@ -778,11 +778,11 @@ async def onboarding_save_prompt(body: dict):
 
 # ── PLAN FEATURES ────────────────────────────────────────
 PLAN_FEATURES = {
-    "trial":    {"agents": 15, "numbers": 3,  "ai_credits": 1000, "disparos": True,  "copilot": True,  "onboarding": False, "white_label": False},
-    "starter":  {"agents": 5,  "numbers": 1,  "ai_credits": 0,    "disparos": True,  "copilot": False, "onboarding": False, "white_label": False},
-    "pro":      {"agents": 15, "numbers": 3,  "ai_credits": 1000, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
-    "business": {"agents": 30, "numbers": 8,  "ai_credits": 3000, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
-    "enterprise":{"agents":999,"numbers": 999,"ai_credits":99999,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
+    "trial":     {"agents": 3,   "numbers": 1,   "ai_credits": 200,   "disparos": True,  "copilot": True,  "onboarding": False, "white_label": False},
+    "starter":   {"agents": 3,   "numbers": 1,   "ai_credits": 0,     "disparos": True,  "copilot": False, "onboarding": False, "white_label": False},
+    "pro":       {"agents": 8,   "numbers": 2,   "ai_credits": 300,   "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
+    "business":  {"agents": 20,  "numbers": 5,   "ai_credits": 1000,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
+    "enterprise":{"agents": 999, "numbers": 999, "ai_credits": 99999, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
 }
 
 @app.get("/plan/features", dependencies=[Depends(verify_key)])
