@@ -19,10 +19,10 @@ def cache_del(key):
     _cache.pop(key, None)
 # ── PLAN CREDIT CONSTANTS ────────────────────────────────
 PLAN_CREDITS = {
-    "trial":     1000,
-    "starter":   0,
-    "pro":       1000,
-    "business":  3000,
+    "trial":      200,   # suficiente pra testar, não pra depender
+    "starter":    0,     # sem IA
+    "pro":        300,   # ~1 semana de uso intenso → incentiva compra de pacote
+    "business":   1000,  # generoso mas não infinito
     "enterprise": 99999,
 }
 PLAN_RESETS = {
@@ -759,15 +759,15 @@ RESUMO:"""
 
     async with httpx.AsyncClient(timeout=30) as client2:
         r2 = await client2.post("https://api.anthropic.com/v1/messages",
-            headers={{"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
-            json={{"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
-                  "messages": [{{"role": "user", "content": summary_prompt}}]}})
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
+                  "messages": [{"role": "user", "content": summary_prompt}]})
         summary = r2.json()["content"][0]["text"]
 
     # Save summary too
-    supabase.table("tenants").update({{"copilot_prompt_summary": summary}}).eq("id", tenant_id).execute()
+    supabase.table("tenants").update({"copilot_prompt_summary": summary}).eq("id", tenant_id).execute()
 
-    return {{"summary": summary, "conversations_analyzed": total_convs, "days_analyzed": days, "tenant_name": tenant["name"], "credits_remaining": remaining}}
+    return {"summary": summary, "conversations_analyzed": total_convs, "days_analyzed": days, "tenant_name": tenant["name"], "credits_remaining": remaining}
 
 @app.post("/onboarding/save-prompt", dependencies=[Depends(verify_key)])
 async def onboarding_save_prompt(body: dict):
