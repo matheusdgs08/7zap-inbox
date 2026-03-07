@@ -17,6 +17,20 @@ def cache_set(key, data, ttl=20):
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
 def cache_del(key):
     _cache.pop(key, None)
+# ── PLAN CREDIT CONSTANTS ────────────────────────────────
+PLAN_CREDITS = {
+    "trial":     1000,
+    "starter":   0,
+    "pro":       1000,
+    "business":  3000,
+    "enterprise": 99999,
+}
+PLAN_RESETS = {
+    "pro":       True,
+    "business":  True,
+    "enterprise": True,
+}
+
 # ── CREDIT HELPERS ───────────────────────────────────────
 def get_tenant_credits(tenant_id: str):
     """Returns (credits_remaining, plan, credits_limit). Also resets if monthly."""
