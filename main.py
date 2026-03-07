@@ -1011,18 +1011,59 @@ async def report_agents(tenant_id: str, days: int = 30):
 
 @app.get("/reports/broadcasts", dependencies=[Depends(verify_key)])
 async def report_broadcasts(tenant_id: str):
-    """Relatório de disparos — enviados vs respondidos"""
+    """Relatório de disparos — enviados, entregues e ROI (conversas geradas)"""
     broadcasts = supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20).execute().data
     result = []
     for b in broadcasts:
-        sent = b.get("recipients_count", 0)
-        delivered = b.get("delivered_count", 0)
-        # Count replies: messages inbound after broadcast creation from broadcast contacts
+        sent = b.get("total_recipients") or b.get("sent_count") or 0
+        failed = b.get("failed_count") or 0
+        delivered = sent - failed
+        broadcast_id = b["id"]
+        created_at = b.get("created_at", "")
+
+        # Get phone numbers that were contacted in this broadcast
+        recipients = supabase.table("broadcast_recipients").select("phone,contact_id,sent_at").eq("broadcast_id", broadcast_id).eq("status","sent").execute().data
+        phones = [r["phone"] for r in recipients if r.get("phone")]
+        
+        # Count replies: contacts that sent at least 1 inbound message AFTER broadcast was sent
+        replied = 0
+        replied_names = []
+        if phones and created_at:
+            # Get contacts matching those phones in this tenant
+            contacts = supabase.table("contacts").select("id,name,phone").eq("tenant_id", tenant_id).execute().data
+            phone_to_contact = {c["phone"]: c for c in contacts}
+            contact_ids = [phone_to_contact[p]["id"] for p in phones if p in phone_to_contact]
+            
+            if contact_ids:
+                # Get conversations for those contacts
+                convs = supabase.table("conversations").select("id,contact_id").in_("contact_id", contact_ids).execute().data
+                conv_ids = [c["id"] for c in convs]
+                
+                if conv_ids:
+                    # Count convs with at least 1 inbound message after broadcast sent_at
+                    for cid in conv_ids:
+                        msgs = supabase.table("messages").select("id").eq("conversation_id", cid).eq("direction","inbound").gte("created_at", created_at).limit(1).execute().data
+                        if msgs:
+                            replied += 1
+                            # Find contact name
+                            conv_contact_id = next((c["contact_id"] for c in convs if c["id"] == cid), None)
+                            contact = next((c for c in contacts if c["id"] == conv_contact_id), None)
+                            if contact:
+                                replied_names.append(contact.get("name") or contact.get("phone",""))
+        
+        roi_pct = round(replied / delivered * 100) if delivered > 0 else 0
         result.append({
-            "id": b["id"], "message": (b.get("message","") or "")[:80],
-            "created_at": b.get("created_at"), "status": b.get("status"),
-            "sent": sent, "delivered": delivered,
-            "reply_rate": round(delivered/sent*100) if sent > 0 else 0
+            "id": broadcast_id,
+            "name": b.get("name") or "",
+            "message": (b.get("message","") or "")[:100],
+            "created_at": created_at,
+            "status": b.get("status"),
+            "sent": sent,
+            "delivered": delivered,
+            "failed": failed,
+            "replied": replied,
+            "roi_pct": roi_pct,
+            "replied_sample": replied_names[:5]  # primeiros 5 nomes que responderam
         })
     return {"broadcasts": result}
 
