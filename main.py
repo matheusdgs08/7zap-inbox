@@ -543,29 +543,41 @@ async def whatsapp_qrcode(instance: str = "default"):
         raise HTTPException(status_code=503, detail="WAHA não configurada")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # Verifica se já está conectado
+            # Verifica se sessão existe
             r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
-            if r.status_code == 200:
+
+            if r.status_code == 404:
+                # Sessão não existe — cria agora
+                create_r = await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
+                    json={"name": instance, "start": True})
+                if create_r.status_code not in (200, 201):
+                    return {"qr_code": "", "state": "error", "error": f"Erro ao criar sessão: {create_r.text}"}
+                await asyncio.sleep(4)  # aguarda inicializar
+
+            elif r.status_code == 200:
                 data = r.json()
                 status = data.get("status", "")
                 if status == "WORKING":
                     me = data.get("me") or {}
-                    phone = me.get("id", "").replace("@c.us", "")
+                    phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
                     return {"qr_code": "", "state": "open", "connected": True, "phone": phone}
-                # Se FAILED, reinicia
-                if status == "FAILED":
+                if status == "STOPPED":
+                    # Sessão parada — inicia
+                    await client.post(f"{WAHA_URL}/api/sessions/{instance}/start", headers=waha_headers())
+                    await asyncio.sleep(4)
+                elif status == "FAILED":
                     await client.post(f"{WAHA_URL}/api/sessions/{instance}/restart", headers=waha_headers())
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(4)
 
-            # Pega screenshot com QR Code
-            for _ in range(5):
+            # Tenta pegar screenshot com QR Code (até 6 tentativas)
+            for attempt in range(6):
                 screenshot = await client.get(f"{WAHA_URL}/api/screenshot?session={instance}", headers=waha_headers())
                 if screenshot.status_code == 200 and screenshot.content:
                     b64 = base64.b64encode(screenshot.content).decode()
                     return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
                 await asyncio.sleep(3)
 
-            return {"qr_code": "", "state": "timeout", "error": "QR Code não disponível"}
+            return {"qr_code": "", "state": "timeout", "error": "QR Code não disponível — tente novamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
