@@ -594,6 +594,70 @@ async def whatsapp_instances():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/whatsapp/tenant-instances", dependencies=[Depends(verify_key)])
+async def whatsapp_tenant_instances(tenant_id: str):
+    """Lista instâncias do tenant com status real-time"""
+    tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
+    plan = tenant.get("plan", "starter")
+    max_numbers = PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])["numbers"]
+    db_instances = supabase.table("gateway_instances").select("*").eq("tenant_id", tenant_id).order("created_at").execute().data
+    result = []
+    for inst in db_instances:
+        inst_name = inst.get("instance_name") or inst["id"]
+        live_status = {"connected": False, "phone": ""}
+        if WAHA_URL:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
+                    if r.status_code == 200:
+                        data = r.json()
+                        connected = data.get("status") == "WORKING"
+                        me = data.get("me") or {}
+                        phone = me.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
+                        live_status = {"connected": connected, "phone": phone}
+            except: pass
+        result.append({**inst, **live_status})
+    return {"instances": result, "max_numbers": max_numbers, "plan": plan}
+
+@app.post("/whatsapp/create-instance", dependencies=[Depends(verify_key)])
+async def whatsapp_create_instance(body: dict):
+    """Cria nova instância WhatsApp para o tenant"""
+    tenant_id = body.get("tenant_id")
+    label = (body.get("label") or "Número").strip()[:40]
+    tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
+    plan = tenant.get("plan", "starter")
+    max_numbers = PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])["numbers"]
+    current = supabase.table("gateway_instances").select("id").eq("tenant_id", tenant_id).execute().data
+    if len(current) >= max_numbers:
+        raise HTTPException(400, f"Limite de {max_numbers} número(s) atingido para o plano {plan}")
+    import uuid
+    inst_name = f"t{tenant_id[:6]}-{uuid.uuid4().hex[:6]}"
+    if WAHA_URL:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
+                    json={"name": inst_name, "config": {"webhooks": [{"url": f"{os.environ.get('BACKEND_URL','')}/webhook/relay", "events": ["message"]}]}})
+        except: pass
+    db_row = supabase.table("gateway_instances").insert({
+        "tenant_id": tenant_id, "instance_name": inst_name,
+        "label": label, "status": "disconnected", "plan": plan
+    }).execute().data[0]
+    return {"ok": True, "instance": db_row}
+
+@app.delete("/whatsapp/delete-instance", dependencies=[Depends(verify_key)])
+async def whatsapp_delete_instance(body: dict):
+    """Remove instância do tenant"""
+    tenant_id = body.get("tenant_id")
+    instance_id = body.get("instance_id")
+    inst_name = body.get("instance_name")
+    if WAHA_URL and inst_name:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.delete(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
+        except: pass
+    supabase.table("gateway_instances").delete().eq("id", instance_id).eq("tenant_id", tenant_id).execute()
+    return {"ok": True}
+
 # ── BROADCASTS ───────────────────────────────────────────
 @app.post("/broadcasts/suggest-message", dependencies=[Depends(verify_key)])
 async def suggest_broadcast_message(body: dict):
