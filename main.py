@@ -599,12 +599,55 @@ async def pending_conversation(conv_id: str):
 
 @app.put("/conversations/{conv_id}/labels", dependencies=[Depends(verify_key)])
 async def update_conversation_labels(conv_id: str, body: UpdateLabels):
+    # 1. Update conversation_labels table
     supabase.table("conversation_labels").delete().eq("conversation_id", conv_id).execute()
     if body.label_ids:
         supabase.table("conversation_labels").insert([{"conversation_id": conv_id, "label_id": lid} for lid in body.label_ids]).execute()
+    # 2. Sync label names to contact.tags so label follows the phone number
+    try:
+        conv = supabase.table("conversations").select("contact_id").eq("id", conv_id).single().execute().data
+        if conv and body.label_ids:
+            label_names = [r["name"] for r in supabase.table("labels").select("name").in_("id", body.label_ids).execute().data]
+            supabase.table("contacts").update({"tags": label_names}).eq("id", conv["contact_id"]).execute()
+        elif conv and not body.label_ids:
+            supabase.table("contacts").update({"tags": []}).eq("id", conv["contact_id"]).execute()
+    except Exception as e:
+        print(f"label sync to contact err: {e}")
     return {"ok": True}
 
 # ── CONTACTS ─────────────────────────────────────────────
+# ── LABELS CRUD ──────────────────────────────────────────
+@app.get("/labels", dependencies=[Depends(verify_key)])
+async def get_labels(tenant_id: str):
+    rows = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
+    return {"labels": rows}
+
+@app.post("/labels", dependencies=[Depends(verify_key)])
+async def create_label(body: dict):
+    tenant_id = body.get("tenant_id")
+    name = (body.get("name") or "").strip()
+    color = body.get("color", "#00a884")
+    if not name: raise HTTPException(400, "Nome obrigatório")
+    row = supabase.table("labels").insert({"tenant_id": tenant_id, "name": name, "color": color}).execute().data[0]
+    return {"label": row}
+
+@app.put("/labels/{label_id}", dependencies=[Depends(verify_key)])
+async def update_label(label_id: str, body: dict):
+    updates = {}
+    if "name" in body: updates["name"] = body["name"]
+    if "color" in body: updates["color"] = body["color"]
+    row = supabase.table("labels").update(updates).eq("id", label_id).execute().data
+    return {"ok": True, "label": row[0] if row else None}
+
+@app.delete("/labels/{label_id}", dependencies=[Depends(verify_key)])
+async def delete_label(label_id: str):
+    # Remove from all conversations first
+    try: supabase.table("conversation_labels").delete().eq("label_id", label_id).execute()
+    except: pass
+    supabase.table("labels").delete().eq("id", label_id).execute()
+    return {"ok": True}
+
+
 @app.get("/contacts", dependencies=[Depends(verify_key)])
 async def list_contacts(tenant_id: str):
     return {"contacts": supabase.table("contacts").select("*").eq("tenant_id", tenant_id).order("name").execute().data}
