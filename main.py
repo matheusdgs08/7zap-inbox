@@ -649,6 +649,26 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 
+@app.get("/users/me/preferences", dependencies=[Depends(verify_key)])
+async def get_user_preferences(user_id: str):
+    def _get():
+        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        return u.get("preferences") or {} if u else {}
+    prefs = await run_sync(_get)
+    return {"preferences": prefs}
+
+@app.put("/users/me/preferences", dependencies=[Depends(verify_key)])
+async def save_user_preferences(user_id: str, body: dict = Body(...)):
+    def _save():
+        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        current = (u.get("preferences") or {}) if u else {}
+        current.update(body)
+        supabase.table("users").update({"preferences": current}).eq("id", user_id).execute()
+        return current
+    prefs = await run_sync(_save)
+    return {"preferences": prefs}
+
+
 @app.post("/contacts/sync-names", dependencies=[Depends(verify_key)])
 async def sync_contact_names(tenant_id: str):
     """Busca nomes reais dos contatos via WAHA /chats e atualiza no banco. Roda em background."""
