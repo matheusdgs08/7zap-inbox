@@ -781,15 +781,35 @@ async def whatsapp_create_instance(body: dict):
 
 @app.delete("/whatsapp/delete-instance", dependencies=[Depends(verify_key)])
 async def whatsapp_delete_instance(body: dict):
-    """Remove instância do tenant"""
+    """Remove instância do tenant e apaga todo o histórico vinculado"""
     tenant_id = body.get("tenant_id")
     instance_id = body.get("instance_id")
     inst_name = body.get("instance_name")
+    delete_history = body.get("delete_history", True)  # default: apaga histórico
+
+    # 1. Desconectar no WAHA
     if WAHA_URL and inst_name:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.delete(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
         except: pass
+
+    # 2. Cascata: apagar conversas/mensagens vinculadas a esta instância
+    if delete_history and tenant_id:
+        def _cascade():
+            # Busca conversas do tenant nessa instância
+            convs = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).eq("instance_name", inst_name).execute().data
+            conv_ids = [c["id"] for c in convs]
+            if conv_ids:
+                supabase.table("tasks").delete().in_("conversation_id", conv_ids).execute()
+                supabase.table("messages").delete().in_("conversation_id", conv_ids).execute()
+                supabase.table("conversation_labels").delete().in_("conversation_id", conv_ids).execute()
+                supabase.table("conversations").delete().in_("id", conv_ids).execute()
+            # Apaga contatos que só existem por causa desse número (sem outras conversas)
+            # Não apagamos contatos pois podem ter histórico em outros números
+        await run_sync(_cascade)
+
+    # 3. Remove a instância
     supabase.table("gateway_instances").delete().eq("id", instance_id).eq("tenant_id", tenant_id).execute()
     return {"ok": True}
 
