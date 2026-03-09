@@ -6,20 +6,65 @@ async def run_sync(fn):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_thread_pool, fn)
 
-# ── CACHE SIMPLES (stale-while-revalidate) ────────────────
-_cache: dict = {}
+# ── CACHE: Redis (preferido) + in-memory fallback ─────────
+import redis as _redis_lib, pickle
+
+_cache: dict = {}  # fallback in-memory
+_redis = None
+
+def _get_redis():
+    global _redis
+    if _redis is not None:
+        return _redis
+    url = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("CACHE_REDIS_URI")
+    if url:
+        try:
+            _redis = _redis_lib.from_url(url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
+            _redis.ping()
+        except Exception as e:
+            print(f"Redis unavailable, using memory cache: {e}")
+            _redis = False
+    else:
+        _redis = False
+    return _redis
+
 def cache_get(key, stale_ok=False):
+    r = _get_redis()
+    if r:
+        try:
+            raw = r.get(f"7crm:{key}")
+            if raw:
+                return pickle.loads(raw)
+        except: pass
     v = _cache.get(key)
     if not v: return None
     age = datetime.utcnow().timestamp() - v["ts"]
     if age < v["ttl"]: return v["data"]
-    if stale_ok and age < v["ttl"] * 10: return v["data"]  # serve stale até 10x o TTL
+    if stale_ok and age < v["ttl"] * 10: return v["data"]
     return None
+
 def cache_set(key, data, ttl=30):
+    r = _get_redis()
+    if r:
+        try:
+            r.setex(f"7crm:{key}", ttl, pickle.dumps(data))
+        except: pass
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
+
 def cache_del(key):
+    r = _get_redis()
+    if r:
+        try: r.delete(f"7crm:{key}")
+        except: pass
     _cache.pop(key, None)
+
 def cache_is_stale(key):
+    r = _get_redis()
+    if r:
+        try:
+            ttl_remaining = r.ttl(f"7crm:{key}")
+            return ttl_remaining <= 0
+        except: pass
     v = _cache.get(key)
     if not v: return True
     return (datetime.utcnow().timestamp() - v["ts"]) >= v["ttl"]
@@ -451,10 +496,19 @@ async def receive_message(payload: dict):
 
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
             # Invalida cache para forçar reload no frontend
-            cache_del(f"msgs:{conv_id}")
-            cache_del(f"convs:{tid}:open")
-            cache_del(f"convs:{tid}:None")
-            cache_del(f"convs:{tid}:all")
+            cache_del(f"msgs:{conv_id}:latest")
+            cache_del(f"msgs:{conv_id}:None")
+            # Bust all conversation list variants for this tenant
+            for s in ["open", "None", "all", "none", None]:
+                cache_del(f"convs:{tid}:{s}:{None}:first")
+                cache_del(f"convs:{tid}:{s}:None:first")
+            # Redis pattern delete for convs:tid:*
+            try:
+                r = _get_redis()
+                if r:
+                    for k in r.scan_iter(f"7crm:convs:{tid}:*"):
+                        r.delete(k)
+            except: pass
         return {"ok": True}
     except Exception as e:
         import traceback
@@ -496,24 +550,27 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
             allowed_names = {r["instance_name"] for r in inst_rows}
             convs = [c for c in convs if c.get("instance_name") in allowed_names]
 
-        # Labels em batch (sem N+1)
+        # Labels + label_details em paralelo via ThreadPool
         conv_ids = [c["id"] for c in convs]
-        all_cl = supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data if conv_ids else []
+        if conv_ids:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f_cl = pool.submit(lambda: supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data)
+                f_lb = pool.submit(lambda: {lb["id"]: lb for lb in supabase.table("labels").select("id,name,color").eq("tenant_id", tenant_id).execute().data})
+                all_cl = f_cl.result()
+                label_details = f_lb.result()
+        else:
+            all_cl = []
+            label_details = {}
         cl_map: dict = {}
         for row in all_cl:
             cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
-        all_label_ids = list({r["label_id"] for r in all_cl if r.get("label_id")})
-        label_details = {}
-        if all_label_ids:
-            for lb in supabase.table("labels").select("id,name,color").in_("id", all_label_ids).execute().data:
-                label_details[lb["id"]] = lb
         for c in convs:
             c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
         return convs
 
     convs = await run_sync(_query)
     if not before:
-        cache_set(cache_key, convs, ttl=30)
+        cache_set(cache_key, convs, ttl=60)
     return {"conversations": convs, "has_more": len(convs) == limit}
 
 async def _refresh_conversations(tenant_id, status, user_id):
@@ -550,10 +607,14 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     q = supabase.table("messages").select("*").eq("conversation_id", conv_id)
     if before:
         q = q.lt("created_at", before)
-    msgs = await run_sync(lambda: q.order("created_at", desc=True).limit(limit).execute().data)
-    msgs = list(reversed(msgs))
-    await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
-    cache_set(cache_key, msgs, ttl=30)
+    def _fetch():
+        data = q.order("created_at", desc=True).limit(limit).execute().data
+        # Reset unread in same thread (no extra roundtrip)
+        try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
+        except: pass
+        return list(reversed(data))
+    msgs = await run_sync(_fetch)
+    cache_set(cache_key, msgs, ttl=45)
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
