@@ -1045,11 +1045,13 @@ async def whatsapp_sync(body: dict):
     days_limit = plan_days.get(plan, 90)
     since_ts = int((datetime.utcnow() - timedelta(days=days_limit)).timestamp() * 1000)
     stats = {"chats": 0, "contacts_created": 0, "conversations_created": 0, "messages_saved": 0, "skipped": 0}
+
     async with httpx.AsyncClient(timeout=60) as client:
+        # ── 1. Fetch chats list ──────────────────────────────────
         chats = []
         for route in [f"{WAHA_URL}/api/chats?session={instance}", f"{WAHA_URL}/api/{instance}/chats"]:
             try:
-                r = await client.get(route, headers=waha_headers(), timeout=15)
+                r = await client.get(route, headers=waha_headers(), timeout=20)
                 if r.status_code == 200:
                     data = r.json()
                     chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
@@ -1058,6 +1060,8 @@ async def whatsapp_sync(body: dict):
         if not chats:
             raise HTTPException(status_code=502, detail="Não foi possível buscar chats do WAHA.")
         stats["chats"] = len(chats)
+
+        # ── 2. For each chat: upsert contact + conversation + messages ──
         for chat in chats:
             try:
                 raw_id = chat.get("id", "")
@@ -1068,14 +1072,18 @@ async def whatsapp_sync(body: dict):
                 if is_group or chat.get("isGroup"): continue
                 phone = "".join(c for c in phone_raw if c.isdigit())
                 if not phone or len(phone) < 8: stats["skipped"] += 1; continue
+                chat_id = f"{phone}@c.us"
                 name = chat.get("name") or phone
+
+                # Upsert contact
                 existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
                 contact_id = existing[0]["id"] if existing else supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
                 if not existing: stats["contacts_created"] += 1
+
+                # Upsert conversation
                 existing_conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
                 if existing_conv:
                     conv_id = existing_conv[0]["id"]
-                    # Backfill instance_name if missing
                     if not existing_conv[0].get("instance_name"):
                         supabase.table("conversations").update({"instance_name": instance}).eq("id", conv_id).execute()
                 else:
@@ -1084,7 +1092,74 @@ async def whatsapp_sync(body: dict):
                 last_ts = chat.get("timestamp", 0)
                 if last_ts:
                     supabase.table("conversations").update({"last_message_at": datetime.utcfromtimestamp(last_ts).isoformat()}).eq("id", conv_id).execute()
+
+                # ── 3. Fetch messages for this chat ──────────────
+                msgs_data = []
+                for msg_route in [
+                    f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=100&downloadMedia=false",
+                    f"{WAHA_URL}/api/{instance}/messages?chatId={chat_id}&limit=100",
+                    f"{WAHA_URL}/api/chats/{chat_id}/messages?session={instance}&limit=100",
+                ]:
+                    try:
+                        mr = await client.get(msg_route, headers=waha_headers(), timeout=15)
+                        if mr.status_code == 200:
+                            md = mr.json()
+                            msgs_data = md if isinstance(md, list) else md.get("messages", md.get("data", []))
+                            if msgs_data: break
+                    except: continue
+
+                if not msgs_data:
+                    continue
+
+                # Get existing message IDs to avoid duplicates
+                existing_msg_ids = set()
+                existing_msgs = supabase.table("messages").select("waha_id").eq("conversation_id", conv_id).execute().data
+                existing_msg_ids = {m["waha_id"] for m in existing_msgs if m.get("waha_id")}
+
+                to_insert = []
+                for msg in msgs_data:
+                    try:
+                        msg_ts = msg.get("timestamp", 0) or msg.get("t", 0)
+                        # Skip messages older than plan limit
+                        if msg_ts and msg_ts * 1000 < since_ts: continue
+                        ext_id = msg.get("id") or msg.get("_serialized") or ""
+                        if isinstance(ext_id, dict): ext_id = ext_id.get("_serialized", ext_id.get("id", ""))
+                        if ext_id and ext_id in existing_msg_ids: continue
+
+                        body_text = msg.get("body") or msg.get("text") or msg.get("caption") or ""
+                        msg_type = msg.get("type", "chat")
+                        # Map WAHA types to our types
+                        type_map = {"chat": "text", "image": "image", "audio": "audio", "ptt": "audio",
+                                    "video": "video", "document": "document", "sticker": "image"}
+                        our_type = type_map.get(msg_type, "text")
+                        # Determine direction
+                        from_me = msg.get("fromMe", False) or msg.get("from_me", False)
+                        direction = "outbound" if from_me else "inbound"
+                        created_at = datetime.utcfromtimestamp(msg_ts).isoformat() if msg_ts else datetime.utcnow().isoformat()
+
+                        row = {
+                            "conversation_id": conv_id,
+                            "direction": direction,
+                            "content": body_text,
+                            "type": our_type,
+                            "created_at": created_at,
+                        }
+                        if ext_id:
+                            row["external_id"] = ext_id
+                        to_insert.append(row)
+                    except: continue
+
+                # Batch insert in chunks of 50
+                if to_insert:
+                    for i in range(0, len(to_insert), 50):
+                        chunk = to_insert[i:i+50]
+                        try:
+                            supabase.table("messages").insert(chunk).execute()
+                            stats["messages_saved"] += len(chunk)
+                        except: pass
+
             except: stats["skipped"] += 1; continue
+
     return {"ok": True, "stats": stats}
 
 @app.get("/whatsapp/sync-status", dependencies=[Depends(verify_key)])
