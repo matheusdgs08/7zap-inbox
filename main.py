@@ -367,11 +367,11 @@ class LoginRequest(BaseModel):
     password: str
 
 class CreateUser(BaseModel):
-    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"; permissions: str = "read_write"; allowed_instances: Optional[List[str]] = []
+    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"; permissions: str = "read_write"; allowed_instances: Optional[List[str]] = []; phone: Optional[str] = None
 
 class UpdateUser(BaseModel):
     name: Optional[str] = None; email: Optional[str] = None; password: Optional[str] = None
-    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None; permissions: Optional[str] = None; allowed_instances: Optional[List[str]] = None
+    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None; permissions: Optional[str] = None; allowed_instances: Optional[List[str]] = None; phone: Optional[str] = None
 
 class SendMessage(BaseModel):
     conversation_id: str; text: str; sent_by: Optional[str] = None; is_internal_note: Optional[bool] = False
@@ -449,13 +449,13 @@ async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
     if supabase.table("users").select("id").eq("email", body.email.lower()).execute().data:
         raise HTTPException(status_code=400, detail="Email já cadastrado")
     pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances or []}).execute().data[0]
+    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances or [], "phone": body.phone}).execute().data[0]
     user.pop("password_hash", None)
     return {"user": user}
 
 @app.put("/admin/users/{user_id}")
 async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
-    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances}.items() if v is not None}
+    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances, "phone": body.phone}.items() if v is not None}
     if body.password:
         if len(body.password) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
         updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
@@ -1748,6 +1748,91 @@ async def forgot_password(body: dict):
             email_sent = True
         except: pass
     return {"ok": True, "message": "Se o email existir, você receberá as instruções.", "reset_url": reset_url if not email_sent else None, "email_sent": email_sent}
+
+@app.post("/auth/forgot-password-whatsapp")
+async def forgot_password_whatsapp(body: dict):
+    """
+    Recuperação de senha via WhatsApp.
+    O usuário informa o telefone cadastrado na conta e recebemos o link via WhatsApp.
+    """
+    phone_raw = (body.get("phone") or "").strip()
+    if not phone_raw:
+        raise HTTPException(status_code=400, detail="Telefone obrigatório")
+
+    # Normaliza: remove tudo que não é dígito
+    phone_clean = "".join(c for c in phone_raw if c.isdigit())
+    if len(phone_clean) < 8:
+        raise HTTPException(status_code=400, detail="Telefone inválido")
+
+    # Busca usuário pelo telefone (coluna phone na tabela users)
+    # Tenta com e sem código do país para flexibilidade
+    user = None
+    for variant in [phone_clean, phone_clean[-11:], phone_clean[-10:]]:
+        rows = supabase.table("users").select("id,name,email,tenant_id,phone")             .eq("is_active", True).execute().data
+        # Filtra manualmente para suportar variações do número
+        for r in rows:
+            stored = "".join(c for c in (r.get("phone") or "") if c.isdigit())
+            if stored and (stored == variant or stored.endswith(variant) or variant.endswith(stored)):
+                user = r
+                break
+        if user:
+            break
+
+    # Resposta genérica para não vazar se o número existe
+    if not user:
+        return {"ok": True, "message": "Se o telefone estiver cadastrado, você receberá o link no WhatsApp."}
+
+    # Gera token de reset
+    token = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=48))
+    expires_at = (datetime.utcnow() + timedelta(hours=2)).isoformat()
+    supabase.table("password_resets").upsert(
+        {"user_id": user["id"], "token": token, "expires_at": expires_at, "used": False},
+        on_conflict="user_id"
+    ).execute()
+
+    reset_url = f"https://7zap-inbox-frontend.vercel.app/?reset={token}"
+
+    # Busca qualquer instância WAHA ativa do tenant para enviar
+    waha_sent = False
+    try:
+        instances = supabase.table("gateway_instances")             .select("instance_name").eq("tenant_id", user["tenant_id"]).execute().data
+        session_to_use = None
+        if instances:
+            # Verifica qual instância está WORKING
+            async with httpx.AsyncClient(timeout=8) as client:
+                for inst in instances:
+                    iname = inst.get("instance_name")
+                    if not iname:
+                        continue
+                    try:
+                        r = await client.get(f"{WAHA_URL}/api/sessions/{iname}", headers=waha_headers())
+                        if r.status_code == 200 and r.json().get("status") == "WORKING":
+                            session_to_use = iname
+                            break
+                    except:
+                        continue
+
+        if session_to_use:
+            msg_text = (
+                "🔐 *Recuperação de senha — 7CRM*\n\n"
+                f"Olá, *{user['name']}*! Recebemos uma solicitação de redefinição de senha.\n\n"
+                "Clique no link abaixo para criar uma nova senha (expira em 2h):\n\n"
+                f"{reset_url}\n\n"
+                "Se não foi você, ignore esta mensagem."
+            )
+            # phone_clean já tem só dígitos
+            await waha_send_msg(phone_clean, msg_text, session_to_use)
+            waha_sent = True
+    except Exception as e:
+        print(f"[forgot_password_whatsapp] erro ao enviar WhatsApp: {e}")
+
+    return {
+        "ok": True,
+        "message": "Se o telefone estiver cadastrado, você receberá o link no WhatsApp.",
+        "whatsapp_sent": waha_sent,
+        # Fallback manual se WhatsApp falhar (para debug/suporte)
+        "reset_url": reset_url if not waha_sent else None,
+    }
 
 @app.post("/auth/reset-password")
 async def reset_password(body: dict):
