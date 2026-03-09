@@ -655,6 +655,25 @@ async def whatsapp_status(instance: str = "default"):
     except Exception as e:
         return {"state": "error", "connected": False, "error": str(e)}
 
+@app.get("/whatsapp/check-connected", dependencies=[Depends(verify_key)])
+async def whatsapp_check_connected(instance: str = "default"):
+    """Polling leve — só verifica se sessão já está WORKING. Usado pelo frontend após exibir QR."""
+    if not WAHA_URL:
+        return {"connected": False}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
+            if r.status_code == 200:
+                data = r.json()
+                status = data.get("status", "")
+                if status == "WORKING":
+                    me = data.get("me") or {}
+                    phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+                    return {"connected": True, "phone": phone}
+        return {"connected": False}
+    except:
+        return {"connected": False}
+
 @app.get("/whatsapp/qrcode", dependencies=[Depends(verify_key)])
 async def whatsapp_qrcode(instance: str = "default"):
     """Retorna QR Code para conexão via WAHA screenshot"""
