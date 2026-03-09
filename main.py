@@ -1072,9 +1072,15 @@ async def whatsapp_sync(body: dict):
                 existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
                 contact_id = existing[0]["id"] if existing else supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
                 if not existing: stats["contacts_created"] += 1
-                existing_conv = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
-                conv_id = existing_conv[0]["id"] if existing_conv else supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": chat.get("unreadCount", 0)}).execute().data[0]["id"]
-                if not existing_conv: stats["conversations_created"] += 1
+                existing_conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
+                if existing_conv:
+                    conv_id = existing_conv[0]["id"]
+                    # Backfill instance_name if missing
+                    if not existing_conv[0].get("instance_name"):
+                        supabase.table("conversations").update({"instance_name": instance}).eq("id", conv_id).execute()
+                else:
+                    conv_id = supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": chat.get("unreadCount", 0), "instance_name": instance}).execute().data[0]["id"]
+                    stats["conversations_created"] += 1
                 last_ts = chat.get("timestamp", 0)
                 if last_ts:
                     supabase.table("conversations").update({"last_message_at": datetime.utcfromtimestamp(last_ts).isoformat()}).eq("id", conv_id).execute()
@@ -1086,6 +1092,49 @@ async def sync_status(tenant_id: str):
     convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
     msgs = supabase.table("messages").select("id", count="exact").execute()
     return {"conversations": convs.count, "messages": msgs.count}
+
+@app.post("/whatsapp/backfill-instances", dependencies=[Depends(verify_key)])
+async def backfill_instances(body: dict):
+    """
+    Backfill instance_name on existing conversations that have it null.
+    Queries WAHA for each instance's chats and matches by phone number.
+    Call once per instance: { tenant_id, instance }
+    """
+    tenant_id = body.get("tenant_id")
+    instance  = body.get("instance", "default")
+    updated = 0
+    async with httpx.AsyncClient(timeout=60) as client:
+        chats = []
+        for route in [f"{WAHA_URL}/api/chats?session={instance}", f"{WAHA_URL}/api/{instance}/chats"]:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
+                    if chats: break
+            except: continue
+    if not chats:
+        raise HTTPException(status_code=502, detail="Não foi possível buscar chats do WAHA.")
+    for chat in chats:
+        try:
+            raw_id = chat.get("id", "")
+            if isinstance(raw_id, dict):
+                phone_raw = raw_id.get("user", ""); is_group = raw_id.get("server", "") == "g.us"
+            else:
+                phone_raw = str(raw_id); is_group = "@g.us" in phone_raw
+            if is_group or chat.get("isGroup"): continue
+            phone = "".join(c for c in phone_raw if c.isdigit())
+            if not phone or len(phone) < 8: continue
+            # Find contact then conversation
+            contact = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).maybe_single().execute().data
+            if not contact: continue
+            conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact["id"]).maybe_single().execute().data
+            if not conv: continue
+            if not conv.get("instance_name"):
+                supabase.table("conversations").update({"instance_name": instance}).eq("id", conv["id"]).execute()
+                updated += 1
+        except: continue
+    return {"ok": True, "instance": instance, "chats_checked": len(chats), "updated": updated}
 
 # ── AUTH — Recuperação de Senha ───────────────────────────
 @app.post("/auth/forgot-password")
