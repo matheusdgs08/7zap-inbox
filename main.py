@@ -463,65 +463,63 @@ async def receive_message(payload: dict):
 
 # ── CONVERSATIONS ────────────────────────────────────────
 @app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None):
-    cache_key = f"convs:{tenant_id}:{status}:{user_id}"
-    # Serve stale cache instantly while refreshing in background
-    stale = cache_get(cache_key, stale_ok=True)
-    if stale and not cache_is_stale(cache_key):
-        return {"conversations": stale}  # fresh cache, return immediately
-    if stale:
-        # Has stale data — return it now, refresh in background
-        asyncio.create_task(_refresh_conversations(cache_key, tenant_id, status, user_id))
-        return {"conversations": stale}
+async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50):
+    """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
+    limit = min(limit, 50)
+    cache_key = f"convs:{tenant_id}:{status}:{user_id}:{before or 'first'}"
+
+    # Só usa cache na primeira página (sem cursor)
+    if not before:
+        stale = cache_get(cache_key, stale_ok=True)
+        if stale and not cache_is_stale(cache_key):
+            return {"conversations": stale, "has_more": len(stale) == limit}
+        if stale:
+            asyncio.create_task(_refresh_conversations(tenant_id, status, user_id))
+            return {"conversations": stale, "has_more": len(stale) == limit}
 
     def _query():
-        # Get user's allowed_instances if user_id provided
         allowed = None
         if user_id:
             u = supabase.table("users").select("allowed_instances,role").eq("id", user_id).maybe_single().execute().data
             if u and u.get("role") != "admin" and u.get("allowed_instances"):
-                allowed = u["allowed_instances"]  # list of instance IDs
+                allowed = u["allowed_instances"]
 
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
-        convs = q.order("last_message_at", desc=True).limit(100).execute().data
+        if before: q = q.lt("last_message_at", before)
+        convs = q.order("last_message_at", desc=True).limit(limit).execute().data
         if not convs:
             return convs
 
-        # Filter by allowed instances if applicable
         if allowed:
-            # Get instance names for allowed IDs
             inst_rows = supabase.table("gateway_instances").select("id,instance_name").in_("id", allowed).execute().data
             allowed_names = {r["instance_name"] for r in inst_rows}
             convs = [c for c in convs if c.get("instance_name") in allowed_names]
 
-        # Busca todos os labels de uma vez (sem N+1)
+        # Labels em batch (sem N+1)
         conv_ids = [c["id"] for c in convs]
         all_cl = supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data if conv_ids else []
-        # Agrupa label_ids por conversa
         cl_map: dict = {}
         for row in all_cl:
             cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
-        # Busca detalhes dos labels únicos
         all_label_ids = list({r["label_id"] for r in all_cl if r.get("label_id")})
         label_details = {}
         if all_label_ids:
             for lb in supabase.table("labels").select("id,name,color").in_("id", all_label_ids).execute().data:
                 label_details[lb["id"]] = lb
-        # Monta labels por conversa
         for c in convs:
             c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
         return convs
 
     convs = await run_sync(_query)
-    cache_set(cache_key, convs, ttl=30)
-    return {"conversations": convs}
+    if not before:
+        cache_set(cache_key, convs, ttl=30)
+    return {"conversations": convs, "has_more": len(convs) == limit}
 
-async def _refresh_conversations(cache_key, tenant_id, status, user_id):
-    """Background task: silently refresh stale conversations cache."""
+async def _refresh_conversations(tenant_id, status, user_id):
+    """Background task: silently refresh first page cache."""
     try:
-        result = await list_conversations(tenant_id, status, user_id)
-        # result already sets cache internally
+        await list_conversations(tenant_id, status, user_id)
     except Exception:
         pass
 
@@ -1229,8 +1227,8 @@ async def whatsapp_sync(body: dict):
             except: continue
         if not chats:
             raise HTTPException(status_code=502, detail="Não foi possível buscar chats do WAHA.")
-        # Ordena por timestamp desc e limita aos 60 mais recentes para não travar
-        chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)[:60]
+        # Ordena por timestamp desc e limita aos 30 mais recentes para não travar
+        chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)[:30]
         stats["chats"] = len(chats)
 
         # ── 2. For each chat: upsert contact + conversation + messages ──
