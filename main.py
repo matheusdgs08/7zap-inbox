@@ -460,16 +460,21 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
     return {"conversations": convs}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
-async def get_messages(conv_id: str):
-    cache_key = f"msgs:{conv_id}"
+async def get_messages(conv_id: str, before: str = None, limit: int = 50):
+    limit = min(limit, 100)
+    cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
     if cached:
         await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
         return {"messages": cached}
-    msgs = await run_sync(lambda: supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").execute().data)
+    q = supabase.table("messages").select("*").eq("conversation_id", conv_id)
+    if before:
+        q = q.lt("created_at", before)
+    msgs = await run_sync(lambda: q.order("created_at", desc=True).limit(limit).execute().data)
+    msgs = list(reversed(msgs))
     await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
     cache_set(cache_key, msgs, ttl=10)
-    return {"messages": msgs}
+    return {"messages": msgs, "has_more": len(msgs) == limit}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
