@@ -830,20 +830,24 @@ async def whatsapp_delete_instance(body: dict):
     # 2. Cascata: apagar conversas/mensagens vinculadas a esta instância
     if delete_history and tenant_id:
         def _cascade():
-            # Busca conversas do tenant nessa instância
             convs = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).eq("instance_name", inst_name).execute().data
             conv_ids = [c["id"] for c in convs]
             if conv_ids:
-                supabase.table("tasks").delete().in_("conversation_id", conv_ids).execute()
-                supabase.table("messages").delete().in_("conversation_id", conv_ids).execute()
-                supabase.table("conversation_labels").delete().in_("conversation_id", conv_ids).execute()
-                supabase.table("conversations").delete().in_("id", conv_ids).execute()
-            # Apaga contatos que só existem por causa desse número (sem outras conversas)
-            # Não apagamos contatos pois podem ter histórico em outros números
+                try: supabase.table("tasks").delete().in_("conversation_id", conv_ids).execute()
+                except Exception as e: print(f"delete tasks err: {e}")
+                try: supabase.table("messages").delete().in_("conversation_id", conv_ids).execute()
+                except Exception as e: print(f"delete messages err: {e}")
+                try: supabase.table("conversation_labels").delete().in_("conversation_id", conv_ids).execute()
+                except Exception: pass
+                try: supabase.table("conversations").delete().in_("id", conv_ids).execute()
+                except Exception as e: print(f"delete convs err: {e}")
         await run_sync(_cascade)
 
-    # 3. Remove a instância
-    supabase.table("gateway_instances").delete().eq("id", instance_id).eq("tenant_id", tenant_id).execute()
+    # 3. Remove a instância do banco
+    try:
+        supabase.table("gateway_instances").delete().eq("id", instance_id).eq("tenant_id", tenant_id).execute()
+    except Exception as e:
+        print(f"delete gateway_instances err: {e}")
     return {"ok": True}
 
 # ── BROADCASTS ───────────────────────────────────────────
