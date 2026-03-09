@@ -133,10 +133,6 @@ from datetime import datetime, timedelta
 app = FastAPI(title="7CRM API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(_startup_sync_names())
-
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
 WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
@@ -279,48 +275,6 @@ async def keepalive_loop():
         except:
             pass
         await asyncio.sleep(240)
-
-async def _startup_sync_names():
-    """Roda uma vez no startup: sincroniza nomes de contatos sem nome via WAHA."""
-    await asyncio.sleep(15)  # espera backend estabilizar
-    try:
-        import urllib.request as _req
-        tenants = supabase.table("tenants").select("id").execute().data
-        for tenant in tenants:
-            tid = tenant["id"]
-            # Busca contatos cujo nome é igual ao phone (sem nome real)
-            contacts = supabase.table("contacts").select("id,phone,name").eq("tenant_id", tid).execute().data or []
-            nameless = [c for c in contacts if not c.get("name") or c["name"] == c["phone"] or c["name"] == (c["phone"] or "").split("@")[0]]
-            if not nameless:
-                continue
-            # Pega instâncias do tenant
-            instances = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", tid).execute().data or []
-            for inst in instances:
-                iname = inst.get("instance_name")
-                if not iname: continue
-                try:
-                    r = _req.urlopen(_req.Request(f"{WAHA_URL}/api/{iname}/chats", headers={"X-Api-Key": WAHA_KEY}), timeout=12)
-                    chats = json.loads(r.read())
-                    # Build lookup map: jid → name
-                    name_map = {}
-                    for chat in chats:
-                        jid = chat.get("id", {}).get("_serialized", "")
-                        name = chat.get("name", "")
-                        if jid and name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
-                            name_map[jid] = name
-                    # Update nameless contacts
-                    updated = 0
-                    for contact in nameless:
-                        phone = contact["phone"]
-                        if phone in name_map:
-                            supabase.table("contacts").update({"name": name_map[phone]}).eq("id", contact["id"]).execute()
-                            updated += 1
-                    print(f"[startup_sync] tenant={tid[:8]} inst={iname}: {updated}/{len(nameless)} contatos atualizados")
-                except Exception as e:
-                    print(f"[startup_sync] erro inst={iname}: {e}")
-    except Exception as e:
-        print(f"[startup_sync] erro geral: {e}")
-
 
 @app.get("/ping")
 async def ping():
@@ -693,26 +647,6 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     msgs = await run_sync(_fetch)
     cache_set(cache_key, msgs, ttl=45)
     return {"messages": msgs, "has_more": len(msgs) == limit}
-
-
-@app.get("/users/me/preferences", dependencies=[Depends(verify_key)])
-async def get_user_preferences(user_id: str):
-    def _get():
-        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
-        return u.get("preferences") or {} if u else {}
-    prefs = await run_sync(_get)
-    return {"preferences": prefs}
-
-@app.put("/users/me/preferences", dependencies=[Depends(verify_key)])
-async def save_user_preferences(user_id: str, body: dict = Body(...)):
-    def _save():
-        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
-        current = (u.get("preferences") or {}) if u else {}
-        current.update(body)
-        supabase.table("users").update({"preferences": current}).eq("id", user_id).execute()
-        return current
-    prefs = await run_sync(_save)
-    return {"preferences": prefs}
 
 
 @app.post("/contacts/sync-names", dependencies=[Depends(verify_key)])
