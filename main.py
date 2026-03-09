@@ -1120,10 +1120,8 @@ async def whatsapp_sync(body: dict):
     instance  = body.get("instance", "default")
     tenant = supabase.table("tenants").select("plan, name").eq("id", tenant_id).single().execute().data
     plan = tenant.get("plan", "starter")
-    plan_days = {"pro": 90, "business": 180, "trial": 90, "enterprise": 365}
-    if plan == "starter":
-        raise HTTPException(status_code=403, detail="Sincronização disponível nos planos Pro e Business.")
-    days_limit = plan_days.get(plan, 90)
+    plan_days = {"starter": 30, "pro": 90, "business": 180, "trial": 90, "enterprise": 365}
+    days_limit = plan_days.get(plan, 30)
     since_ts = int((datetime.utcnow() - timedelta(days=days_limit)).timestamp() * 1000)
     stats = {"chats": 0, "contacts_created": 0, "conversations_created": 0, "messages_saved": 0, "skipped": 0}
 
@@ -1140,6 +1138,8 @@ async def whatsapp_sync(body: dict):
             except: continue
         if not chats:
             raise HTTPException(status_code=502, detail="Não foi possível buscar chats do WAHA.")
+        # Ordena por timestamp desc e limita aos 60 mais recentes para não travar
+        chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)[:60]
         stats["chats"] = len(chats)
 
         # ── 2. For each chat: upsert contact + conversation + messages ──
