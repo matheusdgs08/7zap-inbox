@@ -221,11 +221,11 @@ class LoginRequest(BaseModel):
     password: str
 
 class CreateUser(BaseModel):
-    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"; permissions: str = "read_write"
+    tenant_id: str; name: str; email: str; password: str; role: str = "agent"; avatar_color: Optional[str] = "#00c853"; permissions: str = "read_write"; allowed_instances: Optional[List[str]] = []
 
 class UpdateUser(BaseModel):
     name: Optional[str] = None; email: Optional[str] = None; password: Optional[str] = None
-    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None; permissions: Optional[str] = None
+    role: Optional[str] = None; is_active: Optional[bool] = None; avatar_color: Optional[str] = None; permissions: Optional[str] = None; allowed_instances: Optional[List[str]] = None
 
 class SendMessage(BaseModel):
     conversation_id: str; text: str; sent_by: Optional[str] = None; is_internal_note: Optional[bool] = False
@@ -275,11 +275,11 @@ async def login(body: LoginRequest):
     import secrets as _secrets
     session_id = _secrets.token_hex(16)
     supabase.table("users").update({"last_login": datetime.utcnow().isoformat(), "session_id": session_id}).eq("id", user["id"]).execute()
-    return {"token": create_jwt(user, session_id), "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853")}}
+    return {"token": create_jwt(user, session_id), "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "avatar_color": user.get("avatar_color", "#00c853"), "allowed_instances": user.get("allowed_instances") or []}}
 
 @app.get("/auth/me")
 async def me(user=Depends(get_current_user)):
-    return supabase.table("users").select("id,name,email,role,tenant_id,avatar_color,last_login").eq("id", user["sub"]).single().execute().data
+    return supabase.table("users").select("id,name,email,role,tenant_id,avatar_color,last_login,allowed_instances").eq("id", user["sub"]).single().execute().data
 
 @app.post("/auth/change-password")
 async def change_password(body: dict, user=Depends(get_current_user)):
@@ -296,20 +296,20 @@ async def change_password(body: dict, user=Depends(get_current_user)):
 # ── ADMIN ────────────────────────────────────────────────
 @app.get("/admin/users")
 async def list_users_admin(admin=Depends(require_admin)):
-    return {"users": supabase.table("users").select("id,name,email,role,is_active,avatar_color,last_login,tenant_id,permissions").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
+    return {"users": supabase.table("users").select("id,name,email,role,is_active,avatar_color,last_login,tenant_id,permissions,allowed_instances").eq("tenant_id", admin["tenant_id"]).order("created_at").execute().data}
 
 @app.post("/admin/users")
 async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
     if supabase.table("users").select("id").eq("email", body.email.lower()).execute().data:
         raise HTTPException(status_code=400, detail="Email já cadastrado")
     pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions}).execute().data[0]
+    user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances or []}).execute().data[0]
     user.pop("password_hash", None)
     return {"user": user}
 
 @app.put("/admin/users/{user_id}")
 async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
-    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions}.items() if v is not None}
+    updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances}.items() if v is not None}
     if body.password:
         if len(body.password) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
         updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
@@ -360,6 +360,9 @@ async def receive_message(payload: dict):
         if not content: return {"ok": True}
         waha_id = ""
 
+    # Captura session/instance_name do webhook
+    instance_name = payload.get("session") or payload.get("instance") or payload.get("instanceName") or ""
+
     tenants = supabase.table("tenants").select("id").execute().data
     for tenant in tenants:
         tid = tenant["id"]
@@ -369,7 +372,10 @@ async def receive_message(payload: dict):
         if convs:
             conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
         else:
-            conv = supabase.table("conversations").insert({"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}).execute().data[0]
+            insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
+            if instance_name:
+                insert_data["instance_name"] = instance_name
+            conv = supabase.table("conversations").insert(insert_data).execute().data[0]
             conv_id = conv["id"]; uc = 1
 
         # Evita duplicata por waha_id
@@ -388,21 +394,36 @@ async def receive_message(payload: dict):
 
 # ── CONVERSATIONS ────────────────────────────────────────
 @app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None):
-    cache_key = f"convs:{tenant_id}:{status}"
+async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None):
+    cache_key = f"convs:{tenant_id}:{status}:{user_id}"
     cached = cache_get(cache_key)
     if cached:
         return {"conversations": cached}
 
     def _query():
+        # Get user's allowed_instances if user_id provided
+        allowed = None
+        if user_id:
+            u = supabase.table("users").select("allowed_instances,role").eq("id", user_id).maybe_single().execute().data
+            if u and u.get("role") != "admin" and u.get("allowed_instances"):
+                allowed = u["allowed_instances"]  # list of instance IDs
+
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
         convs = q.order("last_message_at", desc=True).limit(200).execute().data
         if not convs:
             return convs
+
+        # Filter by allowed instances if applicable
+        if allowed:
+            # Get instance names for allowed IDs
+            inst_rows = supabase.table("gateway_instances").select("id,instance_name").in_("id", allowed).execute().data
+            allowed_names = {r["instance_name"] for r in inst_rows}
+            convs = [c for c in convs if c.get("instance_name") in allowed_names]
+
         # Busca todos os labels de uma vez (sem N+1)
         conv_ids = [c["id"] for c in convs]
-        all_cl = supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data
+        all_cl = supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data if conv_ids else []
         # Agrupa label_ids por conversa
         cl_map: dict = {}
         for row in all_cl:
