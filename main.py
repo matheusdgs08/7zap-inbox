@@ -363,34 +363,48 @@ async def receive_message(payload: dict):
     # Captura session/instance_name do webhook
     instance_name = payload.get("session") or payload.get("instance") or payload.get("instanceName") or ""
 
-    tenants = supabase.table("tenants").select("id").execute().data
-    for tenant in tenants:
-        tid = tenant["id"]
-        contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
-        contact_id = contacts[0]["id"] if contacts else supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]["id"]
-        convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").execute().data
-        if convs:
-            conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
-        else:
-            insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
-            if instance_name:
-                insert_data["instance_name"] = instance_name
-            conv = supabase.table("conversations").insert(insert_data).execute().data[0]
-            conv_id = conv["id"]; uc = 1
+    try:
+        tenants = supabase.table("tenants").select("id").execute().data
+        for tenant in tenants:
+            tid = tenant["id"]
+            contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
+            contact_id = contacts[0]["id"] if contacts else supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]["id"]
+            convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").execute().data
+            if convs:
+                conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
+            else:
+                insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
+                if instance_name:
+                    insert_data["instance_name"] = instance_name
+                conv = supabase.table("conversations").insert(insert_data).execute().data[0]
+                conv_id = conv["id"]; uc = 1
 
-        # Evita duplicata por waha_id
-        if waha_id:
-            dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
-            if dup: continue
+            # Evita duplicata por waha_id
+            if waha_id:
+                try:
+                    dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
+                    if dup: continue
+                except Exception:
+                    pass  # waha_id column may not exist yet, continue saving
 
-        supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
-        supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
-        # Invalida cache para forçar reload no frontend
-        cache_del(f"msgs:{conv_id}")
-        cache_del(f"convs:{tid}:open")
-        cache_del(f"convs:{tid}:None")
-        cache_del(f"convs:{tid}:all")
-    return {"ok": True}
+            # Salva mensagem — tenta com waha_id primeiro, fallback sem ele
+            try:
+                supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
+            except Exception:
+                # Fallback: insert sem waha_id caso coluna não exista
+                supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute()
+
+            supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
+            # Invalida cache para forçar reload no frontend
+            cache_del(f"msgs:{conv_id}")
+            cache_del(f"convs:{tid}:open")
+            cache_del(f"convs:{tid}:None")
+            cache_del(f"convs:{tid}:all")
+        return {"ok": True}
+    except Exception as e:
+        import traceback
+        print(f"WEBHOOK ERROR: {e}\n{traceback.format_exc()}")
+        return {"ok": False, "error": str(e)}
 
 # ── CONVERSATIONS ────────────────────────────────────────
 @app.get("/conversations", dependencies=[Depends(verify_key)])
