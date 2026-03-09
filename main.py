@@ -6,17 +6,23 @@ async def run_sync(fn):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_thread_pool, fn)
 
-# ── CACHE SIMPLES ─────────────────────────────────────────
+# ── CACHE SIMPLES (stale-while-revalidate) ────────────────
 _cache: dict = {}
-def cache_get(key):
+def cache_get(key, stale_ok=False):
     v = _cache.get(key)
-    if v and (datetime.utcnow().timestamp() - v["ts"]) < v["ttl"]:
-        return v["data"]
+    if not v: return None
+    age = datetime.utcnow().timestamp() - v["ts"]
+    if age < v["ttl"]: return v["data"]
+    if stale_ok and age < v["ttl"] * 10: return v["data"]  # serve stale até 10x o TTL
     return None
-def cache_set(key, data, ttl=20):
+def cache_set(key, data, ttl=30):
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
 def cache_del(key):
     _cache.pop(key, None)
+def cache_is_stale(key):
+    v = _cache.get(key)
+    if not v: return True
+    return (datetime.utcnow().timestamp() - v["ts"]) >= v["ttl"]
 # ── PLAN CREDIT CONSTANTS ────────────────────────────────
 PLAN_CREDITS = {
     "trial":      200,   # suficiente pra testar, não pra depender
@@ -412,9 +418,14 @@ async def receive_message(payload: dict):
 @app.get("/conversations", dependencies=[Depends(verify_key)])
 async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None):
     cache_key = f"convs:{tenant_id}:{status}:{user_id}"
-    cached = cache_get(cache_key)
-    if cached:
-        return {"conversations": cached}
+    # Serve stale cache instantly while refreshing in background
+    stale = cache_get(cache_key, stale_ok=True)
+    if stale and not cache_is_stale(cache_key):
+        return {"conversations": stale}  # fresh cache, return immediately
+    if stale:
+        # Has stale data — return it now, refresh in background
+        asyncio.create_task(_refresh_conversations(cache_key, tenant_id, status, user_id))
+        return {"conversations": stale}
 
     def _query():
         # Get user's allowed_instances if user_id provided
@@ -426,7 +437,7 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
 
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
-        convs = q.order("last_message_at", desc=True).limit(200).execute().data
+        convs = q.order("last_message_at", desc=True).limit(100).execute().data
         if not convs:
             return convs
 
@@ -456,8 +467,16 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
         return convs
 
     convs = await run_sync(_query)
-    cache_set(cache_key, convs, ttl=20)
+    cache_set(cache_key, convs, ttl=30)
     return {"conversations": convs}
+
+async def _refresh_conversations(cache_key, tenant_id, status, user_id):
+    """Background task: silently refresh stale conversations cache."""
+    try:
+        result = await list_conversations(tenant_id, status, user_id)
+        # result already sets cache internally
+    except Exception:
+        pass
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str, before: str = None, limit: int = 50):
@@ -473,7 +492,7 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     msgs = await run_sync(lambda: q.order("created_at", desc=True).limit(limit).execute().data)
     msgs = list(reversed(msgs))
     await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
-    cache_set(cache_key, msgs, ttl=10)
+    cache_set(cache_key, msgs, ttl=30)
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
