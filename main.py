@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 import concurrent.futures
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
@@ -7,7 +8,7 @@ async def run_sync(fn):
     return await loop.run_in_executor(_thread_pool, fn)
 
 # ── CACHE: Redis (preferido) + in-memory fallback ─────────
-import redis as _redis_lib, pickle
+# redis imported lazily inside _get_redis()
 
 _cache: dict = {}  # fallback in-memory
 _redis = None
@@ -19,8 +20,11 @@ def _get_redis():
     url = os.getenv("REDIS_URL") or os.getenv("REDIS_PRIVATE_URL") or os.getenv("CACHE_REDIS_URI")
     if url:
         try:
+            import redis as _redis_lib, pickle as _pickle
+            globals()["_pickle"] = _pickle
             _redis = _redis_lib.from_url(url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
             _redis.ping()
+            print(f"Redis connected: {url[:30]}...")
         except Exception as e:
             print(f"Redis unavailable, using memory cache: {e}")
             _redis = False
@@ -32,6 +36,7 @@ def cache_get(key, stale_ok=False):
     r = _get_redis()
     if r:
         try:
+            import pickle
             raw = r.get(f"7crm:{key}")
             if raw:
                 return pickle.loads(raw)
@@ -47,6 +52,7 @@ def cache_set(key, data, ttl=30):
     r = _get_redis()
     if r:
         try:
+            import pickle
             r.setex(f"7crm:{key}", ttl, pickle.dumps(data))
         except: pass
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
@@ -602,14 +608,14 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
     if cached:
-        await run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute())
-        return {"messages": cached}
+        # reset unread async in background, dont block response
+        asyncio.create_task(run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()))
+        return {"messages": cached, "has_more": len(cached) >= limit}
     q = supabase.table("messages").select("*").eq("conversation_id", conv_id)
     if before:
         q = q.lt("created_at", before)
     def _fetch():
         data = q.order("created_at", desc=True).limit(limit).execute().data
-        # Reset unread in same thread (no extra roundtrip)
         try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
         except: pass
         return list(reversed(data))
