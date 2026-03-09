@@ -650,7 +650,7 @@ async def whatsapp_qrcode(instance: str = "default"):
                     json={"name": instance, "start": True})
                 if create_r.status_code not in (200, 201):
                     return {"qr_code": "", "state": "error", "error": f"Erro ao criar sessão: {create_r.text}"}
-                await asyncio.sleep(4)  # aguarda inicializar
+                await asyncio.sleep(4)
 
             elif r.status_code == 200:
                 data = r.json()
@@ -660,19 +660,23 @@ async def whatsapp_qrcode(instance: str = "default"):
                     phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
                     return {"qr_code": "", "state": "open", "connected": True, "phone": phone}
                 if status == "STOPPED":
-                    # Sessão parada — inicia
                     await client.post(f"{WAHA_URL}/api/sessions/{instance}/start", headers=waha_headers())
                     await asyncio.sleep(4)
                 elif status == "FAILED":
                     await client.post(f"{WAHA_URL}/api/sessions/{instance}/restart", headers=waha_headers())
                     await asyncio.sleep(4)
 
-            # Tenta pegar screenshot com QR Code (até 6 tentativas)
+            # WAHA Plus: endpoint /api/{session}/auth/qr retorna PNG puro (QR limpo, sem screenshot)
             for attempt in range(6):
+                qr_r = await client.get(f"{WAHA_URL}/api/{instance}/auth/qr", headers=waha_headers())
+                if qr_r.status_code == 200 and qr_r.content and qr_r.headers.get("content-type","").startswith("image"):
+                    b64 = base64.b64encode(qr_r.content).decode()
+                    return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
+                # Fallback: screenshot (WAHA Core)
                 screenshot = await client.get(f"{WAHA_URL}/api/screenshot?session={instance}", headers=waha_headers())
                 if screenshot.status_code == 200 and screenshot.content:
                     b64 = base64.b64encode(screenshot.content).decode()
-                    return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE"}
+                    return {"qr_code": f"data:image/png;base64,{b64}", "state": "SCAN_QR_CODE", "screenshot": True}
                 await asyncio.sleep(3)
 
             return {"qr_code": "", "state": "timeout", "error": "QR Code não disponível — tente novamente"}
