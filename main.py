@@ -375,7 +375,8 @@ async def receive_message(payload: dict):
             tid = tenant["id"]
             contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
             contact_id = contacts[0]["id"] if contacts else supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]["id"]
-            convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").execute().data
+            # Get most recent open conversation for this contact (avoid duplicates)
+            convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True).limit(1).execute().data
             if convs:
                 conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
             else:
@@ -383,7 +384,6 @@ async def receive_message(payload: dict):
                 try:
                     conv = supabase.table("conversations").insert(insert_data).execute().data[0]
                 except Exception:
-                    # Fallback without optional fields
                     conv = supabase.table("conversations").insert({"contact_id": contact_id, "tenant_id": tid, "status": "open"}).execute().data[0]
                 conv_id = conv["id"]; uc = 1
 
@@ -477,6 +477,22 @@ async def _refresh_conversations(cache_key, tenant_id, status, user_id):
         # result already sets cache internally
     except Exception:
         pass
+
+
+@app.delete("/conversations/{conv_id}", dependencies=[Depends(verify_key)])
+async def delete_conversation(conv_id: str):
+    """Delete a conversation and all its messages/tasks."""
+    try:
+        supabase.table("tasks").delete().eq("conversation_id", conv_id).execute()
+    except: pass
+    try:
+        supabase.table("conversation_labels").delete().eq("conversation_id", conv_id).execute()
+    except: pass
+    try:
+        supabase.table("messages").delete().eq("conversation_id", conv_id).execute()
+    except: pass
+    supabase.table("conversations").delete().eq("id", conv_id).execute()
+    return {"ok": True}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def get_messages(conv_id: str, before: str = None, limit: int = 50):
@@ -1180,10 +1196,17 @@ async def whatsapp_sync(body: dict):
                 chat_id = f"{phone}@c.us"
                 name = chat.get("name") or phone
 
-                # Upsert contact
-                existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
-                contact_id = existing[0]["id"] if existing else supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
-                if not existing: stats["contacts_created"] += 1
+                # Upsert contact — always update name if it came from WhatsApp
+                existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
+                if existing:
+                    contact_id = existing[0]["id"]
+                    # Update name if currently blank or is just the phone number
+                    existing_name = existing[0].get("name","")
+                    if name and name != phone and (not existing_name or existing_name == phone):
+                        supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
+                else:
+                    contact_id = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
+                    stats["contacts_created"] += 1
 
                 # Upsert conversation
                 existing_conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
