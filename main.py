@@ -374,9 +374,11 @@ async def receive_message(payload: dict):
                 conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
             else:
                 insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
-                if instance_name:
-                    insert_data["instance_name"] = instance_name
-                conv = supabase.table("conversations").insert(insert_data).execute().data[0]
+                try:
+                    conv = supabase.table("conversations").insert(insert_data).execute().data[0]
+                except Exception:
+                    # Fallback without optional fields
+                    conv = supabase.table("conversations").insert({"contact_id": contact_id, "tenant_id": tid, "status": "open"}).execute().data[0]
                 conv_id = conv["id"]; uc = 1
 
             # Evita duplicata por waha_id
