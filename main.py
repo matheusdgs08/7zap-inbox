@@ -937,6 +937,37 @@ async def delete_label(label_id: str):
 async def list_contacts(tenant_id: str):
     return {"contacts": supabase.table("contacts").select("*").eq("tenant_id", tenant_id).order("name").execute().data}
 
+@app.get("/contacts/profile-picture", dependencies=[Depends(verify_key)])
+async def get_profile_picture(phone: str, instance: str = "default"):
+    """
+    Busca foto de perfil de um contato via WAHA.
+    Retorna {"url": "..."} ou {"url": null} se não tiver foto.
+    """
+    if not WAHA_URL:
+        return {"url": None}
+    try:
+        # Normaliza o chat_id
+        if "@" in phone:
+            chat_id = phone  # mantém @lid ou @c.us original
+        else:
+            clean = "".join(c for c in phone if c.isdigit())
+            chat_id = f"{clean}@c.us"
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                f"{WAHA_URL}/api/contacts/profile-picture",
+                headers=waha_headers(),
+                params={"session": instance, "contactId": chat_id}
+            )
+            if r.status_code == 200:
+                data = r.json()
+                # WAHA retorna {"eurl": "...", "tag": "..."} ou {"url": "..."}
+                url = data.get("eurl") or data.get("url") or data.get("profilePictureUrl")
+                return {"url": url}
+    except Exception as e:
+        print(f"[profile_picture] erro {phone}: {e}")
+    return {"url": None}
+
 # ── TASKS ────────────────────────────────────────────────
 @app.get("/tasks/completed", dependencies=[Depends(verify_key)])
 async def list_completed_tasks(tenant_id: str, days: int = 7):
