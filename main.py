@@ -623,6 +623,83 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     cache_set(cache_key, msgs, ttl=45)
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
+
+@app.get("/conversations/{conv_id}/history", dependencies=[Depends(verify_key)])
+async def get_history(conv_id: str, limit: int = 30):
+    """Busca histórico direto do WAHA + mescla com DB. Garante pelo menos as últimas N mensagens."""
+    def _fetch():
+        # 1. Pega dados da conversa
+        conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).maybe_single().execute().data
+        if not conv:
+            return []
+
+        phone = conv.get("contacts", {}).get("phone", "") if conv.get("contacts") else ""
+        instance_name = conv.get("instance_name", "")
+
+        # 2. Mensagens já salvas no banco
+        db_msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at", desc=False).execute().data or []
+
+        # 3. Busca histórico no WAHA
+        waha_msgs = []
+        if phone and instance_name:
+            try:
+                # Normaliza phone para formato WAHA
+                clean = phone.replace("+","").replace("-","").replace(" ","").replace("(","").replace(")","")
+                # Remove @lid/@c.us se tiver
+                if "@" in clean:
+                    clean = clean.split("@")[0]
+                chat_id = f"{clean}@c.us"
+
+                waha_url = f"{WAHA_URL}/api/{instance_name}/chats/{chat_id}/messages?limit={limit}&downloadMedia=false"
+                import urllib.request as _req
+                req = _req.Request(waha_url, headers={"X-Api-Key": WAHA_KEY})
+                resp = _req.urlopen(req, timeout=8)
+                raw = json.loads(resp.read())
+
+                # Converte formato WAHA → formato DB
+                db_waha_ids = {m.get("waha_id") for m in db_msgs if m.get("waha_id")}
+                now = datetime.utcnow()
+
+                for m in raw:
+                    waha_id = m.get("id", "")
+                    if waha_id in db_waha_ids:
+                        continue  # já temos no banco
+                    ts = m.get("timestamp", 0)
+                    created_at = datetime.utcfromtimestamp(ts).isoformat() if ts else now.isoformat()
+                    body = m.get("body", "") or ""
+                    if not body and m.get("hasMedia"):
+                        body = f"[{m.get('type','mídia')}]"
+                    waha_msgs.append({
+                        "id": f"waha_{waha_id}",
+                        "conversation_id": conv_id,
+                        "direction": "outbound" if m.get("fromMe") else "inbound",
+                        "content": body,
+                        "type": "text",
+                        "waha_id": waha_id,
+                        "created_at": created_at,
+                        "is_internal_note": False,
+                        "ai_suggestion": None,
+                        "_from_waha": True,
+                    })
+            except Exception as e:
+                print(f"WAHA history error: {e}")
+
+        # 4. Mescla: WAHA histórico + banco, sem duplicatas, ordenado por data
+        all_msgs = waha_msgs + db_msgs
+        seen = set()
+        merged = []
+        for m in all_msgs:
+            key = m.get("waha_id") or m.get("id")
+            if key not in seen:
+                seen.add(key)
+                merged.append(m)
+
+        merged.sort(key=lambda x: x.get("created_at",""))
+        return merged[-limit:]  # retorna as últimas N
+
+    msgs = await run_sync(_fetch)
+    return {"messages": msgs, "source": "merged"}
+
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
