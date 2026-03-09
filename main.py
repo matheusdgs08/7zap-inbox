@@ -86,6 +86,8 @@ SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
 WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
 WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
+BACKEND_URL       = os.getenv("BACKEND_URL", "https://7zap-inbox-production.up.railway.app")
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "7zap_inbox_secret")
 INBOX_API_KEY     = os.getenv("INBOX_API_KEY", "7zap_inbox_secret")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
@@ -171,11 +173,54 @@ security = HTTPBearer(auto_error=False)
 async def start_keepalive():
     asyncio.create_task(keepalive_loop())
 
+async def ensure_webhooks():
+    """Auto-configure webhooks for all active WAHA sessions that are missing it."""
+    if not WAHA_URL:
+        return
+    webhook_url = f"{BACKEND_URL}/webhook/message"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            if r.status_code != 200:
+                return
+            sessions = r.json()
+            for session in sessions:
+                name = session.get("name", "")
+                status = session.get("status", "")
+                if status not in ("WORKING", "CONNECTED"):
+                    continue
+                # Check if webhook already configured correctly
+                webhooks = session.get("config", {}).get("webhooks", [])
+                already_set = any(
+                    w.get("url") == webhook_url
+                    for w in webhooks
+                )
+                if already_set:
+                    continue
+                # Configure webhook automatically
+                await client.put(
+                    f"{WAHA_URL}/api/sessions/{name}",
+                    headers=waha_headers(),
+                    json={"config": {"webhooks": [{
+                        "url": webhook_url,
+                        "events": ["message", "session.status"],
+                        "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
+                    }]}}
+                )
+                print(f"✅ Auto-webhook configured for session: {name}")
+    except Exception as e:
+        print(f"ensure_webhooks error: {e}")
+
 async def keepalive_loop():
     await asyncio.sleep(30)
     while True:
         try:
             supabase.table("tenants").select("id").limit(1).execute()
+        except:
+            pass
+        # Auto-configure webhooks for any session missing them
+        try:
+            await ensure_webhooks()
         except:
             pass
         await asyncio.sleep(240)
@@ -848,7 +893,11 @@ async def whatsapp_create_instance(body: dict):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
-                    json={"name": inst_name, "config": {"webhooks": [{"url": f"{os.environ.get('BACKEND_URL','')}/webhook/relay", "events": ["message"]}]}})
+                    json={"name": inst_name, "config": {"webhooks": [{
+                        "url": f"{BACKEND_URL}/webhook/message",
+                        "events": ["message", "session.status"],
+                        "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
+                    }]}})
         except: pass
     db_row = supabase.table("gateway_instances").insert({
         "tenant_id": tenant_id, "instance_name": inst_name,
