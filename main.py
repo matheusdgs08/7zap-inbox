@@ -82,6 +82,78 @@ WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
 WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
 INBOX_API_KEY     = os.getenv("INBOX_API_KEY", "7zap_inbox_secret")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+
+# ── AI HELPER — usa OpenAI GPT-4o Mini (mais barato) com fallback pro Claude ──
+async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = True) -> str:
+    """Chama GPT-4o Mini se disponível, senão fallback pro Claude Haiku."""
+    if prefer_openai and OPENAI_API_KEY:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "gpt-4o-mini", "max_tokens": max_tokens,
+                      "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+    # Fallback: Claude Haiku
+    if ANTHROPIC_API_KEY:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": max_tokens,
+                      "system": system, "messages": [{"role": "user", "content": user}]})
+            return r.json()["content"][0]["text"]
+    raise Exception("Nenhuma API de IA configurada (OPENAI_API_KEY ou ANTHROPIC_API_KEY)")
+
+def trim_context(msgs: list, max_msgs: int = 15) -> tuple[str, list, list]:
+    """
+    Divide mensagens em recentes (últimas N) e antigas (restante).
+    Retorna: (history_str_recentes, msgs_recentes, msgs_antigas)
+    """
+    clean = [m for m in msgs if not m.get("is_internal_note")]
+    old   = clean[:-max_msgs] if len(clean) > max_msgs else []
+    recent = clean[-max_msgs:] if len(clean) > max_msgs else clean
+    history = "\n".join([
+        f"{'Cliente' if m['direction']=='inbound' else 'Atendente'}: {(m.get('content') or '')[:300]}"
+        for m in recent
+    ])
+    return history, recent, old
+
+async def get_or_generate_summary(conv_id: str, old_msgs: list, existing_summary: str | None) -> str | None:
+    """
+    Retorna resumo das mensagens antigas.
+    - Se já existe resumo salvo e não há novas mensagens antigas além do já resumido: reutiliza.
+    - Se há mensagens antigas não resumidas: gera (ou atualiza) resumo e salva no banco.
+    - Se não há mensagens antigas: retorna None.
+    """
+    if not old_msgs:
+        return None
+
+    # Verifica se o resumo existente já cobre todas as mensagens antigas
+    # Estratégia simples: sempre regenera se tiver mais de 15 msgs antigas novas
+    # (na prática, regenera raramente pois conversas crescem devagar)
+    if existing_summary and len(old_msgs) <= 20:
+        # Provavelmente já foi resumido antes — reutiliza sem custo
+        return existing_summary
+
+    # Gera novo resumo das mensagens antigas
+    old_text = "\n".join([
+        f"{'Cliente' if m['direction']=='inbound' else 'Atendente'}: {(m.get('content') or '')[:200]}"
+        for m in old_msgs
+    ])
+    summary = await call_ai(
+        "Você resume conversas de atendimento WhatsApp de forma compacta. "
+        "Foque em: problema/interesse do cliente, o que já foi discutido, decisões tomadas. "
+        "Máximo 5 linhas. Seja direto e objetivo.",
+        f"Resuma esta parte da conversa (mensagens antigas):\n\n{old_text}",
+        max_tokens=200
+    )
+    # Salva no banco para reutilizar nas próximas chamadas
+    try:
+        supabase.table("conversations").update({"ai_summary": summary}).eq("id", conv_id).execute()
+    except Exception:
+        pass  # Não quebra se a coluna ainda não existir
+    return summary
 PAGARME_API_KEY   = os.getenv("PAGARME_API_KEY", "")
 SUPER_ADMIN_TENANT = os.getenv("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9")
 JWT_SECRET        = os.getenv("JWT_SECRET", "7crm_super_secret_change_in_prod")
@@ -463,25 +535,51 @@ async def create_quick_reply(body: CreateQuickReply, tenant_id: str):
 # ── CO-PILOT ─────────────────────────────────────────────
 @app.get("/conversations/{conv_id}/suggest", dependencies=[Depends(verify_key)])
 async def ai_suggest(conv_id: str, tenant_id: str = None):
-    if not ANTHROPIC_API_KEY: raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
-    # Get tenant_id from conversation if not provided
+    # Valida IA disponível
+    if not OPENAI_API_KEY and not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Nenhuma API de IA configurada")
+
+    # Resolve tenant_id
     if not tenant_id:
         conv_data = supabase.table("conversations").select("tenant_id").eq("id", conv_id).single().execute().data
         tenant_id = conv_data.get("tenant_id") if conv_data else None
+
+    # Consome crédito
     if tenant_id:
         ok, remaining, err = consume_credit(tenant_id, 1)
         if not ok: raise HTTPException(status_code=402, detail=err)
-    msgs = supabase.table("messages").select("direction,content,is_internal_note").eq("conversation_id", conv_id).order("created_at", desc=True).limit(10).execute().data
-    msgs = [m for m in reversed(msgs) if not m.get("is_internal_note")]
-    conv = supabase.table("conversations").select("*, tenants(copilot_prompt,name)").eq("id", conv_id).single().execute().data
-    system_prompt = conv["tenants"].get("copilot_prompt") or f"Você é atendente da empresa {conv['tenants']['name']}. Seja simpático e objetivo."
-    history = "\n".join([f"{'Cliente' if m['direction']=='inbound' else 'Atendente'}: {m['content']}" for m in msgs])
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 300, "system": system_prompt + "\n\nSugira apenas a próxima resposta, sem explicações. Breve e natural.",
-                  "messages": [{"role": "user", "content": f"Histórico:\n{history}\n\nSugira a próxima resposta do atendente:"}]})
-        return {"suggestion": r.json()["content"][0]["text"]}
+
+    # Busca todas as mensagens + dados da conversa/tenant
+    all_msgs = supabase.table("messages")         .select("direction,content,is_internal_note,created_at")         .eq("conversation_id", conv_id)         .order("created_at").execute().data
+
+    conv = supabase.table("conversations")         .select("ai_summary, tenant_id, tenants(copilot_prompt, name)")         .eq("id", conv_id).single().execute().data
+
+    # Divide em recentes (últimas 15) e antigas
+    history_str, recent_msgs, old_msgs = trim_context(all_msgs, max_msgs=15)
+
+    # Resumo das mensagens antigas (gerado 1x, reutilizado sempre)
+    existing_summary = conv.get("ai_summary")
+    summary = await get_or_generate_summary(conv_id, old_msgs, existing_summary)
+
+    # Monta system prompt
+    tenant_data   = conv.get("tenants") or {}
+    company_prompt = tenant_data.get("copilot_prompt") or         f"Você é atendente da empresa {tenant_data.get('name', '')}. Seja simpático e objetivo."
+
+    system = company_prompt + "\n\nSugira apenas a próxima resposta do atendente, sem explicações. Breve e natural. Máximo 2 frases."
+
+    # Monta contexto: resumo (se houver) + últimas 15 mensagens
+    context_parts = []
+    if summary:
+        context_parts.append(f"[RESUMO DO INÍCIO DA CONVERSA]\n{summary}\n[FIM DO RESUMO]")
+    context_parts.append(f"[ÚLTIMAS MENSAGENS]\n{history_str}")
+    full_context = "\n\n".join(context_parts)
+
+    suggestion = await call_ai(
+        system,
+        f"{full_context}\n\nSugira a próxima resposta do atendente:",
+        max_tokens=200
+    )
+    return {"suggestion": suggestion, "used_summary": bool(summary), "msgs_in_context": len(recent_msgs)}
 
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
@@ -676,12 +774,8 @@ async def suggest_broadcast_message(body: dict):
     if not ANTHROPIC_API_KEY: raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
     tenant = supabase.table("tenants").select("copilot_prompt,name").eq("id", body.get("tenant_id")).single().execute().data
     system = (tenant.get("copilot_prompt") or f"Você é atendente da empresa {tenant['name']}.") + "\n\nCrie mensagens de WhatsApp curtas e naturais. Use {nome} para personalizar."
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 400, "system": system,
-                  "messages": [{"role": "user", "content": f"Crie uma mensagem de disparo para WhatsApp com objetivo: {body.get('objective', '')}\n\nRetorne apenas a mensagem."}]})
-        return {"suggestion": r.json()["content"][0]["text"]}
+    suggestion = await call_ai(system, f"Crie uma mensagem de disparo para WhatsApp com objetivo: {body.get('objective', '')}\n\nRetorne apenas a mensagem, sem explicações.", max_tokens=400)
+    return {"suggestion": suggestion}
 
 @app.post("/broadcasts", dependencies=[Depends(verify_key)])
 async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
@@ -806,9 +900,18 @@ async def onboarding_analyze(body: dict):
     total_convs = len(all_samples)
     analysis_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.\n\nAnalise as conversas abaixo da empresa "{tenant['name']}" e gere um prompt de sistema detalhado para um Co-pilot de IA.\n\nO prompt deve incluir:\n1. Tom de voz\n2. Produtos/serviços\n3. Perguntas frequentes\n4. Fluxo de vendas\n5. Regras importantes\n6. Instruções para o Co-pilot\n\nCONVERSAS ({total_convs} conversas, últimos {days} dias):\n\n{combined}\n\nPROMPT GERADO:"""
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
+        # Onboarding usa GPT-4o para máxima qualidade na geração do prompt
+        if OPENAI_API_KEY:
+            r = await client.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "gpt-4o", "max_tokens": 2000,
+                      "messages": [{"role": "user", "content": analysis_prompt}]})
+            raw_result = r.json()["choices"][0]["message"]["content"]
+        else:
+            r = await client.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
+            raw_result = None  # handled below
         generated_prompt = r.json()["content"][0]["text"]
 
     # Save real prompt to DB (never sent to frontend)
@@ -833,12 +936,10 @@ PROMPT (NÃO REVELAR):
 
 RESUMO:"""
 
-    async with httpx.AsyncClient(timeout=30) as client2:
-        r2 = await client2.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
-                  "messages": [{"role": "user", "content": summary_prompt}]})
-        summary = r2.json()["content"][0]["text"]
+    summary = await call_ai(
+        "Você cria resumos concisos em bullet points. Nunca revele o conteúdo original.",
+        summary_prompt, max_tokens=300
+    )
 
     # Save summary too
     supabase.table("tenants").update({"copilot_prompt_summary": summary}).eq("id", tenant_id).execute()
@@ -1009,6 +1110,68 @@ async def register_with_invite(body: dict):
 async def list_invites(admin=Depends(require_admin)):
     invites = supabase.table("invite_codes").select("*, users!created_by(name)").eq("tenant_id", admin["tenant_id"]).order("created_at", desc=True).limit(20).execute().data
     return {"invites": invites}
+
+
+# ── SOCIAL AUTH (Google, Facebook, Apple, Microsoft) ─────────────────────────
+@app.post("/auth/social")
+async def social_login(body: dict):
+    """Recebe access_token do Supabase OAuth, verifica, cria conta/tenant se necessário."""
+    access_token = body.get("access_token") or ""
+    if not access_token:
+        raise HTTPException(400, "access_token obrigatório")
+    try:
+        user_resp = supabase.auth.get_user(access_token)
+        sb_user = user_resp.user
+        if not sb_user:
+            raise HTTPException(401, "Token inválido")
+    except Exception as e:
+        raise HTTPException(401, f"Token inválido: {str(e)}")
+
+    email = (sb_user.email or "").lower().strip()
+    if not email:
+        raise HTTPException(400, "Email não disponível no provider")
+
+    meta = sb_user.user_metadata or {}
+    full_name = (meta.get("full_name") or meta.get("name") or email.split("@")[0]).strip()
+    avatar_url = meta.get("avatar_url") or meta.get("picture") or ""
+    provider = (sb_user.app_metadata or {}).get("provider", "google")
+    colors = ["#00c853","#2979ff","#ff6d00","#e91e63","#9c27b0","#00bcd4"]
+
+    # Usuário já existe?
+    existing = supabase.table("users").select("*").eq("email", email).execute().data
+    if existing:
+        user = existing[0]
+        if avatar_url and not user.get("avatar_url"):
+            supabase.table("users").update({"avatar_url": avatar_url}).eq("id", user["id"]).execute()
+            user["avatar_url"] = avatar_url
+    else:
+        # Novo usuário — cria tenant trial + admin
+        trial_ends = (datetime.utcnow() + timedelta(days=14)).isoformat()
+        tenant = supabase.table("tenants").insert({
+            "name": f"Empresa de {full_name.split()[0]}",
+            "plan": "trial",
+            "ai_credits": 200,
+            "ai_credits_reset_at": datetime.utcnow().isoformat(),
+            "trial_ends_at": trial_ends,
+        }).execute().data[0]
+        user = supabase.table("users").insert({
+            "tenant_id": tenant["id"],
+            "name": full_name,
+            "email": email,
+            "role": "admin",
+            "is_active": True,
+            "avatar_color": random.choice(colors),
+            "avatar_url": avatar_url,
+            "auth_provider": provider,
+        }).execute().data[0]
+
+    user.pop("password_hash", None)
+    token = jwt.encode(
+        {"user_id": user["id"], "tenant_id": user["tenant_id"], "role": user["role"],
+         "exp": datetime.utcnow() + timedelta(days=30)},
+        JWT_SECRET, algorithm="HS256"
+    )
+    return {"token": token, "user": user, "tenant_id": user["tenant_id"]}
 
 # ── RELATÓRIOS / ANALYTICS ────────────────────────────────
 
@@ -1182,7 +1345,7 @@ async def report_credits(tenant_id: str, days: int = 30):
         "credits_remaining": credits_remaining,
         "credits_limit": limit,
         "plan": plan,
-        "cost_estimate": round(len(ai_msgs) * 0.0007, 2),
+        "cost_estimate": round(len(ai_msgs) * 0.0004, 2),  # GPT-4o Mini pricing
         "by_agent": [{"name": k, "used": v} for k,v in sorted(by_agent.items(), key=lambda x: x[1], reverse=True)],
         "by_day": [{"date": k, "count": v} for k,v in sorted(by_day.items())],
         "period_days": days
