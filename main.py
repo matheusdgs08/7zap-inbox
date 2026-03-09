@@ -127,19 +127,25 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
-import httpx, os, jwt, bcrypt, asyncio, random, base64
+import httpx, os, jwt, bcrypt, asyncio, random, base64, json, secrets as _secrets_mod
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_startup_sync_names())
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
 WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
 WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
 BACKEND_URL       = os.getenv("BACKEND_URL", "https://7zap-inbox-production.up.railway.app")
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "7zap_inbox_secret")
-INBOX_API_KEY     = os.getenv("INBOX_API_KEY", "7zap_inbox_secret")
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET") or "7zap_inbox_secret_CHANGE_ME"
+INBOX_API_KEY     = os.getenv("INBOX_API_KEY") or "7zap_inbox_secret_CHANGE_ME"
+if INBOX_API_KEY.endswith("_CHANGE_ME"):
+    import warnings; warnings.warn("⚠️  INBOX_API_KEY não configurada — usando valor padrão inseguro!")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 
@@ -215,7 +221,7 @@ async def get_or_generate_summary(conv_id: str, old_msgs: list, existing_summary
     return summary
 PAGARME_API_KEY   = os.getenv("PAGARME_API_KEY", "")
 SUPER_ADMIN_TENANT = os.getenv("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9")
-JWT_SECRET        = os.getenv("JWT_SECRET", "7crm_super_secret_change_in_prod")
+JWT_SECRET        = os.getenv("JWT_SECRET") or "7crm_super_secret_CHANGE_ME_IN_PROD"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 security = HTTPBearer(auto_error=False)
@@ -275,6 +281,44 @@ async def keepalive_loop():
         except:
             pass
         await asyncio.sleep(240)
+
+async def _startup_sync_names():
+    """Roda uma vez no startup: sincroniza nomes de contatos sem nome via WAHA."""
+    await asyncio.sleep(15)  # espera backend estabilizar
+    try:
+        tenants = supabase.table("tenants").select("id").execute().data
+        for tenant in tenants:
+            tid = tenant["id"]
+            contacts = supabase.table("contacts").select("id,phone,name").eq("tenant_id", tid).execute().data or []
+            nameless = [c for c in contacts if not c.get("name") or c["name"] == c["phone"] or c["name"] == (c["phone"] or "").split("@")[0]]
+            if not nameless:
+                continue
+            instances = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", tid).execute().data or []
+            for inst in instances:
+                iname = inst.get("instance_name")
+                if not iname: continue
+                try:
+                    async with httpx.AsyncClient(timeout=12) as client:
+                        r = await client.get(f"{WAHA_URL}/api/{iname}/chats", headers=waha_headers())
+                        chats = r.json() if r.status_code == 200 else []
+                    name_map = {}
+                    for chat in (chats if isinstance(chats, list) else []):
+                        jid = chat.get("id", {}).get("_serialized", "")
+                        name = chat.get("name", "")
+                        if jid and name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
+                            name_map[jid] = name
+                    updated = 0
+                    for contact in nameless:
+                        phone = contact["phone"]
+                        if phone in name_map:
+                            supabase.table("contacts").update({"name": name_map[phone]}).eq("id", contact["id"]).execute()
+                            updated += 1
+                    print(f"[startup_sync] tenant={tid[:8]} inst={iname}: {updated}/{len(nameless)} contatos atualizados")
+                except Exception as e:
+                    print(f"[startup_sync] erro inst={iname}: {e}")
+    except Exception as e:
+        print(f"[startup_sync] erro geral: {e}")
+
 
 @app.get("/ping")
 async def ping():
@@ -427,8 +471,11 @@ async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
 # ── WEBHOOK — recebe mensagens do WAHA ───────────────────
 @app.post("/webhook/inbox")
 @app.post("/webhook/message")
-async def receive_message(payload: dict):
+async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     """Aceita formato WAHA: {event, session, payload: {from, fromMe, body, type}}"""
+    # Verifica autenticidade do webhook (cabeçalho enviado pelo WAHA)
+    if WEBHOOK_SECRET and x_api_key != WEBHOOK_SECRET:
+        return {"ok": True}  # Silently ignore invalid webhooks
     # Suporte a ambos formatos: WAHA e Evolution API legado
     event = payload.get("event", "")
 
@@ -472,7 +519,17 @@ async def receive_message(payload: dict):
     instance_name = payload.get("session") or payload.get("instance") or payload.get("instanceName") or ""
 
     try:
-        tenants = supabase.table("tenants").select("id").execute().data
+        # Tenant isolation: find tenant via gateway_instance, not loop-all
+        tid = None
+        if instance_name:
+            inst_row = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).maybe_single().execute().data
+            if inst_row:
+                tid = inst_row["tenant_id"]
+        if not tid:
+            # Fallback: use first tenant that has this contact (legacy)
+            tenants = supabase.table("tenants").select("id").execute().data
+        else:
+            tenants = [{"id": tid}]
         for tenant in tenants:
             tid = tenant["id"]
             contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
@@ -485,10 +542,11 @@ async def receive_message(payload: dict):
                 # Try to get real name from WAHA chat list async
                 async def _fetch_name(tid=tid, phone=phone, contact_id=contact_id, instance_name=instance_name):
                     try:
-                        import urllib.request as _req
-                        r = _req.urlopen(_req.Request(f"{WAHA_URL}/api/{instance_name}/chats", headers={"X-Api-Key": WAHA_KEY}), timeout=8)
-                        chats = json.loads(r.read())
-                        for chat in chats:
+                        if not instance_name: return
+                        async with httpx.AsyncClient(timeout=8) as _c:
+                            _r = await _c.get(f"{WAHA_URL}/api/{instance_name}/chats", headers=waha_headers())
+                            chats = _r.json() if _r.status_code == 200 else []
+                        for chat in (chats if isinstance(chats, list) else []):
                             if chat.get("id", {}).get("_serialized") == phone:
                                 name = chat.get("name","")
                                 if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
@@ -649,6 +707,26 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 
+@app.get("/users/me/preferences", dependencies=[Depends(verify_key)])
+async def get_user_preferences(user_id: str):
+    def _get():
+        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        return u.get("preferences") or {} if u else {}
+    prefs = await run_sync(_get)
+    return {"preferences": prefs}
+
+@app.put("/users/me/preferences", dependencies=[Depends(verify_key)])
+async def save_user_preferences(user_id: str, body: dict = Body(...)):
+    def _save():
+        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        current = (u.get("preferences") or {}) if u else {}
+        current.update(body)
+        supabase.table("users").update({"preferences": current}).eq("id", user_id).execute()
+        return current
+    prefs = await run_sync(_save)
+    return {"preferences": prefs}
+
+
 @app.post("/contacts/sync-names", dependencies=[Depends(verify_key)])
 async def sync_contact_names(tenant_id: str):
     """Busca nomes reais dos contatos via WAHA /chats e atualiza no banco. Roda em background."""
@@ -659,10 +737,10 @@ async def sync_contact_names(tenant_id: str):
                 iname = inst.get("instance_name")
                 if not iname: continue
                 try:
-                    import urllib.request as _req
-                    r = _req.urlopen(_req.Request(f"{WAHA_URL}/api/{iname}/chats", headers={"X-Api-Key": WAHA_KEY}), timeout=10)
-                    chats = json.loads(r.read())
-                    for chat in chats:
+                    async with httpx.AsyncClient(timeout=10) as _hc:
+                        _hr = await _hc.get(f"{WAHA_URL}/api/{iname}/chats", headers=waha_headers())
+                        chats = _hr.json() if _hr.status_code == 200 else []
+                    for chat in (chats if isinstance(chats, list) else []):
                         name = chat.get("name", "")
                         jid = chat.get("id", {}).get("_serialized", "")
                         if not name or not jid: continue
@@ -708,10 +786,10 @@ async def get_history(conv_id: str, limit: int = 30):
                     chat_id = f"{clean}@c.us"
 
                 waha_url = f"{WAHA_URL}/api/{instance_name}/chats/{chat_id}/messages?limit={limit}&downloadMedia=false"
-                import urllib.request as _req
-                req = _req.Request(waha_url, headers={"X-Api-Key": WAHA_KEY})
-                resp = _req.urlopen(req, timeout=8)
-                raw = json.loads(resp.read())
+                import httpx as _hx
+                with _hx.Client(timeout=8) as _hc:
+                    _hr = _hc.get(waha_url, headers=waha_headers())
+                    raw = _hr.json() if _hr.status_code == 200 else []
 
                 # Converte formato WAHA → formato DB
                 db_waha_ids = {m.get("waha_id") for m in db_msgs if m.get("waha_id")}
@@ -763,17 +841,23 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
     if not body.is_internal_note:
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
-        bg.add_task(waha_send_msg, conv["contacts"]["phone"], body.text)
+        session = conv.get("instance_name") or "default"
+        bg.add_task(waha_send_msg, conv["contacts"]["phone"], body.text, session)
     return {"message": msg}
 
-async def waha_send_msg(phone: str, text: str):
-    """Envia mensagem via WAHA — formato correto"""
+async def waha_send_msg(phone: str, text: str, session: str = "default"):
+    """Envia mensagem via WAHA — usa session correta da conversa"""
     try:
+        # Normalize phone: if @lid keep as-is, otherwise append @c.us
+        if "@" in phone:
+            chat_id = phone
+        else:
+            chat_id = f"{phone}@c.us"
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(
                 f"{WAHA_URL}/api/sendText",
                 headers=waha_headers(),
-                json={"session": "default", "chatId": f"{phone}@c.us", "text": text}
+                json={"session": session, "chatId": chat_id, "text": text}
             )
     except:
         pass
@@ -1188,7 +1272,7 @@ async def whatsapp_delete_instance(body: dict):
 
 # ── TEMP CLEANUP — remove after use ─────────────────────
 @app.post("/admin/reset-tenant", dependencies=[Depends(verify_key)])
-async def reset_tenant(body: dict):
+async def reset_tenant(body: dict, admin=Depends(require_super_admin)):
     """Limpa todo o histórico de um tenant e reseta senha do usuário admin"""
     tenant_id = body.get("tenant_id")
     new_password = body.get("new_password", "")
@@ -1279,7 +1363,10 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
     recipients = supabase.table("broadcast_recipients").select("*").eq("broadcast_id", broadcast_id).eq("status", "pending").execute().data
     sent = 0; failed = 0
     for rec in recipients:
-        if supabase.table("broadcasts").select("status").eq("id", broadcast_id).single().execute().data["status"] == "cancelled": break
+        # Check cancelled every 5 messages (not every message) to reduce DB calls
+        if sent % 5 == 0:
+            bcast_status = supabase.table("broadcasts").select("status").eq("id", broadcast_id).single().execute().data
+            if bcast_status and bcast_status["status"] == "cancelled": break
         msg = bcast["message"].replace("{nome}", rec.get("name") or "").replace("{telefone}", rec.get("phone") or "")
         ok = False
         try:
@@ -1332,7 +1419,7 @@ async def trial_status(tenant_id: str):
     return {"status": "expired" if expired else "trial", "plan": "trial", "is_blocked": expired, "days_left": days_left, "trial_ends_at": trial_ends_at}
 
 @app.post("/tenant/activate-plan", dependencies=[Depends(verify_key)])
-async def activate_plan(body: dict):
+async def activate_plan(body: dict, admin=Depends(require_super_admin)):
     tenant_id = body.get("tenant_id")
     plan = body.get("plan")
     if plan not in ["starter", "pro", "business"]:
@@ -1425,7 +1512,7 @@ RESUMO:"""
     return {"summary": summary, "conversations_analyzed": total_convs, "days_analyzed": days, "tenant_name": tenant["name"], "credits_remaining": remaining}
 
 @app.post("/onboarding/save-prompt", dependencies=[Depends(verify_key)])
-async def onboarding_save_prompt(body: dict):
+async def onboarding_save_prompt(body: dict, admin=Depends(require_admin)):
     tenant_id = body.get("tenant_id")
     prompt = body.get("prompt")
     supabase.table("tenants").update({"copilot_prompt": prompt, "onboarding_done": True, "updated_at": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
@@ -1586,7 +1673,7 @@ async def whatsapp_sync(body: dict):
 @app.get("/whatsapp/sync-status", dependencies=[Depends(verify_key)])
 async def sync_status(tenant_id: str):
     convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
-    msgs = supabase.table("messages").select("id", count="exact").execute()
+    msgs = supabase.table("messages").select("id", count="exact").in_("conversation_id", [c["id"] for c in (supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data or [])]).execute()
     return {"conversations": convs.count, "messages": msgs.count}
 
 @app.post("/whatsapp/backfill-instances", dependencies=[Depends(verify_key)])
@@ -1775,11 +1862,10 @@ async def social_login(body: dict):
         }).execute().data[0]
 
     user.pop("password_hash", None)
-    token = jwt.encode(
-        {"user_id": user["id"], "tenant_id": user["tenant_id"], "role": user["role"],
-         "exp": datetime.utcnow() + timedelta(days=30)},
-        JWT_SECRET, algorithm="HS256"
-    )
+    import secrets as _s
+    session_id = _s.token_hex(16)
+    supabase.table("users").update({"session_id": session_id, "last_login": datetime.utcnow().isoformat()}).eq("id", user["id"]).execute()
+    token = create_jwt(user, session_id)
     return {"token": token, "user": user, "tenant_id": user["tenant_id"]}
 
 # ── RELATÓRIOS / ANALYTICS ────────────────────────────────
