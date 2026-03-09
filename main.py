@@ -850,6 +850,67 @@ async def whatsapp_delete_instance(body: dict):
         print(f"delete gateway_instances err: {e}")
     return {"ok": True}
 
+
+# ── TEMP CLEANUP — remove after use ─────────────────────
+@app.post("/admin/reset-tenant", dependencies=[Depends(verify_key)])
+async def reset_tenant(body: dict):
+    """Limpa todo o histórico de um tenant e reseta senha do usuário admin"""
+    tenant_id = body.get("tenant_id")
+    new_password = body.get("new_password", "")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+
+    def _wipe():
+        import traceback
+        results = {}
+        # 1. Busca todas as conversas do tenant
+        try:
+            convs = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data
+            conv_ids = [c["id"] for c in convs]
+            results["conversations_found"] = len(conv_ids)
+        except Exception as e:
+            results["conv_fetch_err"] = str(e)
+            conv_ids = []
+
+        if conv_ids:
+            # Deleta em lotes de 100
+            for i in range(0, len(conv_ids), 100):
+                chunk = conv_ids[i:i+100]
+                try: supabase.table("messages").delete().in_("conversation_id", chunk).execute()
+                except Exception as e: results[f"msg_del_{i}"] = str(e)
+                try: supabase.table("tasks").delete().in_("conversation_id", chunk).execute()
+                except Exception: pass
+                try: supabase.table("conversation_labels").delete().in_("conversation_id", chunk).execute()
+                except Exception: pass
+                try: supabase.table("conversations").delete().in_("id", chunk).execute()
+                except Exception as e: results[f"conv_del_{i}"] = str(e)
+
+        # 2. Deleta contatos do tenant
+        try:
+            supabase.table("contacts").delete().eq("tenant_id", tenant_id).execute()
+            results["contacts"] = "deleted"
+        except Exception as e: results["contacts_err"] = str(e)
+
+        # 3. Deleta instâncias WhatsApp do tenant
+        try:
+            supabase.table("gateway_instances").delete().eq("tenant_id", tenant_id).execute()
+            results["instances"] = "deleted"
+        except Exception as e: results["instances_err"] = str(e)
+
+        # 4. Reseta senha do usuário admin se fornecida
+        if new_password:
+            try:
+                import bcrypt
+                hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+                supabase.table("users").update({"password_hash": hashed}).eq("tenant_id", tenant_id).execute()
+                results["password"] = "reset"
+            except Exception as e: results["password_err"] = str(e)
+
+        return results
+
+    result = await run_sync(_wipe)
+    return {"ok": True, "result": result}
+
 # ── BROADCASTS ───────────────────────────────────────────
 @app.post("/broadcasts/suggest-message", dependencies=[Depends(verify_key)])
 async def suggest_broadcast_message(body: dict):
