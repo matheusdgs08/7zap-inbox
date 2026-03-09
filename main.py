@@ -1918,11 +1918,213 @@ async def register_with_invite(body: dict):
     user.pop("password_hash", None)
     return {"ok": True, "user": user, "message": "Conta criada com sucesso!"}
 
+@app.post("/auth/register-trial")
+async def register_trial(body: dict):
+    """
+    Auto-cadastro — cria tenant + admin sem convite.
+    Plano: trial (7 dias). Bloqueado após expirar.
+    """
+    company = (body.get("company") or "").strip()
+    name    = (body.get("name") or "").strip()
+    email   = (body.get("email") or "").lower().strip()
+    password = body.get("password") or ""
+    phone   = (body.get("phone") or "").strip()
+    segment = (body.get("segment") or "outros").strip()  # academia | clinica | comercio | etc
+
+    if not all([company, name, email, password]):
+        raise HTTPException(400, "Nome da empresa, nome, email e senha são obrigatórios")
+    if len(password) < 6:
+        raise HTTPException(400, "Senha deve ter pelo menos 6 caracteres")
+    if supabase.table("users").select("id").eq("email", email).execute().data:
+        raise HTTPException(400, "Este email já está cadastrado")
+
+    # Cria tenant
+    trial_ends = (datetime.utcnow() + timedelta(days=7)).isoformat()
+    colors = ["#00c853","#2979ff","#ff6d00","#e91e63","#9c27b0","#00bcd4"]
+    tenant = supabase.table("tenants").insert({
+        "name": company,
+        "plan": "trial",
+        "trial_ends_at": trial_ends,
+        "trial_used": True,
+        "segment": segment,
+        "is_blocked": False,
+        "ai_credits": 200,
+    }).execute().data[0]
+
+    # Cria usuário admin
+    pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user = supabase.table("users").insert({
+        "tenant_id": tenant["id"],
+        "name": name,
+        "email": email,
+        "role": "admin",
+        "password_hash": pw_hash,
+        "is_active": True,
+        "avatar_color": random.choice(colors),
+        "phone": phone or None,
+    }).execute().data[0]
+
+    user.pop("password_hash", None)
+    print(f"[register_trial] Novo tenant: {company} ({tenant['id']}) | {email}")
+    return {
+        "ok": True,
+        "tenant_id": tenant["id"],
+        "user": user,
+        "trial_ends_at": trial_ends,
+        "message": f"Conta criada! Seu trial de 7 dias começa agora. 🚀"
+    }
+
 @app.get("/auth/invites", dependencies=[Depends(verify_key)])
 async def list_invites(admin=Depends(require_admin)):
     invites = supabase.table("invite_codes").select("*, users!created_by(name)").eq("tenant_id", admin["tenant_id"]).order("created_at", desc=True).limit(20).execute().data
     return {"invites": invites}
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPERADMIN — Painel da Andressa (read-only, tenant = SUPER_ADMIN_TENANT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/superadmin/dashboard", dependencies=[Depends(verify_key)])
+async def superadmin_dashboard(user=Depends(require_super_admin)):
+    """Overview geral: tenants, MRR estimado, trials, mensagens."""
+    tenants = supabase.table("tenants").select(
+        "id,name,plan,created_at,trial_ends_at,is_blocked,segment,ai_credits,ai_credits_purchased"
+    ).order("created_at", desc=True).execute().data or []
+
+    plan_price = {"starter": 149, "pro": 299, "business": 599, "enterprise": 1200, "trial": 0}
+    now = datetime.utcnow()
+
+    stats = {
+        "total_tenants": len(tenants),
+        "active_paid": sum(1 for t in tenants if t.get("plan") not in ["trial", None] and not t.get("is_blocked")),
+        "active_trials": sum(1 for t in tenants if t.get("plan") == "trial" and not t.get("is_blocked")),
+        "expired_trials": sum(1 for t in tenants if t.get("is_blocked")),
+        "mrr_estimate": sum(plan_price.get(t.get("plan"), 0) for t in tenants if not t.get("is_blocked")),
+        "new_this_month": sum(1 for t in tenants if t.get("created_at", "") >= now.replace(day=1).isoformat()[:10]),
+    }
+
+    # Crescimento mês a mês (últimos 6 meses)
+    monthly = {}
+    for t in tenants:
+        mo = (t.get("created_at") or "")[:7]
+        if mo:
+            monthly[mo] = monthly.get(mo, 0) + 1
+    stats["monthly_signups"] = sorted([{"month": k, "count": v} for k, v in monthly.items()])[-6:]
+
+    # Distribuição por plano
+    plan_dist = {}
+    for t in tenants:
+        p = t.get("plan") or "trial"
+        plan_dist[p] = plan_dist.get(p, 0) + 1
+    stats["plan_distribution"] = [{"plan": k, "count": v} for k, v in plan_dist.items()]
+
+    # Distribuição por segmento
+    seg_dist = {}
+    for t in tenants:
+        s = t.get("segment") or "outros"
+        seg_dist[s] = seg_dist.get(s, 0) + 1
+    stats["segment_distribution"] = [{"segment": k, "count": v} for k, v in seg_dist.items()]
+
+    return stats
+
+@app.get("/superadmin/tenants", dependencies=[Depends(verify_key)])
+async def superadmin_tenants(user=Depends(require_super_admin), page: int = 1, limit: int = 30, search: str = ""):
+    """Lista todos os tenants com estatísticas."""
+    tenants_raw = supabase.table("tenants").select(
+        "id,name,plan,created_at,trial_ends_at,is_blocked,segment,ai_credits,ai_credits_purchased"
+    ).order("created_at", desc=True).execute().data or []
+
+    if search:
+        tenants_raw = [t for t in tenants_raw if search.lower() in (t.get("name") or "").lower()]
+
+    total = len(tenants_raw)
+    offset = (page - 1) * limit
+    page_tenants = tenants_raw[offset:offset + limit]
+
+    # Para cada tenant, busca users e instâncias
+    result = []
+    for t in page_tenants:
+        tid = t["id"]
+        users = supabase.table("users").select("id,name,email,role,is_active,last_login").eq("tenant_id", tid).execute().data or []
+        instances = supabase.table("gateway_instances").select("id,instance_name,phone,status").eq("tenant_id", tid).execute().data or []
+
+        # Conta mensagens (aproximado via conversations)
+        convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tid).execute()
+        conv_count = convs.count or 0
+
+        # Trial info
+        trial_info = None
+        if t.get("plan") == "trial" and t.get("trial_ends_at"):
+            ends = datetime.fromisoformat(t["trial_ends_at"].replace("Z", ""))
+            days_left = (ends - datetime.utcnow()).days
+            trial_info = {"ends_at": t["trial_ends_at"], "days_left": days_left, "expired": days_left < 0}
+
+        result.append({
+            **t,
+            "users_count": len(users),
+            "users": [{"id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"], "is_active": u["is_active"], "last_login": u["last_login"]} for u in users],
+            "instances_count": len(instances),
+            "instances": instances,
+            "connected_phones": sum(1 for i in instances if (i.get("status") or "").upper() in ["WORKING", "CONNECTED", "ONLINE"]),
+            "conversations_count": conv_count,
+            "trial_info": trial_info,
+            "ai_credits_used": (200 - (t.get("ai_credits") or 0)) if t.get("plan") == "trial" else None,
+        })
+
+    return {"tenants": result, "total": total, "page": page, "pages": (total + limit - 1) // limit}
+
+@app.get("/superadmin/tenants/{tenant_id}", dependencies=[Depends(verify_key)])
+async def superadmin_tenant_detail(tenant_id: str, user=Depends(require_super_admin)):
+    """Detalhe completo de um tenant."""
+    tenant = supabase.table("tenants").select("*").eq("id", tenant_id).single().execute().data
+    if not tenant:
+        raise HTTPException(404, "Tenant não encontrado")
+
+    users = supabase.table("users").select("id,name,email,role,is_active,last_login,created_at").eq("tenant_id", tenant_id).execute().data or []
+    instances = supabase.table("gateway_instances").select("*").eq("tenant_id", tenant_id).execute().data or []
+
+    # Contagens
+    convs_resp = supabase.table("conversations").select("id,status,created_at", count="exact").eq("tenant_id", tenant_id).execute()
+    conv_count = convs_resp.count or 0
+    conv_data = convs_resp.data or []
+
+    # Broadcasts
+    broadcasts = supabase.table("broadcasts").select("id,status,created_at").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(5).execute().data or []
+
+    # Activity (conversations por dia últimos 30 dias)
+    since = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    recent_convs = supabase.table("conversations").select("created_at").eq("tenant_id", tenant_id).gte("created_at", since).execute().data or []
+    daily = {}
+    for c in recent_convs:
+        day = (c.get("created_at") or "")[:10]
+        if day: daily[day] = daily.get(day, 0) + 1
+
+    return {
+        "tenant": tenant,
+        "users": users,
+        "instances": instances,
+        "connected_phones": sum(1 for i in instances if (i.get("status") or "").upper() in ["WORKING", "CONNECTED", "ONLINE"]),
+        "conversations_count": conv_count,
+        "open_conversations": sum(1 for c in conv_data if c.get("status") == "open"),
+        "broadcasts": broadcasts,
+        "activity_last_30d": sorted([{"date": k, "count": v} for k, v in daily.items()]),
+    }
+
+@app.post("/superadmin/tenants/{tenant_id}/block", dependencies=[Depends(verify_key)])
+async def superadmin_block_tenant(tenant_id: str, body: dict, user=Depends(require_super_admin)):
+    """Bloqueia ou desbloqueia um tenant. DESABILITADO — painel é somente leitura por ora."""
+    raise HTTPException(status_code=403, detail="Ação não disponível no momento. Contate o desenvolvedor.")
+
+@app.post("/superadmin/tenants/{tenant_id}/extend-trial", dependencies=[Depends(verify_key)])
+async def superadmin_extend_trial(tenant_id: str, body: dict, user=Depends(require_super_admin)):
+    """Estende o trial. DESABILITADO — painel é somente leitura por ora."""
+    raise HTTPException(status_code=403, detail="Ação não disponível no momento. Contate o desenvolvedor.")
+
+@app.post("/superadmin/tenants/{tenant_id}/upgrade-plan", dependencies=[Depends(verify_key)])
+async def superadmin_upgrade_plan(tenant_id: str, body: dict, user=Depends(require_super_admin)):
+    """Muda o plano. DESABILITADO — painel é somente leitura por ora."""
+    raise HTTPException(status_code=403, detail="Ação não disponível no momento. Contate o desenvolvedor.")
 
 # ── SOCIAL AUTH (Google, Facebook, Apple, Microsoft) ─────────────────────────
 @app.post("/auth/social")
