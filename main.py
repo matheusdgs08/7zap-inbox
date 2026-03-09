@@ -436,8 +436,14 @@ async def receive_message(payload: dict):
     if "payload" in payload and isinstance(payload["payload"], dict):
         data = payload["payload"]
         if data.get("fromMe"): return {"ok": True}
-        phone = data.get("from", "").replace("@c.us", "").replace("@s.whatsapp.net", "").replace("@g.us", "")
-        if not phone or "@g" in data.get("from", ""): return {"ok": True}  # ignora grupos
+        raw_from = data.get("from", "")
+        if "@g" in raw_from: return {"ok": True}  # ignora grupos
+        # Preserve @lid — only strip @c.us and @s.whatsapp.net
+        if "@lid" in raw_from:
+            phone = raw_from  # keep full JID including @lid
+        else:
+            phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
+        if not phone: return {"ok": True}
         content = data.get("body") or data.get("text") or ""
         msg_type = data.get("type", "chat")
         if not content:
@@ -644,11 +650,12 @@ async def get_history(conv_id: str, limit: int = 30):
         if phone and instance_name:
             try:
                 # Normaliza phone para formato WAHA
-                clean = phone.replace("+","").replace("-","").replace(" ","").replace("(","").replace(")","")
-                # Remove @lid/@c.us se tiver
-                if "@" in clean:
-                    clean = clean.split("@")[0]
-                chat_id = f"{clean}@c.us"
+                # Preserve original suffix (@lid, @c.us, @g.us) if present
+                if "@" in phone:
+                    chat_id = phone  # já tem o sufixo correto
+                else:
+                    clean = phone.replace("+","").replace("-","").replace(" ","").replace("(","").replace(")","")
+                    chat_id = f"{clean}@c.us"
 
                 waha_url = f"{WAHA_URL}/api/{instance_name}/chats/{chat_id}/messages?limit={limit}&downloadMedia=false"
                 import urllib.request as _req
