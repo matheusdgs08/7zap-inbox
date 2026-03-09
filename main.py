@@ -476,7 +476,26 @@ async def receive_message(payload: dict):
         for tenant in tenants:
             tid = tenant["id"]
             contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
-            contact_id = contacts[0]["id"] if contacts else supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]["id"]
+            if contacts:
+                contact_id = contacts[0]["id"]
+            else:
+                # Create contact with phone as placeholder name
+                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]
+                contact_id = new_contact["id"]
+                # Try to get real name from WAHA chat list async
+                async def _fetch_name(tid=tid, phone=phone, contact_id=contact_id, instance_name=instance_name):
+                    try:
+                        import urllib.request as _req
+                        r = _req.urlopen(_req.Request(f"{WAHA_URL}/api/{instance_name}/chats", headers={"X-Api-Key": WAHA_KEY}), timeout=8)
+                        chats = json.loads(r.read())
+                        for chat in chats:
+                            if chat.get("id", {}).get("_serialized") == phone:
+                                name = chat.get("name","")
+                                if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
+                                    supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
+                                break
+                    except: pass
+                asyncio.create_task(_fetch_name())
             # Get most recent open conversation for this contact (avoid duplicates)
             convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True).limit(1).execute().data
             if convs:
@@ -628,6 +647,37 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     msgs = await run_sync(_fetch)
     cache_set(cache_key, msgs, ttl=45)
     return {"messages": msgs, "has_more": len(msgs) == limit}
+
+
+@app.post("/contacts/sync-names", dependencies=[Depends(verify_key)])
+async def sync_contact_names(tenant_id: str):
+    """Busca nomes reais dos contatos via WAHA /chats e atualiza no banco. Roda em background."""
+    async def _run():
+        try:
+            instances = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", tenant_id).execute().data
+            for inst in instances:
+                iname = inst.get("instance_name")
+                if not iname: continue
+                try:
+                    import urllib.request as _req
+                    r = _req.urlopen(_req.Request(f"{WAHA_URL}/api/{iname}/chats", headers={"X-Api-Key": WAHA_KEY}), timeout=10)
+                    chats = json.loads(r.read())
+                    for chat in chats:
+                        name = chat.get("name", "")
+                        jid = chat.get("id", {}).get("_serialized", "")
+                        if not name or not jid: continue
+                        # Only update if name looks real (not a phone number)
+                        if name.replace("+","").replace(" ","").replace("-","").isdigit(): continue
+                        # Find contact by phone (jid)
+                        existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", jid).execute().data
+                        if existing and existing[0].get("name") in [None, "", jid, jid.split("@")[0]]:
+                            supabase.table("contacts").update({"name": name}).eq("id", existing[0]["id"]).execute()
+                except Exception as e:
+                    print(f"sync_contact_names error for {iname}: {e}")
+        except Exception as e:
+            print(f"sync_contact_names error: {e}")
+    asyncio.create_task(_run())
+    return {"ok": True, "message": "Sync iniciado em background"}
 
 
 @app.get("/conversations/{conv_id}/history", dependencies=[Depends(verify_key)])
