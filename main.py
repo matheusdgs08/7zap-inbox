@@ -1730,18 +1730,61 @@ async def whatsapp_sync(body: dict):
     stats = {"chats": 0, "contacts_created": 0, "conversations_created": 0, "messages_saved": 0, "skipped": 0}
 
     async with httpx.AsyncClient(timeout=60) as client:
-        # ── 1. Fetch chats list ──────────────────────────────────
+        # ── 1. Fetch chats list — tries multiple WAHA routes ──────
         chats = []
-        for route in [f"{WAHA_URL}/api/chats?session={instance}", f"{WAHA_URL}/api/{instance}/chats"]:
+        waha_routes = [
+            f"{WAHA_URL}/api/chats?session={instance}&limit=50",
+            f"{WAHA_URL}/api/chats?session={instance}",
+            f"{WAHA_URL}/api/{instance}/chats",
+            f"{WAHA_URL}/api/chats/{instance}",
+        ]
+        for route in waha_routes:
             try:
                 r = await client.get(route, headers=waha_headers(), timeout=20)
                 if r.status_code == 200:
                     data = r.json()
                     chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
-                    if chats: break
-            except: continue
+                    if chats:
+                        print(f"[SYNC] Got {len(chats)} chats from {route}")
+                        break
+            except Exception as e:
+                print(f"[SYNC] Route {route} failed: {e}")
+                continue
+
+        # ── 1b. Fallback: use existing contacts in Supabase ────────
+        # If WAHA /api/chats is empty (not available in free version),
+        # fall back to syncing messages for contacts already in our DB
         if not chats:
-            raise HTTPException(status_code=502, detail="Não foi possível buscar chats do WAHA.")
+            print(f"[SYNC] WAHA /api/chats returned empty — using Supabase contacts as fallback")
+            existing_contacts = supabase.table("contacts").select("id,phone,name").eq("tenant_id", tenant_id).limit(50).execute().data or []
+            if existing_contacts:
+                # Build fake chat objects from existing contacts so the loop below works
+                chats = [{"id": f"{c['phone']}@c.us", "name": c.get("name",""), "timestamp": 0, "_from_db": True} for c in existing_contacts]
+                print(f"[SYNC] Fallback: syncing {len(chats)} known contacts from DB")
+            else:
+                # Truly nothing to work with — try to fetch recent messages directly from WAHA
+                # This handles the case where WAHA has chats but no /api/chats endpoint
+                try:
+                    r = await client.get(f"{WAHA_URL}/api/messages?session={instance}&limit=200&downloadMedia=false", headers=waha_headers(), timeout=30)
+                    if r.status_code == 200:
+                        msgs = r.json()
+                        if isinstance(msgs, list) and msgs:
+                            # Extract unique chat IDs from messages
+                            seen = set()
+                            for msg in msgs:
+                                cid = msg.get("chatId") or msg.get("from") or msg.get("to", "")
+                                if cid and "@c.us" in str(cid) and cid not in seen:
+                                    seen.add(cid)
+                                    phone = "".join(x for x in str(cid).split("@")[0] if x.isdigit())
+                                    if phone and len(phone) >= 8:
+                                        chats.append({"id": cid, "name": phone, "timestamp": 0})
+                            print(f"[SYNC] Extracted {len(chats)} unique chats from messages endpoint")
+                except Exception as e:
+                    print(f"[SYNC] Messages fallback failed: {e}")
+
+        if not chats:
+            # Return success with 0 stats instead of 502 error
+            return {"ok": True, "stats": stats, "note": "WAHA returned no chats. The session may need a few minutes after first connection, or /api/chats requires WAHA Plus."}
         # Ordena por timestamp desc e limita aos 30 mais recentes para não travar
         chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)[:30]
         stats["chats"] = len(chats)
