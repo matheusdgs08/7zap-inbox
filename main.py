@@ -526,6 +526,40 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     # Suporte a ambos formatos: WAHA e Evolution API legado
     event = payload.get("event", "")
 
+    # ── Evento session.status — auto-sync quando sessão conecta ──
+    if event == "session.status":
+        sess_payload = payload.get("payload", {})
+        sess_status = sess_payload.get("status", "") if isinstance(sess_payload, dict) else ""
+        sess_name = payload.get("session", "")
+        if sess_status == "WORKING" and sess_name:
+            print(f"[WEBHOOK] session.status WORKING para {sess_name} — disparando auto-sync")
+            async def _auto_sync_on_connect(instance_name=sess_name):
+                try:
+                    # Busca o tenant dono desta instância
+                    inst_row = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).limit(1).execute().data
+                    if not inst_row:
+                        print(f"[AUTO-SYNC] Instância {instance_name} não encontrada no banco")
+                        return
+                    tenant_id = inst_row[0]["tenant_id"]
+                    # Atualiza status da instância para connected
+                    supabase.table("gateway_instances").update({"status": "connected"}).eq("instance_name", instance_name).execute()
+                    # Aguarda 5s para WAHA estabilizar a sessão antes de sincronizar
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(5)
+                    # Dispara sync de histórico
+                    print(f"[AUTO-SYNC] Iniciando sync para tenant={tenant_id[:8]} inst={instance_name}")
+                    from httpx import AsyncClient as _AsyncClient
+                    async with _AsyncClient(timeout=60) as cl:
+                        sync_url = f"{BACKEND_URL}/whatsapp/sync" if BACKEND_URL else "http://localhost:8000/whatsapp/sync"
+                        await cl.post(sync_url,
+                            headers={"x-api-key": INBOX_API_KEY, "Content-Type": "application/json"},
+                            json={"tenant_id": tenant_id, "instance": instance_name})
+                    print(f"[AUTO-SYNC] Sync concluído para {instance_name}")
+                except Exception as e:
+                    print(f"[AUTO-SYNC] Erro: {e}")
+            asyncio.create_task(_auto_sync_on_connect())
+        return {"ok": True}
+
     # Formato WAHA
     if "payload" in payload and isinstance(payload["payload"], dict):
         data = payload["payload"]
