@@ -1114,6 +1114,24 @@ async def delete_label(label_id: str):
 async def list_contacts(tenant_id: str):
     return {"contacts": supabase.table("contacts").select("*").eq("tenant_id", tenant_id).order("name").execute().data}
 
+@app.put("/contacts/{contact_id}", dependencies=[Depends(verify_key)])
+async def update_contact(contact_id: str, body: dict):
+    """Atualiza nome e/ou observações de um contato."""
+    update = {}
+    if "name" in body and body["name"] is not None:
+        name = body["name"].strip()
+        if name:
+            update["name"] = name
+    if "notes" in body:
+        update["notes"] = body["notes"]
+    if not update:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+    update["updated_at"] = datetime.utcnow().isoformat()
+    result = supabase.table("contacts").update(update).eq("id", contact_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Contato não encontrado")
+    return {"contact": result.data[0]}
+
 @app.get("/contacts/profile-picture", dependencies=[Depends(verify_key)])
 async def get_profile_picture(phone: str, instance: str = "default"):
     """
