@@ -1104,6 +1104,16 @@ async def assign_conversation(conv_id: str, body: AssignConversation):
 async def update_kanban(conv_id: str, body: UpdateKanban):
     return supabase.table("conversations").update({"kanban_stage": body.stage, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
+@app.post("/conversations/{conv_id}/read", dependencies=[Depends(verify_key)])
+async def mark_conversation_read(conv_id: str):
+    supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
+    return {"ok": True}
+
+@app.post("/conversations/{conv_id}/unread", dependencies=[Depends(verify_key)])
+async def mark_conversation_unread(conv_id: str):
+    supabase.table("conversations").update({"unread_count": 1}).eq("id", conv_id).execute()
+    return {"ok": True}
+
 @app.put("/conversations/{conv_id}/resolve", dependencies=[Depends(verify_key)])
 async def resolve_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "resolved", "kanban_stage": "resolved", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
