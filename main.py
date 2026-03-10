@@ -150,10 +150,10 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 
 # ── AI HELPER — usa OpenAI GPT-4o Mini (mais barato) com fallback pro Claude ──
-async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = True) -> str:
+async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = True, timeout: int = 30) -> str:
     """Chama GPT-4o Mini se disponível, senão fallback pro Claude Haiku."""
     if prefer_openai and OPENAI_API_KEY:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post("https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={"model": "gpt-4o-mini", "max_tokens": max_tokens,
@@ -1500,8 +1500,8 @@ async def onboarding_analyze(body: dict):
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
     tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt, onboarding_last_run").eq("id", tenant_id).single().execute().data
     plan = tenant.get("plan")
-    plan_limits = {"trial": 50, "starter": 100, "pro": 200, "business": 500}
-    conv_limit = plan_limits.get(plan, 50)
+    # Todos os planos recebem o mesmo prompt de máxima qualidade
+    conv_limit = 300
     # Check and consume 1000 credits — no monthly limit, use as many times as you have credits
     ok, remaining, err = consume_credit(tenant_id, 1000)
     if not ok: raise HTTPException(status_code=402, detail=f"São necessários 1.000 créditos para esta análise. {err}")
@@ -1512,7 +1512,7 @@ async def onboarding_analyze(body: dict):
     supabase.table("tenants").update({"onboarding_last_run": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
     all_samples = []
     for conv in conversations[:conv_limit]:
-        msgs = supabase.table("messages").select("direction, content").eq("conversation_id", conv["id"]).eq("is_internal_note", False).order("created_at").limit(20).execute().data
+        msgs = supabase.table("messages").select("direction, content").eq("conversation_id", conv["id"]).eq("is_internal_note", False).order("created_at").limit(30).execute().data
         if len(msgs) < 2: continue
         contact_name = (conv.get("contacts") or {}).get("name", "Cliente")
         sample = f"[Conversa com {contact_name}]\n"
@@ -1523,7 +1523,7 @@ async def onboarding_analyze(body: dict):
     if not all_samples:
         raise HTTPException(status_code=404, detail="Nenhuma conversa com conteúdo suficiente.")
     combined = "\n---\n".join(all_samples[:conv_limit])
-    if len(combined) > 150000: combined = combined[:150000]
+    if len(combined) > 300000: combined = combined[:300000]
     total_convs = len(all_samples)
     analysis_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.\n\nAnalise as conversas abaixo da empresa "{tenant['name']}" e gere um prompt de sistema detalhado para um Co-pilot de IA.\n\nO prompt deve incluir:\n1. Tom de voz\n2. Produtos/serviços\n3. Perguntas frequentes\n4. Fluxo de vendas\n5. Regras importantes\n6. Instruções para o Co-pilot\n\nCONVERSAS ({total_convs} conversas, últimos {days} dias):\n\n{combined}\n\nPROMPT GERADO:"""
     # Onboarding usa GPT-4o Mini (mais barato, suficiente para análise de histórico)
@@ -1532,8 +1532,9 @@ async def onboarding_analyze(body: dict):
     generated_prompt = await call_ai(
         "Você é um especialista em atendimento ao cliente e CRM. Analise conversas e gere prompts de sistema detalhados.",
         analysis_prompt,
-        max_tokens=2000,
-        prefer_openai=True
+        max_tokens=3000,
+        prefer_openai=True,
+        timeout=90
     )
 
     # Save real prompt to DB (never sent to frontend)
@@ -1577,7 +1578,7 @@ async def onboarding_save_prompt(body: dict, admin=Depends(require_admin)):
 
 # ── PLAN FEATURES ────────────────────────────────────────
 PLAN_FEATURES = {
-    "trial":     {"agents": 3,   "numbers": 1,   "ai_credits": 200,   "disparos": True,  "copilot": True,  "onboarding": False, "white_label": False},
+    "trial":     {"agents": 3,   "numbers": 1,   "ai_credits": 1000,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
     "starter":   {"agents": 3,   "numbers": 1,   "ai_credits": 0,     "disparos": True,  "copilot": False, "onboarding": False, "white_label": False},
     "pro":       {"agents": 8,   "numbers": 2,   "ai_credits": 300,   "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
     "business":  {"agents": 20,  "numbers": 5,   "ai_credits": 1000,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
@@ -1974,7 +1975,7 @@ async def register_trial(body: dict):
         "trial_used": True,
         "segment": segment,
         "is_blocked": False,
-        "ai_credits": 200,
+        "ai_credits": 1000,
     }).execute().data[0]
 
     # Cria usuário admin
@@ -2095,7 +2096,7 @@ async def superadmin_tenants(user=Depends(require_super_admin), page: int = 1, l
             "connected_phones": sum(1 for i in instances if (i.get("status") or "").upper() in ["WORKING", "CONNECTED", "ONLINE"]),
             "conversations_count": conv_count,
             "trial_info": trial_info,
-            "ai_credits_used": (200 - (t.get("ai_credits") or 0)) if t.get("plan") == "trial" else None,
+            "ai_credits_used": (1000 - (t.get("ai_credits") or 0)) if t.get("plan") == "trial" else None,
         })
 
     return {"tenants": result, "total": total, "page": page, "pages": (total + limit - 1) // limit}
