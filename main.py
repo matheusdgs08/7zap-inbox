@@ -587,17 +587,18 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             # Invalida cache para forçar reload no frontend
             cache_del(f"msgs:{conv_id}:latest")
             cache_del(f"msgs:{conv_id}:None")
-            # Bust all conversation list variants for this tenant
-            for s in ["open", "None", "all", "none", None]:
-                cache_del(f"convs:{tid}:{s}:{None}:first")
-                cache_del(f"convs:{tid}:{s}:None:first")
-            # Redis pattern delete for convs:tid:*
+            # Bust ALL conversation cache keys for this tenant (including per-user keys)
+            # Pattern: convs:{tid}:*
             try:
                 r = _get_redis()
                 if r:
                     for k in r.scan_iter(f"7crm:convs:{tid}:*"):
                         r.delete(k)
             except: pass
+            # Also bust in-memory cache for all known variants
+            keys_to_del = [k for k in list(_cache.keys()) if k.startswith(f"convs:{tid}:")]
+            for k in keys_to_del:
+                _cache.pop(k, None)
         return {"ok": True}
     except Exception as e:
         import traceback
@@ -659,7 +660,7 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
 
     convs = await run_sync(_query)
     if not before:
-        cache_set(cache_key, convs, ttl=60)
+        cache_set(cache_key, convs, ttl=15)  # TTL curto — webhook invalida ativamente
     return {"conversations": convs, "has_more": len(convs) == limit}
 
 async def _refresh_conversations(tenant_id, status, user_id):
