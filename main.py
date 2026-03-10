@@ -623,10 +623,10 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
             # Salva mensagem — tenta com waha_id primeiro, fallback sem ele
             try:
-                supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
+                supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
             except Exception:
                 # Fallback: insert sem waha_id caso coluna não exista
-                supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute()
+                supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute()
 
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
             # Invalida cache para forçar reload no frontend
@@ -749,7 +749,7 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         # Test message insert
         if convs:
             conv_id = convs[0]["id"]
-            msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute().data
+            msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute().data
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": (convs[0].get("unread_count") or 0) + 1}).eq("id", conv_id).execute()
             return {"ok": True, "action": "updated_existing", "conv_id": conv_id, "tid": tid, "phone": phone, "msg_id": msg[0]["id"] if msg else None}
         else:
@@ -760,7 +760,7 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
             if not conv:
                 return {"ok": False, "reason": "failed to create conversation"}
             conv_id = conv[0]["id"]
-            msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute().data
+            msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute().data
             return {"ok": True, "action": "created_new_conv", "conv_id": conv_id, "tid": tid, "phone": phone}
     except Exception as e:
         return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
@@ -996,7 +996,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
                 t = m.get("type", "")
                 body = "[Imagem]" if "image" in t else "[Áudio]" if "audio" in t or t=="ptt" else "[Vídeo]" if "video" in t else "[Documento]" if "document" in t else ""
             if not body: continue
-            row = {"conversation_id": conv_id, "direction": "outbound" if from_me else "inbound",
+            row = {"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound" if from_me else "inbound",
                    "content": body, "type": "text", "created_at": datetime.utcfromtimestamp(ts).isoformat() if ts else datetime.utcnow().isoformat()}
             if waha_id: row["waha_id"] = waha_id
             to_insert.append(row)
@@ -1015,7 +1015,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
 @app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
 async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
-    msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
+    msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
     if not body.is_internal_note:
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
         session = conv.get("instance_name") or "default"
@@ -2040,6 +2040,7 @@ async def whatsapp_sync(body: dict):
 
                         row = {
                             "conversation_id": conv_id,
+                            "tenant_id": tenant_id,
                             "direction": direction,
                             "content": body_text,
                             "type": our_type,
