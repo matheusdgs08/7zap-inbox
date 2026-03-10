@@ -268,18 +268,30 @@ async def ensure_webhooks():
         print(f"ensure_webhooks error: {e}")
 
 async def keepalive_loop():
-    await asyncio.sleep(30)
+    await asyncio.sleep(15)
+    ping_count = 0
     while True:
+        # Ping Supabase a cada 60s para evitar cold start (free tier adormece conexão)
         try:
             supabase.table("tenants").select("id").limit(1).execute()
         except:
             pass
-        # Auto-configure webhooks for any session missing them
-        try:
-            await ensure_webhooks()
-        except:
-            pass
-        await asyncio.sleep(240)
+        ping_count += 1
+        # A cada 5 pings (5 min), aquece também as tabelas mais consultadas
+        if ping_count % 5 == 0:
+            try:
+                supabase.table("conversations").select("id").limit(1).execute()
+                supabase.table("messages").select("id").limit(1).execute()
+                supabase.table("contacts").select("id").limit(1).execute()
+            except:
+                pass
+        # A cada 10 pings (10 min), re-verifica webhooks WAHA
+        if ping_count % 10 == 0:
+            try:
+                await ensure_webhooks()
+            except:
+                pass
+        await asyncio.sleep(60)
 
 async def _startup_sync_names():
     """Roda uma vez no startup: sincroniza nomes de contatos sem nome via WAHA."""
