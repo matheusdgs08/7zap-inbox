@@ -1525,14 +1525,15 @@ async def onboarding_analyze(body: dict):
     if len(combined) > 150000: combined = combined[:150000]
     total_convs = len(all_samples)
     analysis_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.\n\nAnalise as conversas abaixo da empresa "{tenant['name']}" e gere um prompt de sistema detalhado para um Co-pilot de IA.\n\nO prompt deve incluir:\n1. Tom de voz\n2. Produtos/serviços\n3. Perguntas frequentes\n4. Fluxo de vendas\n5. Regras importantes\n6. Instruções para o Co-pilot\n\nCONVERSAS ({total_convs} conversas, últimos {days} dias):\n\n{combined}\n\nPROMPT GERADO:"""
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
-        resp_data = r.json()
-        if "content" not in resp_data:
-            raise HTTPException(status_code=500, detail=f"Erro na IA: {resp_data.get('error', {}).get('message', 'resposta inválida')}")
-        generated_prompt = resp_data["content"][0]["text"]
+    # Onboarding usa GPT-4o Mini (mais barato, suficiente para análise de histórico)
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY não configurada no servidor")
+    generated_prompt = await call_ai(
+        "Você é um especialista em atendimento ao cliente e CRM. Analise conversas e gere prompts de sistema detalhados.",
+        analysis_prompt,
+        max_tokens=2000,
+        prefer_openai=True
+    )
 
     # Save real prompt to DB (never sent to frontend)
     supabase.table("tenants").update({
