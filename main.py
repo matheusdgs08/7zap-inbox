@@ -285,12 +285,10 @@ async def keepalive_loop():
                 supabase.table("contacts").select("id").limit(1).execute()
             except:
                 pass
-        # A cada 10 pings (10 min), re-verifica webhooks WAHA
-        if ping_count % 10 == 0:
-            try:
-                await ensure_webhooks()
-            except:
-                pass
+# DISABLED:         # A cada 10 pings (10 min), re-verifica webhooks WAHA
+        # ensure_webhooks DESATIVADO - 7gateway relay ja entrega as mensagens.
+        # Causa entrega dupla se ativado: WAHA->relay->inbox E WAHA->inbox direto.
+        # if ping_count % 10 == 0: await ensure_webhooks()
         await asyncio.sleep(60)
 
 async def _startup_sync_names():
@@ -514,7 +512,12 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             elif "document" in msg_type: content = "[Documento]"
             elif "sticker" in msg_type: content = "[Sticker]"
             else: return {"ok": True}
-        waha_id = data.get("id", "")
+        # WAHA pode mandar id como string OU como objeto {fromMe, remote, id}
+        _raw_id = data.get("id", "")
+        if isinstance(_raw_id, dict):
+            waha_id = _raw_id.get("id") or _raw_id.get("_serialized") or ""
+        else:
+            waha_id = str(_raw_id) if _raw_id else ""
         # Extract push name from WAHA payload (contact's WhatsApp display name)
         push_name = data.get("notifyName") or data.get("pushName") or data.get("_data", {}).get("notifyName", "") if isinstance(data.get("_data"), dict) else data.get("notifyName") or data.get("pushName") or ""
     # Formato Evolution API legado
@@ -633,20 +636,39 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 if existing_inst and not existing_inst.get("instance_name"):
                     supabase.table("conversations").update({"instance_name": instance_name}).eq("id", conv_id).execute()
 
-            # Evita duplicata por waha_id
+            # Evita duplicata por waha_id — verificacao rapida no banco
             if waha_id:
                 try:
-                    dup = supabase.table("messages").select("id").eq("waha_id", waha_id).execute().data
-                    if dup: continue
+                    dup = supabase.table("messages").select("id").eq("waha_id", waha_id).limit(1).execute().data
+                    if dup:
+                        print(f"[WEBHOOK] DUPLICATE skipped waha_id={waha_id}")
+                        continue
                 except Exception:
-                    pass  # waha_id column may not exist yet, continue saving
+                    pass
 
-            # Salva mensagem — tenta com waha_id primeiro, fallback sem ele
+            # Salva mensagem
             try:
-                supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text", "waha_id": waha_id or None}).execute()
-            except Exception:
-                # Fallback: insert sem waha_id caso coluna não exista
-                supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute()
+                supabase.table("messages").insert({
+                    "conversation_id": conv_id,
+                    "tenant_id": tid,
+                    "direction": "inbound",
+                    "content": content,
+                    "type": "text",
+                    "waha_id": waha_id or None
+                }).execute()
+            except Exception as insert_err:
+                err_str = str(insert_err)
+                if "duplicate" in err_str.lower() or "unique" in err_str.lower():
+                    print(f"[WEBHOOK] DUPLICATE blocked by DB constraint waha_id={waha_id}")
+                    continue  # unique constraint pegou — ignora silenciosamente
+                # Fallback: insert sem waha_id caso coluna nao exista
+                supabase.table("messages").insert({
+                    "conversation_id": conv_id,
+                    "tenant_id": tid,
+                    "direction": "inbound",
+                    "content": content,
+                    "type": "text"
+                }).execute()
 
             _preview = (content[:80] if content else "")
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc, "last_message_preview": _preview}).eq("id", conv_id).execute()
