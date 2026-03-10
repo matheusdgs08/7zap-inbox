@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body, UploadFile, File, Form
 import concurrent.futures
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
@@ -1050,6 +1050,51 @@ async def waha_send_msg(phone: str, text: str, session: str = "default"):
             )
     except:
         pass
+
+@app.post("/conversations/{conv_id}/media", dependencies=[Depends(verify_key)])
+async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None)):
+    """Envia imagem ou documento via WhatsApp"""
+    conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
+    data = await file.read()
+    b64 = base64.b64encode(data).decode()
+    ftype = file.content_type or "application/octet-stream"
+    fname = file.filename or "arquivo"
+    # Determine message type
+    if ftype.startswith("image/"):
+        msg_type = "image"
+        display = f"[📷 {fname}]" + (f" {caption}" if caption else "")
+    elif ftype.startswith("audio/") or ftype.startswith("video/"):
+        msg_type = "video" if ftype.startswith("video/") else "audio"
+        display = f"[🎵 {fname}]"
+    else:
+        msg_type = "document"
+        display = f"[📎 {fname}]" + (f" {caption}" if caption else "")
+    msg = supabase.table("messages").insert({
+        "conversation_id": conv_id, "tenant_id": conv.get("tenant_id"),
+        "direction": "outbound", "content": display, "type": msg_type,
+        "sent_by": sent_by, "is_internal_note": False
+    }).execute().data[0]
+    supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
+    session = conv.get("instance_name") or "default"
+    phone = conv["contacts"]["phone"]
+    bg.add_task(waha_send_media, phone, b64, ftype, fname, caption, msg_type, session)
+    return {"message": msg}
+
+async def waha_send_media(phone: str, b64: str, mimetype: str, filename: str, caption: str, msg_type: str, session: str = "default"):
+    """Envia mídia via WAHA"""
+    try:
+        chat_id = phone if "@" in phone else f"{phone}@c.us"
+        file_obj = {"mimetype": mimetype, "filename": filename, "data": b64}
+        if msg_type == "image":
+            endpoint = "/api/sendImage"
+            payload = {"session": session, "chatId": chat_id, "caption": caption, "file": file_obj}
+        else:
+            endpoint = "/api/sendFile"
+            payload = {"session": session, "chatId": chat_id, "caption": caption, "file": file_obj}
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(f"{WAHA_URL}{endpoint}", headers=waha_headers(), json=payload)
+    except Exception as e:
+        print(f"[waha_send_media] error: {e}")
 
 @app.put("/conversations/{conv_id}/assign", dependencies=[Depends(verify_key)])
 async def assign_conversation(conv_id: str, body: AssignConversation):
