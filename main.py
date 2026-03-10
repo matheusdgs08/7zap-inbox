@@ -526,11 +526,36 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     # Suporte a ambos formatos: WAHA e Evolution API legado
     event = payload.get("event", "")
 
-    # ── Evento session.status — auto-sync quando sessão conecta ──
+    # ── Evento session.status — auto-sync + auto-reconnect ──
     if event == "session.status":
         sess_payload = payload.get("payload", {})
         sess_status = sess_payload.get("status", "") if isinstance(sess_payload, dict) else ""
         sess_name = payload.get("session", "")
+
+        # Auto-reconnect: FAILED ou STOPPED → tenta reconectar após 10s
+        if sess_status in ("FAILED", "STOPPED") and sess_name:
+            print(f"[WEBHOOK] session.status {sess_status} para {sess_name} — agendando reconexão automática")
+            async def _auto_reconnect(instance_name=sess_name, status=sess_status):
+                try:
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(10)  # aguarda 10s antes de tentar
+                    # Atualiza status no banco
+                    supabase.table("gateway_instances").update({"status": "disconnected"}).eq("instance_name", instance_name).execute()
+                    if not WAHA_URL:
+                        return
+                    from httpx import AsyncClient as _AsyncClient
+                    async with _AsyncClient(timeout=15) as cl:
+                        # Tenta restart da sessão no WAHA
+                        r = await cl.post(f"{WAHA_URL}/api/sessions/{instance_name}/restart",
+                            headers=waha_headers())
+                        if r.status_code in (200, 201):
+                            print(f"[AUTO-RECONNECT] Sessão {instance_name} reiniciada com sucesso")
+                        else:
+                            print(f"[AUTO-RECONNECT] Restart retornou {r.status_code} para {instance_name}")
+                except Exception as e:
+                    print(f"[AUTO-RECONNECT] Erro ao reconectar {instance_name}: {e}")
+            asyncio.create_task(_auto_reconnect())
+
         if sess_status == "WORKING" and sess_name:
             print(f"[WEBHOOK] session.status WORKING para {sess_name} — disparando auto-sync")
             async def _auto_sync_on_connect(instance_name=sess_name):
@@ -654,7 +679,13 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 # Create contact with phone as placeholder name
                 # Use pushName from payload if available, otherwise fall back to phone
                 initial_name = push_name if (push_name and not push_name.replace("+","").replace(" ","").replace("-","").isdigit()) else phone
-                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": initial_name}).execute().data[0]
+                try:
+                    new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": initial_name}).execute().data[0]
+                except Exception as _dup:
+                    if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
+                        new_contact = supabase.table("contacts").select("*").eq("tenant_id", tid).eq("phone", phone).single().execute().data
+                    else:
+                        raise
                 contact_id = new_contact["id"]
                 # Also update name via WAHA /contacts if pushName is still just the phone
                 if initial_name == phone:  # no push name from payload, try WAHA
@@ -871,7 +902,13 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         
         if not contact_id:
             # Try insert
+            try:
             new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data
+        except Exception as _dup:
+            if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
+                new_contact = supabase.table("contacts").select("*").eq("tenant_id", tid).eq("phone", phone).execute().data
+            else:
+                raise
             if new_contact:
                 contact_id = new_contact[0]["id"]
             else:
@@ -1005,20 +1042,27 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
     cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
     if cached:
-        # reset unread async in background, dont block response
         asyncio.create_task(run_sync(lambda: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()))
         return {"messages": cached, "has_more": len(cached) >= limit}
     q = supabase.table("messages").select("*").eq("conversation_id", conv_id)
     if before:
         q = q.lt("created_at", before)
     def _fetch():
-        data = q.order("created_at", desc=True).limit(limit).execute().data
-        try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
-        except: pass
-        return list(reversed(data))
-    msgs = await run_sync(_fetch)
-    cache_set(cache_key, msgs, ttl=30)  # Webhook invalida ativamente ao receber msg nova
-    return {"messages": msgs, "has_more": len(msgs) == limit}
+        try:
+            data = q.order("created_at", desc=True).limit(limit).execute().data
+            try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
+            except: pass
+            return list(reversed(data))
+        except Exception as e:
+            print(f"[MESSAGES] DB error for {conv_id}: {e}")
+            return []
+    try:
+        msgs = await run_sync(_fetch)
+        cache_set(cache_key, msgs, ttl=30)
+        return {"messages": msgs, "has_more": len(msgs) == limit}
+    except Exception as e:
+        print(f"[MESSAGES] Unexpected error for {conv_id}: {e}")
+        return {"messages": [], "has_more": False}
 
 
 @app.get("/users/me/preferences", dependencies=[Depends(verify_key)])
@@ -2260,7 +2304,14 @@ async def whatsapp_sync(body: dict):
                     if name and name != phone and (not existing_name or existing_name == phone):
                         supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
                 else:
+                    try:
                     contact_id = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
+                except Exception as _dup:
+                    if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
+                        existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).single().execute().data
+                        contact_id = existing["id"] if existing else None
+                    else:
+                        raise
                     stats["contacts_created"] += 1
 
                 # Upsert conversation
