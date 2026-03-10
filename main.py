@@ -1718,6 +1718,69 @@ async def get_plan_features(tenant_id: str):
     return {"plan": plan, "features": PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])}
 
 # ── SYNC HISTÓRICO ────────────────────────────────────────
+
+
+@app.get("/whatsapp/debug-session", dependencies=[Depends(verify_key)])
+async def debug_waha_session(instance: str):
+    """Diagnóstico completo de uma sessão WAHA — testa todas as rotas possíveis"""
+    results = {}
+    async with httpx.AsyncClient(timeout=15) as client:
+        # 1. Session status
+        for route in [f"{WAHA_URL}/api/sessions/{instance}", f"{WAHA_URL}/api/session?session={instance}"]:
+            try:
+                r = await client.get(route, headers=waha_headers())
+                results[f"session_status ({route.split('/')[-1]})"] = {"status": r.status_code, "body": r.json() if r.status_code == 200 else r.text[:300]}
+                if r.status_code == 200: break
+            except Exception as e:
+                results[f"session_status"] = {"error": str(e)}
+
+        # 2. Chats
+        chat_routes = [
+            f"{WAHA_URL}/api/{instance}/chats",
+            f"{WAHA_URL}/api/chats?session={instance}",
+            f"{WAHA_URL}/api/chats?session={instance}&limit=5",
+            f"{WAHA_URL}/api/{instance}/chats?limit=5",
+        ]
+        for route in chat_routes:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=10)
+                body = r.json() if r.status_code == 200 else r.text[:200]
+                count = len(body) if isinstance(body, list) else "N/A"
+                results[f"chats [{route.split('waha')[1] if 'waha' in route else route[-40:]}]"] = {
+                    "status": r.status_code, "count": count, "sample": body[:2] if isinstance(body, list) else body
+                }
+                if r.status_code == 200 and isinstance(body, list) and body:
+                    break
+            except Exception as e:
+                results[f"chats_error"] = str(e)
+
+        # 3. Messages
+        msg_routes = [
+            f"{WAHA_URL}/api/messages?session={instance}&limit=5&downloadMedia=false",
+            f"{WAHA_URL}/api/{instance}/messages?limit=5",
+        ]
+        for route in msg_routes:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=10)
+                body = r.json() if r.status_code == 200 else r.text[:200]
+                count = len(body) if isinstance(body, list) else "N/A"
+                results[f"messages [{route[-50:]}]"] = {
+                    "status": r.status_code, "count": count, "sample": body[:1] if isinstance(body, list) else body
+                }
+            except Exception as e:
+                results[f"messages_error"] = str(e)
+
+        # 4. All sessions list
+        try:
+            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            sessions = r.json() if r.status_code == 200 else []
+            match = [s for s in (sessions if isinstance(sessions, list) else []) if s.get("name") == instance]
+            results["all_sessions_match"] = match[0] if match else {"not_found": True, "all_names": [s.get("name") for s in (sessions if isinstance(sessions, list) else [])]}
+        except Exception as e:
+            results["all_sessions_error"] = str(e)
+
+    return {"instance": instance, "waha_url": WAHA_URL, "diagnosis": results}
+
 @app.post("/whatsapp/sync", dependencies=[Depends(verify_key)])
 async def whatsapp_sync(body: dict):
     tenant_id = body.get("tenant_id")
