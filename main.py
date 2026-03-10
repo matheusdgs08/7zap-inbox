@@ -478,8 +478,12 @@ async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
     return {"ok": True}
 
 # ── WEBHOOK — recebe mensagens do WAHA ───────────────────
-@app.post("/webhook/inbox")
 @app.post("/webhook/message")
+async def receive_message_legacy(payload: dict = None, x_api_key: str = Header(default="")):
+    """Rota legada desativada — 7gateway relay ja entrega via /webhook/inbox."""
+    return {"ok": True}
+
+@app.post("/webhook/inbox")
 async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     """Aceita formato WAHA: {event, session, payload: {from, fromMe, body, type}}"""
     # Verifica autenticidade do webhook (cabeçalho enviado pelo WAHA)
