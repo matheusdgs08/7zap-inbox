@@ -602,10 +602,79 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         return {"ok": True}
     except Exception as e:
         import traceback
-        print(f"WEBHOOK ERROR: {e}\n{traceback.format_exc()}")
-        return {"ok": False, "error": str(e)}
+        tb = traceback.format_exc()
+        print(f"WEBHOOK ERROR: {e}\n{tb}")
+        return {"ok": False, "error": str(e), "traceback": tb}
 
 # ── CONVERSATIONS ────────────────────────────────────────
+
+@app.post("/debug/webhook-test")
+async def debug_webhook_test(payload: dict, x_api_key: str = Header(default="")):
+    """Debug: same as webhook but returns detailed error info"""
+    import traceback as tb_module
+    try:
+        event = payload.get("event", "")
+        if "payload" in payload and isinstance(payload["payload"], dict):
+            data = payload["payload"]
+            if data.get("fromMe"): return {"ok": True, "skipped": "fromMe"}
+            raw_from = data.get("from", "")
+            if "@g" in raw_from: return {"ok": True, "skipped": "group"}
+            if "@lid" in raw_from:
+                phone = raw_from
+            else:
+                phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
+            if not phone: return {"ok": False, "reason": "no phone"}
+            content = data.get("body") or data.get("text") or ""
+            if not content: return {"ok": False, "reason": "no content"}
+        else:
+            return {"ok": False, "reason": "invalid payload format"}
+        
+        instance_name = payload.get("session") or ""
+        
+        # Test tenant lookup
+        tid = None
+        if instance_name:
+            inst_row = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).maybe_single().execute().data
+            if inst_row:
+                tid = inst_row["tenant_id"]
+        
+        if not tid:
+            return {"ok": False, "reason": "tenant not found for instance", "instance_name": instance_name}
+        
+        # Test contact lookup
+        contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
+        contact_id = contacts[0]["id"] if contacts else None
+        
+        if not contact_id:
+            # Try insert
+            new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data
+            if new_contact:
+                contact_id = new_contact[0]["id"]
+            else:
+                return {"ok": False, "reason": "failed to create contact"}
+        
+        # Test conv lookup
+        convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True).limit(1).execute().data
+        
+        # Test message insert
+        if convs:
+            conv_id = convs[0]["id"]
+            msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute().data
+            supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": (convs[0].get("unread_count") or 0) + 1}).eq("id", conv_id).execute()
+            return {"ok": True, "action": "updated_existing", "conv_id": conv_id, "tid": tid, "phone": phone, "msg_id": msg[0]["id"] if msg else None}
+        else:
+            insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 1}
+            if instance_name:
+                insert_data["instance_name"] = instance_name
+            conv = supabase.table("conversations").insert(insert_data).execute().data
+            if not conv:
+                return {"ok": False, "reason": "failed to create conversation"}
+            conv_id = conv[0]["id"]
+            msg = supabase.table("messages").insert({"conversation_id": conv_id, "direction": "inbound", "content": content, "type": "text"}).execute().data
+            return {"ok": True, "action": "created_new_conv", "conv_id": conv_id, "tid": tid, "phone": phone}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
+
 @app.get("/conversations", dependencies=[Depends(verify_key)])
 async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
