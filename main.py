@@ -1258,41 +1258,22 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
             # Include convs with null instance_name — legacy rows before multi-instance tracking
             convs = [c for c in convs if not c.get("instance_name") or c.get("instance_name") in allowed_names]
 
-        # Labels + last_message em paralelo via ThreadPool
+        # Labels em paralelo via ThreadPool (last_message_preview já está na tabela conversations)
         conv_ids = [c["id"] for c in convs]
         if conv_ids:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 f_cl = pool.submit(lambda: supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data)
                 f_lb = pool.submit(lambda: {lb["id"]: lb for lb in supabase.table("labels").select("id,name,color").eq("tenant_id", tenant_id).execute().data})
-                # Fetch last message per conversation (for preview like WhatsApp Web)
-                f_lm = pool.submit(lambda: supabase.table("messages").select("conversation_id,content,direction,type,created_at").in_("conversation_id", conv_ids).order("created_at", desc=True).execute().data)
                 all_cl = f_cl.result()
                 label_details = f_lb.result()
-                all_msgs = f_lm.result()
         else:
             all_cl = []
             label_details = {}
-            all_msgs = []
         cl_map: dict = {}
         for row in all_cl:
             cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
-        # Build last message map (already ordered desc, so first per conv = latest)
-        last_msg_map: dict = {}
-        for m in all_msgs:
-            cid = m["conversation_id"]
-            if cid not in last_msg_map:
-                last_msg_map[cid] = m
         for c in convs:
             c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
-            lm = last_msg_map.get(c["id"])
-            if lm:
-                body = lm.get("content") or ""
-                mtype = lm.get("type") or "text"
-                direction = lm.get("direction") or "inbound"
-                if not body:
-                    body = "🖼 Imagem" if "image" in mtype else "🎵 Áudio" if "audio" in mtype or mtype=="ptt" else "📹 Vídeo" if "video" in mtype else "📎 Arquivo" if "document" in mtype else ""
-                prefix = "✓ " if direction == "outbound" else ""
-                c["last_message_preview"] = prefix + body[:80]
         return convs
 
     convs = await run_sync(_query)
