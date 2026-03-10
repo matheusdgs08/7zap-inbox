@@ -475,6 +475,30 @@ async def _startup_sync_names():
 async def ping():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
+@app.get("/media/proxy")
+async def media_proxy(url: str, req: Request):
+    """Proxy WAHA media through backend (adds auth header, avoids CORS)"""
+    verify_jwt(req)
+    if not url:
+        raise HTTPException(400, "url required")
+    # Only allow proxying from our WAHA server
+    if WAHA_URL and not url.startswith(WAHA_URL):
+        # Allow relative paths or full WAHA URLs only
+        if not url.startswith("http"):
+            url = f"{WAHA_URL}{url}"
+        else:
+            raise HTTPException(403, "URL not allowed")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, headers=waha_headers())
+            content_type = r.headers.get("content-type", "application/octet-stream")
+            from fastapi.responses import Response
+            return Response(content=r.content, media_type=content_type,
+                headers={"Cache-Control": "max-age=3600",
+                         "Content-Disposition": r.headers.get("content-disposition", "")})
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch media: {e}")
+
 def create_jwt(user, session_id: str):
     payload = {"sub": user["id"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "name": user["name"], "session_id": session_id, "exp": datetime.utcnow() + timedelta(hours=168)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -710,11 +734,15 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         if not phone: return {"ok": True}
         content = data.get("body") or data.get("text") or ""
         msg_type = data.get("type", "chat")
+        media_url = data.get("mediaUrl") or data.get("media_url") or ""
+        media_mimetype = data.get("mimetype") or data.get("mimeType") or ""
+        media_filename = data.get("filename") or data.get("fileName") or ""
         if not content:
             if "image" in msg_type:    content = "[Imagem]"
             elif "audio" in msg_type:  content = "[Áudio]"
             elif "video" in msg_type:  content = "[Vídeo]"
-            elif "document" in msg_type: content = "[Documento]"
+            elif "document" in msg_type:
+                content = f"[Documento: {media_filename}]" if media_filename else "[Documento]"
             elif "sticker" in msg_type: content = "[Sticker]"
             else: return {"ok": True}
         # WAHA pode mandar id como string OU como objeto {fromMe, remote, id}
@@ -859,14 +887,27 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
             # Salva mensagem
             try:
-                supabase.table("messages").insert({
+                # Determine stored type
+                stored_type = "text"
+                if "image" in msg_type:    stored_type = "image"
+                elif "audio" in msg_type:  stored_type = "audio"
+                elif "video" in msg_type:  stored_type = "video"
+                elif "document" in msg_type: stored_type = "document"
+                msg_insert = {
                     "conversation_id": conv_id,
                     "tenant_id": tid,
                     "direction": "inbound",
                     "content": content,
-                    "type": "text",
+                    "type": stored_type,
                     "waha_id": waha_id or None
-                }).execute()
+                }
+                if media_url:
+                    msg_insert["media_url"] = media_url
+                if media_mimetype:
+                    msg_insert["media_mimetype"] = media_mimetype
+                if media_filename:
+                    msg_insert["media_filename"] = media_filename
+                supabase.table("messages").insert(msg_insert).execute()
             except Exception as insert_err:
                 err_str = str(insert_err)
                 if "duplicate" in err_str.lower() or "unique" in err_str.lower():
@@ -898,7 +939,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                                     headers=waha_headers(), params={"session": inst, "contactId": chat_id})
                                 if _r.status_code == 200:
                                     d = _r.json()
-                                    url = d.get("eurl") or d.get("url") or d.get("profilePictureUrl")
+                                    url = d.get("eurl") or d.get("url") or d.get("profilePictureUrl") or d.get("profilePictureURL")
                                     if url:
                                         supabase.table("contacts").update({"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}).eq("id", cid).execute()
                         except: pass
@@ -1550,7 +1591,7 @@ async def get_profile_picture(phone: str, instance: str = "default"):
             )
             if r.status_code == 200:
                 data = r.json()
-                url = data.get("eurl") or data.get("url") or data.get("profilePictureUrl")
+                url = data.get("eurl") or data.get("url") or data.get("profilePictureUrl") or data.get("profilePictureURL")
                 # Persist to DB so next load is instant (no WAHA call)
                 if url and phone:
                     try:
