@@ -1911,12 +1911,21 @@ async def whatsapp_qrcode(instance: str = "default"):
                     me = data.get("me") or {}
                     phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
                     return {"qr_code": "", "state": "open", "connected": True, "phone": phone}
-                if status == "STOPPED":
-                    await client.post(f"{WAHA_URL}/api/sessions/{instance}/start", headers=waha_headers())
-                    await asyncio.sleep(4)
-                elif status == "FAILED":
+                if status in ("STOPPED", "FAILED", "STARTING"):
                     await client.post(f"{WAHA_URL}/api/sessions/{instance}/restart", headers=waha_headers())
-                    await asyncio.sleep(4)
+                    # Wait until session reaches SCAN_QR_CODE (up to 15s)
+                    for _ in range(10):
+                        await asyncio.sleep(2)
+                        s2 = await client.get(f"{WAHA_URL}/api/sessions/{instance}", headers=waha_headers())
+                        if s2.status_code == 200:
+                            st2 = s2.json().get("status", "")
+                            if st2 == "SCAN_QR_CODE": break
+                            if st2 == "WORKING":
+                                me = s2.json().get("me") or {}
+                                phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+                                return {"qr_code": "", "state": "open", "connected": True, "phone": phone}
+                elif status == "SCAN_QR_CODE":
+                    pass  # already ready for QR
 
             # WAHA Plus: endpoint /api/{session}/auth/qr retorna PNG puro (QR limpo, sem screenshot)
             for attempt in range(6):
