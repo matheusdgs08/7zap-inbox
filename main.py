@@ -611,8 +611,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                         # Fallback: try push_name from the webhook payload itself (passed via closure)
                     except: pass
                 asyncio.create_task(_fetch_name())
-            # Get most recent open conversation for this contact (avoid duplicates)
-            convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True).limit(1).execute().data
+            # Get most recent open conversation for this contact+instance (avoid cross-instance contamination)
+            conv_query = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True)
+            if instance_name:
+                conv_query = conv_query.eq("instance_name", instance_name)
+            convs = conv_query.limit(1).execute().data
             if convs:
                 conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
             else:
@@ -624,6 +627,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 except Exception:
                     conv = supabase.table("conversations").insert({"contact_id": contact_id, "tenant_id": tid, "status": "open"}).execute().data[0]
                 conv_id = conv["id"]; uc = 1
+            # Also fix existing conversations that have wrong/null instance_name
+            if instance_name and convs:
+                existing_inst = supabase.table("conversations").select("instance_name").eq("id", conv_id).single().execute().data
+                if existing_inst and not existing_inst.get("instance_name"):
+                    supabase.table("conversations").update({"instance_name": instance_name}).eq("id", conv_id).execute()
 
             # Evita duplicata por waha_id
             if waha_id:
