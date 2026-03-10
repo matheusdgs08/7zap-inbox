@@ -972,7 +972,7 @@ async def waha_health_check(tenant_id: str):
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
             sessions = r.json() if r.status_code == 200 else []
-        prefix = tenant_id[:7].replace("-", "")
+        prefix = tenant_id[:6].replace("-", "")
         for s in sessions:
             name = s.get("name", "")
             if not name.startswith(f"t{prefix}"): continue
@@ -1027,7 +1027,7 @@ async def full_diagnostics(tenant_id: str):
         diag["waha"]["engine_default"] = version_data.get("engine")
         diag["waha"]["ok"] = sr.status_code == 200
 
-        prefix = tenant_id[:7].replace("-", "")
+        prefix = tenant_id[:6].replace("-", "")
         backend_host = BACKEND_URL.replace("https://", "").replace("http://", "").split("/")[0]
         waha_ok_count = 0
 
@@ -1111,7 +1111,17 @@ async def full_diagnostics(tenant_id: str):
         msgs_24h = msgs_24h_r.count if hasattr(msgs_24h_r, "count") else 0
 
         last_msg_at = last_msg_row[0]["created_at"] if last_msg_row else None
-        last_msg_ago_s = int((now - datetime.fromisoformat(last_msg_at.replace("Z",""))).total_seconds()) if last_msg_at else None
+        last_msg_ago_s = None
+        if last_msg_at:
+            try:
+                # Handle both 'Z' and '+00:00' formats from Supabase
+                ts_str = last_msg_at.replace("Z", "+00:00")
+                from datetime import timezone
+                dt = datetime.fromisoformat(ts_str)
+                now_utc = datetime.now(timezone.utc)
+                last_msg_ago_s = int((now_utc - dt).total_seconds())
+            except Exception:
+                last_msg_ago_s = None
 
         diag["database"] = {
             "ok": True,
