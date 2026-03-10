@@ -1720,6 +1720,58 @@ async def get_plan_features(tenant_id: str):
 # ── SYNC HISTÓRICO ────────────────────────────────────────
 
 
+
+@app.post("/whatsapp/fix-webhook", dependencies=[Depends(verify_key)])
+async def fix_webhook(body: dict):
+    """Força reconfiguração do webhook do WAHA para uma instância específica."""
+    instance_name = body.get("instance_name")
+    if not instance_name:
+        raise HTTPException(400, "instance_name required")
+    webhook_url = f"{BACKEND_URL}/webhook/message"
+    result = {}
+    async with httpx.AsyncClient(timeout=15) as client:
+        # 1. Check current session status
+        try:
+            r = await client.get(f"{WAHA_URL}/api/sessions/{instance_name}", headers=waha_headers())
+            result["session_before"] = r.json() if r.status_code == 200 else r.text[:200]
+        except Exception as e:
+            result["session_check_error"] = str(e)
+
+        # 2. Force update webhook via PUT
+        webhook_payload = {"config": {"webhooks": [{
+            "url": webhook_url,
+            "events": ["message", "message.any", "session.status"],
+            "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
+        }]}}
+        for put_url in [
+            f"{WAHA_URL}/api/sessions/{instance_name}",
+            f"{WAHA_URL}/api/session/{instance_name}",
+        ]:
+            try:
+                r = await client.put(put_url, headers=waha_headers(), json=webhook_payload)
+                result[f"PUT {put_url.split('/')[-2]}/{put_url.split('/')[-1]}"] = {"status": r.status_code, "body": r.text[:300]}
+                if r.status_code in (200, 201, 204):
+                    result["webhook_configured"] = True
+                    break
+            except Exception as e:
+                result[f"PUT_error"] = str(e)
+
+        # 3. Verify after update
+        try:
+            r2 = await client.get(f"{WAHA_URL}/api/sessions/{instance_name}", headers=waha_headers())
+            after = r2.json() if r2.status_code == 200 else r2.text[:200]
+            result["session_after"] = after
+            if isinstance(after, dict):
+                webhooks = after.get("config", {}).get("webhooks", [])
+                result["webhook_url_now"] = webhooks[0].get("url") if webhooks else "none"
+                result["webhook_ok"] = any(w.get("url") == webhook_url for w in webhooks)
+        except Exception as e:
+            result["verify_error"] = str(e)
+
+    result["expected_webhook_url"] = webhook_url
+    result["webhook_secret_prefix"] = WEBHOOK_SECRET[:4] + "..."
+    return result
+
 @app.get("/whatsapp/debug-session", dependencies=[Depends(verify_key)])
 async def debug_waha_session(instance: str):
     """Diagnóstico completo de uma sessão WAHA — testa todas as rotas possíveis"""
