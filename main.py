@@ -648,7 +648,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 # Fallback: insert sem waha_id caso coluna não exista
                 supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute()
 
-            supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
+            _preview = (content[:80] if content else "")
+            supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc, "last_message_preview": _preview}).eq("id", conv_id).execute()
             # Invalida cache para forçar reload no frontend
             cache_del(f"msgs:{conv_id}:latest")  # Força reload imediato no próximo poll (3s)
             # Bust ALL conversation cache keys for this tenant (including per-user keys)
@@ -820,22 +821,41 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
             # Include convs with null instance_name — legacy rows before multi-instance tracking
             convs = [c for c in convs if not c.get("instance_name") or c.get("instance_name") in allowed_names]
 
-        # Labels + label_details em paralelo via ThreadPool
+        # Labels + last_message em paralelo via ThreadPool
         conv_ids = [c["id"] for c in convs]
         if conv_ids:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                 f_cl = pool.submit(lambda: supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data)
                 f_lb = pool.submit(lambda: {lb["id"]: lb for lb in supabase.table("labels").select("id,name,color").eq("tenant_id", tenant_id).execute().data})
+                # Fetch last message per conversation (for preview like WhatsApp Web)
+                f_lm = pool.submit(lambda: supabase.table("messages").select("conversation_id,content,direction,type,created_at").in_("conversation_id", conv_ids).order("created_at", desc=True).execute().data)
                 all_cl = f_cl.result()
                 label_details = f_lb.result()
+                all_msgs = f_lm.result()
         else:
             all_cl = []
             label_details = {}
+            all_msgs = []
         cl_map: dict = {}
         for row in all_cl:
             cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
+        # Build last message map (already ordered desc, so first per conv = latest)
+        last_msg_map: dict = {}
+        for m in all_msgs:
+            cid = m["conversation_id"]
+            if cid not in last_msg_map:
+                last_msg_map[cid] = m
         for c in convs:
             c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
+            lm = last_msg_map.get(c["id"])
+            if lm:
+                body = lm.get("content") or ""
+                mtype = lm.get("type") or "text"
+                direction = lm.get("direction") or "inbound"
+                if not body:
+                    body = "🖼 Imagem" if "image" in mtype else "🎵 Áudio" if "audio" in mtype or mtype=="ptt" else "📹 Vídeo" if "video" in mtype else "📎 Arquivo" if "document" in mtype else ""
+                prefix = "✓ " if direction == "outbound" else ""
+                c["last_message_preview"] = prefix + body[:80]
         return convs
 
     convs = await run_sync(_query)
@@ -1043,7 +1063,7 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
     if not body.is_internal_note:
-        supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
+        supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "last_message_preview": "✓ " + body.text[:78]}).eq("id", conv_id).execute()
         session = conv.get("instance_name") or "default"
         bg.add_task(waha_send_msg, conv["contacts"]["phone"], body.text, session)
     return {"message": msg}
