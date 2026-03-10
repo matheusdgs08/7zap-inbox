@@ -969,47 +969,175 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 @app.get("/health/waha", dependencies=[Depends(verify_key)])
 async def waha_health_check(tenant_id: str):
     """Verifica status das sessões WAHA e se os webhooks estão apontando para este backend."""
-    expected_url = str(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "")
     results = []
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
             sessions = r.json() if r.status_code == 200 else []
-        # Filter sessions belonging to this tenant
         prefix = tenant_id[:7].replace("-", "")
         for s in sessions:
             name = s.get("name", "")
             if not name.startswith(f"t{prefix}"): continue
             status = s.get("status", "UNKNOWN")
             webhooks = s.get("config", {}).get("webhooks", [])
-            webhook_ok = False
-            webhook_url = None
+            webhook_ok = False; webhook_url = None; headers_ok = False
             for wh in webhooks:
-                url = wh.get("url", "")
-                webhook_url = url
-                # Check if webhook points to our backend
-                backend_host = "7zap-inbox-production.up.railway.app"
-                if backend_host in url and "/webhook/message" in url:
+                url = wh.get("url", ""); webhook_url = url
+                backend_host = BACKEND_URL.replace("https://", "").replace("http://", "").split("/")[0]
+                if backend_host in url and ("/webhook/inbox" in url or "/webhook/message" in url):
                     webhook_ok = True
-                    # Check auth header
                     headers_ok = any(
                         h.get("name", "").lower() == "x-api-key" and h.get("value") == WEBHOOK_SECRET
-                        for h in wh.get("customHeaders", [])
-                    )
+                        for h in wh.get("customHeaders", []))
                     break
             results.append({
-                "session": name,
-                "whatsapp_status": status,
-                "status_ok": status == "WORKING",
-                "webhook_url": webhook_url,
-                "webhook_points_to_backend": webhook_ok,
-                "webhook_auth_ok": headers_ok if webhook_ok else False,
-                "all_ok": status == "WORKING" and webhook_ok
+                "session": name, "whatsapp_status": status, "status_ok": status == "WORKING",
+                "webhook_url": webhook_url, "webhook_points_to_backend": webhook_ok,
+                "webhook_auth_ok": headers_ok, "all_ok": status == "WORKING" and webhook_ok and headers_ok,
+                "me": (s.get("me") or {}).get("id", ""), "engine": (s.get("engine") or {}).get("engine", "")
             })
     except Exception as e:
         return {"ok": False, "error": str(e), "sessions": []}
     all_healthy = all(s["all_ok"] for s in results) if results else False
-    return {"ok": all_healthy, "sessions": results, "backend_url": "https://7zap-inbox-production.up.railway.app"}
+    return {"ok": all_healthy, "sessions": results, "backend_url": BACKEND_URL}
+
+
+@app.get("/health/diagnostics", dependencies=[Depends(verify_key)])
+async def full_diagnostics(tenant_id: str):
+    """Diagnóstico completo: WAHA → Webhook → Backend → Banco de dados."""
+    now = datetime.utcnow()
+    diag = {
+        "timestamp": now.isoformat(),
+        "backend": {"ok": True, "url": BACKEND_URL},
+        "waha": {"ok": False, "url": WAHA_URL, "version": None, "sessions": []},
+        "webhook": {"ok": False, "endpoint": f"{BACKEND_URL}/webhook/inbox", "auth_configured": bool(WEBHOOK_SECRET)},
+        "database": {"ok": False, "recent_messages": 0, "last_message_at": None, "total_conversations": 0},
+        "flow": {"steps": [], "all_ok": False}
+    }
+
+    # ── 1. BACKEND ──
+    diag["flow"]["steps"].append({"step": "Backend online", "ok": True, "detail": BACKEND_URL})
+
+    # ── 2. WAHA ──
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            vr = await client.get(f"{WAHA_URL}/api/version", headers=waha_headers())
+            sr = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+        version_data = vr.json() if vr.status_code == 200 else {}
+        sessions_raw = sr.json() if sr.status_code == 200 else []
+        diag["waha"]["version"] = version_data.get("version")
+        diag["waha"]["engine_default"] = version_data.get("engine")
+        diag["waha"]["ok"] = sr.status_code == 200
+
+        prefix = tenant_id[:7].replace("-", "")
+        backend_host = BACKEND_URL.replace("https://", "").replace("http://", "").split("/")[0]
+        waha_ok_count = 0
+
+        for s in sessions_raw:
+            name = s.get("name", "")
+            if not name.startswith(f"t{prefix}"): continue
+            status = s.get("status", "UNKNOWN")
+            webhooks = s.get("config", {}).get("webhooks", [])
+            wh_url = None; wh_ok = False; auth_ok = False; correct_endpoint = False
+            for wh in webhooks:
+                wh_url = wh.get("url", "")
+                if backend_host in wh_url:
+                    wh_ok = True
+                    correct_endpoint = "/webhook/inbox" in wh_url or "/webhook/message" in wh_url
+                    auth_ok = any(
+                        h.get("name","").lower()=="x-api-key" and h.get("value")==WEBHOOK_SECRET
+                        for h in wh.get("customHeaders",[]))
+                    break
+            session_ok = status == "WORKING" and wh_ok and auth_ok
+            if session_ok: waha_ok_count += 1
+            # Last message from DB for this session
+            last_msg = None
+            try:
+                rows = supabase.table("conversations").select("last_message_at").eq("tenant_id", tenant_id).eq("instance_name", name).order("last_message_at", desc=True).limit(1).execute().data
+                last_msg = rows[0]["last_message_at"] if rows else None
+            except: pass
+            diag["waha"]["sessions"].append({
+                "name": name,
+                "phone": (s.get("me") or {}).get("id","").replace("@c.us",""),
+                "push_name": (s.get("me") or {}).get("pushName",""),
+                "status": status,
+                "status_ok": status == "WORKING",
+                "engine": (s.get("engine") or {}).get("engine",""),
+                "webhook_url": wh_url,
+                "webhook_points_to_backend": wh_ok,
+                "webhook_correct_endpoint": correct_endpoint,
+                "webhook_auth_ok": auth_ok,
+                "session_ok": session_ok,
+                "last_db_message_at": last_msg
+            })
+        diag["flow"]["steps"].append({
+            "step": "WAHA acessível",
+            "ok": diag["waha"]["ok"],
+            "detail": f"v{diag['waha']['version']} | {len(diag['waha']['sessions'])} sessão(ões) do tenant"
+        })
+        waha_sessions_ok = waha_ok_count == len(diag["waha"]["sessions"]) and len(diag["waha"]["sessions"]) > 0
+        diag["flow"]["steps"].append({
+            "step": "Sessões WhatsApp conectadas",
+            "ok": waha_sessions_ok,
+            "detail": f"{waha_ok_count}/{len(diag['waha']['sessions'])} sessões OK (WORKING + webhook configurado)"
+        })
+    except Exception as e:
+        diag["waha"]["error"] = str(e)
+        diag["flow"]["steps"].append({"step": "WAHA acessível", "ok": False, "detail": str(e)})
+
+    # ── 3. WEBHOOK CONFIG ──
+    webhook_sessions_ok = all(
+        s["webhook_points_to_backend"] and s["webhook_auth_ok"]
+        for s in diag["waha"]["sessions"]
+    ) if diag["waha"]["sessions"] else False
+    diag["webhook"]["ok"] = webhook_sessions_ok
+    diag["flow"]["steps"].append({
+        "step": "Webhooks apontando para o backend",
+        "ok": webhook_sessions_ok,
+        "detail": f"Endpoint esperado: {BACKEND_URL}/webhook/inbox"
+    })
+
+    # ── 4. DATABASE ──
+    try:
+        cutoff_5min = (now - timedelta(minutes=5)).isoformat()
+        cutoff_1h   = (now - timedelta(hours=1)).isoformat()
+        cutoff_24h  = (now - timedelta(hours=24)).isoformat()
+
+        recent = supabase.table("messages").select("id,created_at,direction").eq("tenant_id", tenant_id).gte("created_at", cutoff_1h).order("created_at", desc=True).limit(50).execute().data
+        total_convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
+        last_msg_row = supabase.table("messages").select("created_at,direction,content").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(1).execute().data
+
+        msgs_5m  = len([m for m in recent if m["created_at"] >= cutoff_5min])
+        msgs_1h  = len(recent)
+        msgs_24h_r = supabase.table("messages").select("id", count="exact").eq("tenant_id", tenant_id).gte("created_at", cutoff_24h).execute()
+        msgs_24h = msgs_24h_r.count if hasattr(msgs_24h_r, "count") else 0
+
+        last_msg_at = last_msg_row[0]["created_at"] if last_msg_row else None
+        last_msg_ago_s = int((now - datetime.fromisoformat(last_msg_at.replace("Z",""))).total_seconds()) if last_msg_at else None
+
+        diag["database"] = {
+            "ok": True,
+            "recent_messages_5min": msgs_5m,
+            "recent_messages_1h": msgs_1h,
+            "recent_messages_24h": msgs_24h,
+            "total_conversations": getattr(total_convs, "count", 0),
+            "last_message_at": last_msg_at,
+            "last_message_ago_seconds": last_msg_ago_s,
+            "last_message_direction": last_msg_row[0]["direction"] if last_msg_row else None,
+        }
+        db_receiving = msgs_5m > 0 or (last_msg_ago_s is not None and last_msg_ago_s < 300)
+        diag["flow"]["steps"].append({
+            "step": "Mensagens gravadas no banco",
+            "ok": db_receiving,
+            "detail": f"{msgs_5m} msg nos últimos 5min | {msgs_1h} na última hora | última há {last_msg_ago_s}s" if last_msg_ago_s else "Nenhuma mensagem recente encontrada"
+        })
+    except Exception as e:
+        diag["database"]["error"] = str(e)
+        diag["flow"]["steps"].append({"step": "Banco de dados", "ok": False, "detail": str(e)})
+
+    # ── 5. OVERALL ──
+    diag["flow"]["all_ok"] = all(s["ok"] for s in diag["flow"]["steps"])
+    return diag
 
 
 # ── CONVERSATIONS ────────────────────────────────────────
