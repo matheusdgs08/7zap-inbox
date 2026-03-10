@@ -503,8 +503,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             elif "sticker" in msg_type: content = "[Sticker]"
             else: return {"ok": True}
         waha_id = data.get("id", "")
+        # Extract push name from WAHA payload (contact's WhatsApp display name)
+        push_name = data.get("notifyName") or data.get("pushName") or data.get("_data", {}).get("notifyName", "") if isinstance(data.get("_data"), dict) else data.get("notifyName") or data.get("pushName") or ""
     # Formato Evolution API legado
     else:
+        push_name = ""  # Evolution API doesn't provide push name easily
         data = payload.get("data", {})
         key = data.get("key", {})
         if key.get("fromMe"): return {"ok": True}
@@ -543,25 +546,57 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
             if contacts:
                 contact_id = contacts[0]["id"]
+                # Update name if still set to the raw phone (never got a real name)
+                existing_name = contacts[0].get("name", "")
+                if existing_name == phone or existing_name == "" or (existing_name and "@" in existing_name):
+                    async def _update_name(contact_id=contact_id, phone=phone, instance_name=instance_name):
+                        try:
+                            if not instance_name: return
+                            clean = "".join(c for c in phone if c.isdigit())
+                            chat_id = f"{clean}@c.us"
+                            async with httpx.AsyncClient(timeout=5) as _c:
+                                _r = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
+                                                  params={"session": instance_name, "contactId": chat_id})
+                                if _r.status_code == 200:
+                                    d = _r.json()
+                                    if isinstance(d, list): d = d[0] if d else {}
+                                    name = d.get("pushname") or d.get("name") or ""
+                                    if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
+                                        supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
+                        except: pass
+                    asyncio.create_task(_update_name())
             else:
                 # Create contact with phone as placeholder name
-                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data[0]
+                # Use pushName from payload if available, otherwise fall back to phone
+                initial_name = push_name if (push_name and not push_name.replace("+","").replace(" ","").replace("-","").isdigit()) else phone
+                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": initial_name}).execute().data[0]
                 contact_id = new_contact["id"]
-                # Try to get real name from WAHA chat list async
+                # Also update name via WAHA /contacts if pushName is still just the phone
+                if initial_name == phone:  # no push name from payload, try WAHA
+                    pass  # _fetch_name will handle it below
+                # Try to get real name from WAHA Plus /contacts endpoint (fast, accurate)
                 async def _fetch_name(tid=tid, phone=phone, contact_id=contact_id, instance_name=instance_name):
                     try:
                         if not instance_name: return
-                        async with httpx.AsyncClient(timeout=8) as _c:
-                            _r = await _c.get(f"{WAHA_URL}/api/{instance_name}/chats", headers=waha_headers())
-                            chats = _r.json() if _r.status_code == 200 else []
-                        for chat in (chats if isinstance(chats, list) else []):
-                            chat_id = chat.get("id", {}).get("_serialized", "") or ""
-                            phone_variants = {phone, phone + "@c.us", phone + "@s.whatsapp.net"}
-                            if chat_id in phone_variants or any(chat_id.startswith(v) for v in phone_variants):
-                                name = chat.get("name","")
+                        # Normalize phone to chatId format
+                        clean = "".join(c for c in phone if c.isdigit())
+                        chat_id = f"{clean}@c.us"
+                        async with httpx.AsyncClient(timeout=6) as _c:
+                            # WAHA Plus: GET /api/contacts?session=X&contactId=Y
+                            _r = await _c.get(
+                                f"{WAHA_URL}/api/contacts",
+                                headers=waha_headers(),
+                                params={"session": instance_name, "contactId": chat_id}
+                            )
+                            if _r.status_code == 200:
+                                data = _r.json()
+                                # Response can be a single object or list
+                                if isinstance(data, list): data = data[0] if data else {}
+                                name = data.get("pushname") or data.get("name") or data.get("verifiedName") or ""
                                 if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
                                     supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
-                                break
+                                    return
+                        # Fallback: try push_name from the webhook payload itself (passed via closure)
                     except: pass
                 asyncio.create_task(_fetch_name())
             # Get most recent open conversation for this contact (avoid duplicates)
@@ -855,33 +890,52 @@ async def save_user_preferences(user_id: str, body: dict = Body(...)):
 
 @app.post("/contacts/sync-names", dependencies=[Depends(verify_key)])
 async def sync_contact_names(tenant_id: str):
-    """Busca nomes reais dos contatos via WAHA /chats e atualiza no banco. Roda em background."""
+    """Busca nomes reais dos contatos via WAHA Plus /chats e atualiza no banco. Roda em background."""
     async def _run():
+        updated = 0
         try:
             instances = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", tenant_id).execute().data
+            # Only update contacts whose name is still the raw phone
+            all_contacts = supabase.table("contacts").select("id,phone,name").eq("tenant_id", tenant_id).execute().data or []
+            needs_update = {c["phone"]: c for c in all_contacts
+                           if not c.get("name") or c["name"] == c["phone"]
+                           or "@" in (c.get("name") or "")
+                           or (c.get("name") or "").replace("+","").replace(" ","").replace("-","").replace("(","").replace(")","").isdigit()}
+            print(f"[SYNC_NAMES] {len(needs_update)} contacts need name update for tenant {tenant_id}")
             for inst in instances:
                 iname = inst.get("instance_name")
                 if not iname: continue
                 try:
-                    async with httpx.AsyncClient(timeout=10) as _hc:
+                    async with httpx.AsyncClient(timeout=20) as _hc:
+                        # WAHA Plus: GET /api/{session}/chats returns name for each conversation
                         _hr = await _hc.get(f"{WAHA_URL}/api/{iname}/chats", headers=waha_headers())
                         chats = _hr.json() if _hr.status_code == 200 else []
+                    # Build lookup map: various phone formats → display name
+                    name_map = {}
                     for chat in (chats if isinstance(chats, list) else []):
-                        name = chat.get("name", "")
-                        jid = chat.get("id", {}).get("_serialized", "")
-                        if not name or not jid: continue
-                        # Only update if name looks real (not a phone number)
+                        cid = chat.get("id","")
+                        if isinstance(cid, dict): cid = cid.get("_serialized","") or cid.get("id","")
+                        name = chat.get("name","") or chat.get("pushname","")
+                        if not cid or not name: continue
                         if name.replace("+","").replace(" ","").replace("-","").isdigit(): continue
-                        # Find contact by phone (jid)
-                        existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", jid).execute().data
-                        if existing and existing[0].get("name") in [None, "", jid, jid.split("@")[0]]:
-                            supabase.table("contacts").update({"name": name}).eq("id", existing[0]["id"]).execute()
+                        clean_num = "".join(c for c in cid if c.isdigit())
+                        name_map[cid] = name
+                        name_map[clean_num] = name
+                        if not cid.endswith("@c.us"): name_map[f"{clean_num}@c.us"] = name
+                    # Update each contact that needs it
+                    for phone, contact in needs_update.items():
+                        clean = "".join(c for c in phone if c.isdigit())
+                        name = name_map.get(phone) or name_map.get(clean) or name_map.get(f"{clean}@c.us")
+                        if name:
+                            supabase.table("contacts").update({"name": name}).eq("id", contact["id"]).execute()
+                            updated += 1
                 except Exception as e:
                     print(f"sync_contact_names error for {iname}: {e}")
         except Exception as e:
             print(f"sync_contact_names error: {e}")
+        print(f"[SYNC_NAMES] Done — {updated} names updated")
     asyncio.create_task(_run())
-    return {"ok": True, "message": "Sync iniciado em background"}
+    return {"ok": True, "message": "Sincronização de nomes iniciada em background"}
 
 
 @app.get("/conversations/{conv_id}/history", dependencies=[Depends(verify_key)])
