@@ -142,8 +142,8 @@ SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
 WAHA_URL          = os.getenv("WAHA_URL", "http://localhost:3000")
 WAHA_KEY          = os.getenv("WAHA_KEY", "pulsekey")
 BACKEND_URL       = os.getenv("BACKEND_URL", "https://7zap-inbox-production.up.railway.app")
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET") or "7zap_inbox_secret_CHANGE_ME"
-INBOX_API_KEY     = os.getenv("INBOX_API_KEY") or "7zap_inbox_secret_CHANGE_ME"
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET") or os.getenv("INBOX_API_KEY") or "7zap_inbox_secret"
+INBOX_API_KEY     = os.getenv("INBOX_API_KEY") or "7zap_inbox_secret"
 if INBOX_API_KEY.endswith("_CHANGE_ME"):
     import warnings; warnings.warn("⚠️  INBOX_API_KEY não configurada — usando valor padrão inseguro!")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -485,6 +485,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         if data.get("fromMe"): return {"ok": True}
         raw_from = data.get("from", "")
         if "@g" in raw_from: return {"ok": True}  # ignora grupos
+        if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
         # Preserve @lid — only strip @c.us and @s.whatsapp.net
         if "@lid" in raw_from:
             phone = raw_from  # keep full JID including @lid
@@ -508,6 +509,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         if key.get("fromMe"): return {"ok": True}
         phone = key.get("remoteJid", "").replace("@s.whatsapp.net", "").replace("@g.us", "")
         if not phone: return {"ok": True}
+        if "broadcast" in phone.lower(): return {"ok": True}  # ignora broadcast
         msg = data.get("message", {})
         content = msg.get("conversation") or (msg.get("extendedTextMessage") or {}).get("text") or (
             "[Imagem]" if msg.get("imageMessage") else "[Áudio]" if msg.get("audioMessage") else
