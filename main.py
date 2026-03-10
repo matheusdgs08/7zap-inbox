@@ -1659,7 +1659,7 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
 async def get_tenant(tenant_id: str):
-    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
+    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at,kanban_columns").eq("id", tenant_id).single().execute().data
     if tenant:
         credits, plan, limit = get_tenant_credits(tenant_id)
         tenant["ai_credits"] = credits
@@ -3388,5 +3388,27 @@ async def set_conv_auto_mode(conv_id: str, body: dict):
             {"copilot_auto_mode": enabled, "updated_at": datetime.utcnow().isoformat()}
         ).eq("id", conv_id).execute()
         return {"ok": True, "copilot_auto_mode": enabled}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── /tenant/kanban-columns — shared kanban column config ─────────────────────
+@app.put("/tenant/kanban-columns", dependencies=[Depends(verify_key)])
+async def save_kanban_columns(body: dict):
+    """Save kanban columns shared for entire tenant (all users see the same columns)."""
+    tenant_id = body.get("tenant_id")
+    columns = body.get("columns")
+    if not tenant_id or not isinstance(columns, list):
+        raise HTTPException(status_code=400, detail="tenant_id and columns required")
+    # Validate columns structure
+    validated = []
+    for col in columns:
+        if isinstance(col, dict) and col.get("id") and col.get("label"):
+            validated.append({"id": col["id"], "label": col["label"], "color": col.get("color", "#00a884")})
+    if not validated:
+        raise HTTPException(status_code=400, detail="At least one valid column required")
+    try:
+        supabase.table("tenants").update({"kanban_columns": validated}).eq("id", tenant_id).execute()
+        return {"ok": True, "columns": validated}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
