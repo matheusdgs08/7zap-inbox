@@ -763,7 +763,8 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
         if allowed:
             inst_rows = supabase.table("gateway_instances").select("id,instance_name").in_("id", allowed).execute().data
             allowed_names = {r["instance_name"] for r in inst_rows}
-            convs = [c for c in convs if c.get("instance_name") in allowed_names]
+            # Include convs with null instance_name — legacy rows before multi-instance tracking
+            convs = [c for c in convs if not c.get("instance_name") or c.get("instance_name") in allowed_names]
 
         # Labels + label_details em paralelo via ThreadPool
         conv_ids = [c["id"] for c in convs]
