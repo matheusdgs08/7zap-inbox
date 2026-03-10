@@ -229,6 +229,7 @@ security = HTTPBearer(auto_error=False)
 @app.on_event("startup")
 async def start_keepalive():
     asyncio.create_task(keepalive_loop())
+    asyncio.create_task(fix_existing_sessions_webhook())
 
 async def ensure_webhooks():
     """Auto-configure webhooks for all active WAHA sessions that are missing it."""
@@ -266,6 +267,37 @@ async def ensure_webhooks():
                 print(f"✅ Auto-webhook configured for session '{name}': {r2.status_code}")
     except Exception as e:
         print(f"ensure_webhooks error: {e}")
+
+async def fix_existing_sessions_webhook():
+    """Corrige sessoes existentes que ainda usam /webhook/message → /webhook/inbox"""
+    if not WAHA_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            if r.status_code != 200:
+                return
+            sessions = r.json()
+            fixed = 0
+            for s in sessions:
+                name = s.get("name", "")
+                webhooks = s.get("config", {}).get("webhooks", [])
+                for wh in webhooks:
+                    if "/webhook/message" in wh.get("url", ""):
+                        # Corrigir para /webhook/inbox
+                        new_url = wh["url"].replace("/webhook/message", "/webhook/inbox")
+                        await client.put(f"{WAHA_URL}/api/sessions/{name}", headers=waha_headers(),
+                            json={"config": {"webhooks": [{
+                                "url": new_url,
+                                "events": ["message", "message.any", "session.status"],
+                                "customHeaders": wh.get("customHeaders", [])
+                            }]}})
+                        print(f"[STARTUP] Corrigido webhook de {name}: /webhook/message → /webhook/inbox")
+                        fixed += 1
+            if fixed > 0:
+                print(f"[STARTUP] {fixed} sessoes corrigidas")
+    except Exception as e:
+        print(f"[STARTUP] fix_existing_sessions_webhook error: {e}")
 
 async def keepalive_loop():
     await asyncio.sleep(15)
@@ -1634,13 +1666,21 @@ async def whatsapp_create_instance(body: dict):
     if WAHA_URL:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
-                    json={"name": inst_name, "config": {"webhooks": [{
-                        "url": f"{BACKEND_URL}/webhook/message",
-                        "events": ["message", "message.any", "session.status"],
-                        "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
-                    }]}})
-        except: pass
+                # Verificar se sessão já existe no WAHA antes de criar (evita duplicatas)
+                check = await client.get(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
+                if check.status_code != 200:
+                    # Criar sessão nova — sempre usar /webhook/inbox
+                    await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
+                        json={"name": inst_name, "config": {"webhooks": [{
+                            "url": f"{BACKEND_URL}/webhook/inbox",
+                            "events": ["message", "message.any", "session.status"],
+                            "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
+                        }]}})
+                    print(f"[CREATE-INSTANCE] Sessao {inst_name} criada no WAHA")
+                else:
+                    print(f"[CREATE-INSTANCE] Sessao {inst_name} ja existe no WAHA, reutilizando")
+        except Exception as e:
+            print(f"[CREATE-INSTANCE] WAHA error: {e}")
     db_row = supabase.table("gateway_instances").insert({
         "tenant_id": tenant_id, "instance_name": inst_name,
         "label": label, "status": "disconnected", "plan": plan
