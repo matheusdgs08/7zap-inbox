@@ -76,7 +76,7 @@ def cache_is_stale(key):
     return (datetime.utcnow().timestamp() - v["ts"]) >= v["ttl"]
 # ── PLAN CREDIT CONSTANTS ────────────────────────────────
 PLAN_CREDITS = {
-    "trial":      200,   # suficiente pra testar, não pra depender
+    "trial":      1000,  # onboarding consome ~1000 créditos — suficiente pra ver resultado
     "starter":    0,     # sem IA
     "pro":        300,   # ~1 semana de uso intenso → incentiva compra de pacote
     "business":   1000,  # generoso mas não infinito
@@ -475,7 +475,9 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     """Aceita formato WAHA: {event, session, payload: {from, fromMe, body, type}}"""
     # Verifica autenticidade do webhook (cabeçalho enviado pelo WAHA)
     if WEBHOOK_SECRET and x_api_key != WEBHOOK_SECRET:
-        return {"ok": True}  # Silently ignore invalid webhooks
+        masked = (x_api_key[:4] + "..." + x_api_key[-4:]) if len(x_api_key) > 8 else f"len={len(x_api_key)}"
+        print(f"[WEBHOOK] AUTH REJECTED: received key '{masked}', expected starts with '{WEBHOOK_SECRET[:4]}...{WEBHOOK_SECRET[-4:]}'")
+        return {"ok": True}  # Return ok to prevent WAHA retries
     # Suporte a ambos formatos: WAHA e Evolution API legado
     event = payload.get("event", "")
 
@@ -528,7 +530,12 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             if inst_row:
                 tid = inst_row["tenant_id"]
         if not tid:
-            # Fallback: use first tenant that has this contact (legacy)
+            if instance_name:
+                # Instance name present but not found in gateway_instances — unknown instance
+                print(f"[WEBHOOK] UNKNOWN INSTANCE: '{instance_name}' not found in gateway_instances, dropping message from {phone}")
+                return {"ok": True}
+            # No instance_name at all — legacy fallback (iterate all tenants)
+            print(f"[WEBHOOK] WARNING: no instance_name in payload, using legacy tenant fallback for {phone}")
             tenants = supabase.table("tenants").select("id").execute().data
         else:
             tenants = [{"id": tid}]
@@ -549,7 +556,9 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                             _r = await _c.get(f"{WAHA_URL}/api/{instance_name}/chats", headers=waha_headers())
                             chats = _r.json() if _r.status_code == 200 else []
                         for chat in (chats if isinstance(chats, list) else []):
-                            if chat.get("id", {}).get("_serialized") == phone:
+                            chat_id = chat.get("id", {}).get("_serialized", "") or ""
+                            phone_variants = {phone, phone + "@c.us", phone + "@s.whatsapp.net"}
+                            if chat_id in phone_variants or any(chat_id.startswith(v) for v in phone_variants):
                                 name = chat.get("name","")
                                 if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
                                     supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
@@ -587,8 +596,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc}).eq("id", conv_id).execute()
             # Invalida cache para forçar reload no frontend
-            cache_del(f"msgs:{conv_id}:latest")
-            cache_del(f"msgs:{conv_id}:None")
+            cache_del(f"msgs:{conv_id}:latest")  # Força reload imediato no próximo poll (3s)
             # Bust ALL conversation cache keys for this tenant (including per-user keys)
             # Pattern: convs:{tid}:*
             try:
@@ -607,6 +615,52 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         tb = traceback.format_exc()
         print(f"WEBHOOK ERROR: {e}\n{tb}")
         return {"ok": False, "error": str(e), "traceback": tb}
+
+@app.get("/health/waha", dependencies=[Depends(verify_key)])
+async def waha_health_check(tenant_id: str):
+    """Verifica status das sessões WAHA e se os webhooks estão apontando para este backend."""
+    expected_url = str(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "")
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            sessions = r.json() if r.status_code == 200 else []
+        # Filter sessions belonging to this tenant
+        prefix = tenant_id[:7].replace("-", "")
+        for s in sessions:
+            name = s.get("name", "")
+            if not name.startswith(f"t{prefix}"): continue
+            status = s.get("status", "UNKNOWN")
+            webhooks = s.get("config", {}).get("webhooks", [])
+            webhook_ok = False
+            webhook_url = None
+            for wh in webhooks:
+                url = wh.get("url", "")
+                webhook_url = url
+                # Check if webhook points to our backend
+                backend_host = "7zap-inbox-production.up.railway.app"
+                if backend_host in url and "/webhook/message" in url:
+                    webhook_ok = True
+                    # Check auth header
+                    headers_ok = any(
+                        h.get("name", "").lower() == "x-api-key" and h.get("value") == WEBHOOK_SECRET
+                        for h in wh.get("customHeaders", [])
+                    )
+                    break
+            results.append({
+                "session": name,
+                "whatsapp_status": status,
+                "status_ok": status == "WORKING",
+                "webhook_url": webhook_url,
+                "webhook_points_to_backend": webhook_ok,
+                "webhook_auth_ok": headers_ok if webhook_ok else False,
+                "all_ok": status == "WORKING" and webhook_ok
+            })
+    except Exception as e:
+        return {"ok": False, "error": str(e), "sessions": []}
+    all_healthy = all(s["all_ok"] for s in results) if results else False
+    return {"ok": all_healthy, "sessions": results, "backend_url": "https://7zap-inbox-production.up.railway.app"}
+
 
 # ── CONVERSATIONS ────────────────────────────────────────
 
@@ -775,7 +829,7 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
         except: pass
         return list(reversed(data))
     msgs = await run_sync(_fetch)
-    cache_set(cache_key, msgs, ttl=45)
+    cache_set(cache_key, msgs, ttl=15)  # Baixo TTL — webhook invalida ativamente em ~0ms
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 
