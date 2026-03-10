@@ -1138,6 +1138,32 @@ async def assign_conversation(conv_id: str, body: AssignConversation):
 async def update_kanban(conv_id: str, body: UpdateKanban):
     return supabase.table("conversations").update({"kanban_stage": body.stage, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
+@app.post("/contacts/{contact_id}/block", dependencies=[Depends(verify_key)])
+async def block_contact(contact_id: str):
+    """Bloqueia contato no WhatsApp via WAHA"""
+    try:
+        contact = supabase.table("contacts").select("phone, tenant_id").eq("id", contact_id).single().execute().data
+        if not contact:
+            return {"ok": False, "error": "Contact not found"}
+        phone = contact["phone"]
+        clean = "".join(c for c in phone if c.isdigit())
+        chat_id = f"{clean}@c.us"
+        # Find active instance for this tenant
+        inst = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", contact["tenant_id"]).limit(1).execute().data
+        session = inst[0]["instance_name"] if inst else "default"
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Try WAHA block endpoint
+            r = await client.post(f"{WAHA_URL}/api/contacts/block",
+                headers=waha_headers(),
+                json={"session": session, "contactId": chat_id}
+            )
+            if r.status_code in (200, 201):
+                supabase.table("contacts").update({"tags": supabase.table("contacts").select("tags").eq("id", contact_id).single().execute().data.get("tags", []) + ["bloqueado"]}).eq("id", contact_id).execute()
+                return {"ok": True}
+            return {"ok": False, "error": f"WAHA {r.status_code}: {r.text[:100]}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.post("/conversations/{conv_id}/read", dependencies=[Depends(verify_key)])
 async def mark_conversation_read(conv_id: str):
     supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
