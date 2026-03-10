@@ -1499,10 +1499,8 @@ async def onboarding_analyze(body: dict):
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
     tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt, onboarding_last_run").eq("id", tenant_id).single().execute().data
     plan = tenant.get("plan")
-    plan_limits = {"pro": 200, "business": 500}
-    if plan not in plan_limits:
-        raise HTTPException(status_code=403, detail="Onboarding Inteligente disponível apenas nos planos Pro e Business")
-    conv_limit = plan_limits[plan]
+    plan_limits = {"trial": 50, "starter": 100, "pro": 200, "business": 500}
+    conv_limit = plan_limits.get(plan, 50)
     # Check and consume 1000 credits — no monthly limit, use as many times as you have credits
     ok, remaining, err = consume_credit(tenant_id, 1000)
     if not ok: raise HTTPException(status_code=402, detail=f"São necessários 1.000 créditos para esta análise. {err}")
@@ -1528,19 +1526,13 @@ async def onboarding_analyze(body: dict):
     total_convs = len(all_samples)
     analysis_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.\n\nAnalise as conversas abaixo da empresa "{tenant['name']}" e gere um prompt de sistema detalhado para um Co-pilot de IA.\n\nO prompt deve incluir:\n1. Tom de voz\n2. Produtos/serviços\n3. Perguntas frequentes\n4. Fluxo de vendas\n5. Regras importantes\n6. Instruções para o Co-pilot\n\nCONVERSAS ({total_convs} conversas, últimos {days} dias):\n\n{combined}\n\nPROMPT GERADO:"""
     async with httpx.AsyncClient(timeout=120) as client:
-        # Onboarding usa GPT-4o para máxima qualidade na geração do prompt
-        if OPENAI_API_KEY:
-            r = await client.post("https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "gpt-4o", "max_tokens": 2000,
-                      "messages": [{"role": "user", "content": analysis_prompt}]})
-            raw_result = r.json()["choices"][0]["message"]["content"]
-        else:
-            r = await client.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
-            raw_result = None  # handled below
-        generated_prompt = r.json()["content"][0]["text"]
+        r = await client.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 2000, "messages": [{"role": "user", "content": analysis_prompt}]})
+        resp_data = r.json()
+        if "content" not in resp_data:
+            raise HTTPException(status_code=500, detail=f"Erro na IA: {resp_data.get('error', {}).get('message', 'resposta inválida')}")
+        generated_prompt = resp_data["content"][0]["text"]
 
     # Save real prompt to DB (never sent to frontend)
     supabase.table("tenants").update({
