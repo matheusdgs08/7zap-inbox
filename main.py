@@ -972,9 +972,8 @@ async def get_history(conv_id: str, limit: int = 50):
     # Serve do DB instantaneamente
     msgs = await run_sync(_fetch_db)
 
-    # Background: se DB está vazio ou poucos msgs, busca do WAHA sem bloquear
-    if len(msgs) < 5:
-        asyncio.create_task(_waha_sync_chat_bg(conv_id, limit))
+    # Background: sempre busca WAHA em background para garantir mensagens atualizadas
+    asyncio.create_task(_waha_sync_chat_bg(conv_id, limit))
 
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
@@ -993,14 +992,21 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
         else:
             clean = "".join(c for c in phone if c.isdigit())
             chat_id = f"{clean}@c.us"
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+        async with httpx.AsyncClient(timeout=15) as client:
+            raw = None
+            for url in [
                 f"{WAHA_URL}/api/{instance_name}/chats/{chat_id}/messages?limit={limit}&downloadMedia=false",
-                headers=waha_headers()
-            )
-            if r.status_code != 200: return
-            raw = r.json()
-        if not isinstance(raw, list): return
+                f"{WAHA_URL}/api/messages?session={instance_name}&chatId={chat_id}&limit={limit}&downloadMedia=false",
+                f"{WAHA_URL}/api/chats/{chat_id}/messages?session={instance_name}&limit={limit}",
+            ]:
+                try:
+                    r = await client.get(url, headers=waha_headers())
+                    if r.status_code == 200:
+                        d = r.json()
+                        raw = d if isinstance(d, list) else d.get("messages", d.get("data", []))
+                        if raw: break
+                except: continue
+            if not raw: return
         def _get_existing():
             return {m["waha_id"] for m in supabase.table("messages").select("waha_id").eq("conversation_id", conv_id).execute().data or [] if m.get("waha_id")}
         existing_ids = await run_sync(_get_existing)
