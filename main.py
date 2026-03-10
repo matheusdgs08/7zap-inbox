@@ -475,29 +475,6 @@ async def _startup_sync_names():
 async def ping():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-@app.get("/media/proxy", dependencies=[Depends(verify_key)])
-async def media_proxy(url: str):
-    """Proxy WAHA media through backend (adds auth header, avoids CORS)"""
-    from fastapi.responses import Response
-    if not url:
-        raise HTTPException(400, "url required")
-    if WAHA_URL and not url.startswith(WAHA_URL):
-        if not url.startswith("http"):
-            url = f"{WAHA_URL}{url}"
-        else:
-            raise HTTPException(403, "URL not allowed")
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, headers=waha_headers())
-            content_type = r.headers.get("content-type", "application/octet-stream")
-            return Response(content=r.content, media_type=content_type,
-                headers={"Cache-Control": "max-age=3600",
-                         "Content-Disposition": r.headers.get("content-disposition", "")})
-    except Exception as e:
-        raise HTTPException(502, f"Failed to fetch media: {e}")
-    except Exception as e:
-        raise HTTPException(502, f"Failed to fetch media: {e}")
-
 def create_jwt(user, session_id: str):
     payload = {"sub": user["id"], "email": user["email"], "role": user["role"], "tenant_id": user["tenant_id"], "name": user["name"], "session_id": session_id, "exp": datetime.utcnow() + timedelta(hours=168)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -530,6 +507,28 @@ async def require_super_admin(user=Depends(get_current_user)):
 
 def verify_key(x_api_key: str = Header(...)):
     if x_api_key != INBOX_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ── MEDIA PROXY ───────────────────────────────────────────
+@app.get("/media/proxy", dependencies=[Depends(verify_key)])
+async def media_proxy(url: str):
+    """Proxy WAHA media through backend (adds auth header, avoids CORS)"""
+    from fastapi.responses import Response
+    if not url:
+        raise HTTPException(400, "url required")
+    if WAHA_URL and not url.startswith(WAHA_URL):
+        if not url.startswith("http"):
+            url = f"{WAHA_URL}{url}"
+        else:
+            raise HTTPException(403, "URL not allowed")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, headers=waha_headers())
+            content_type = r.headers.get("content-type", "application/octet-stream")
+            return Response(content=r.content, media_type=content_type,
+                headers={"Cache-Control": "max-age=3600",
+                         "Content-Disposition": r.headers.get("content-disposition", "")})
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch media: {e}")
 
 # ── WAHA HEADERS (X-Api-Key — formato correto WAHA) ──────
 def waha_headers():
