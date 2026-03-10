@@ -241,30 +241,29 @@ async def ensure_webhooks():
             if r.status_code != 200:
                 return
             sessions = r.json()
+            if not isinstance(sessions, list):
+                sessions = sessions.get("data", sessions.get("sessions", []))
             for session in sessions:
                 name = session.get("name", "")
                 status = session.get("status", "")
-                if status not in ("WORKING", "CONNECTED"):
+                if status not in ("WORKING", "CONNECTED", "AUTHENTICATED"):
                     continue
                 # Check if webhook already configured correctly
                 webhooks = session.get("config", {}).get("webhooks", [])
-                already_set = any(
-                    w.get("url") == webhook_url
-                    for w in webhooks
-                )
+                already_set = any(w.get("url") == webhook_url for w in webhooks)
                 if already_set:
                     continue
-                # Configure webhook automatically
-                await client.put(
+                # WAHA Plus: PUT /api/sessions/{name} to update config
+                r2 = await client.put(
                     f"{WAHA_URL}/api/sessions/{name}",
                     headers=waha_headers(),
                     json={"config": {"webhooks": [{
                         "url": webhook_url,
-                        "events": ["message", "session.status"],
+                        "events": ["message", "message.any", "session.status"],
                         "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
                     }]}}
                 )
-                print(f"✅ Auto-webhook configured for session: {name}")
+                print(f"✅ Auto-webhook configured for session '{name}': {r2.status_code}")
     except Exception as e:
         print(f"ensure_webhooks error: {e}")
 
@@ -299,7 +298,7 @@ async def _startup_sync_names():
                 if not iname: continue
                 try:
                     async with httpx.AsyncClient(timeout=12) as client:
-                        r = await client.get(f"{WAHA_URL}/api/{iname}/chats", headers=waha_headers())
+                        r = await client.get(f"{WAHA_URL}/api/{iname}/chats?limit=1", headers=waha_headers())
                         chats = r.json() if r.status_code == 200 else []
                     name_map = {}
                     for chat in (chats if isinstance(chats, list) else []):
@@ -1379,7 +1378,7 @@ async def whatsapp_create_instance(body: dict):
                 await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
                     json={"name": inst_name, "config": {"webhooks": [{
                         "url": f"{BACKEND_URL}/webhook/message",
-                        "events": ["message", "session.status"],
+                        "events": ["message", "message.any", "session.status"],
                         "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
                     }]}})
         except: pass
@@ -1847,11 +1846,12 @@ async def whatsapp_sync(body: dict):
     async with httpx.AsyncClient(timeout=60) as client:
         # ── 1. Fetch chats list — tries multiple WAHA routes ──────
         chats = []
+        # WAHA Plus: primary route is /api/{session}/chats
         waha_routes = [
+            f"{WAHA_URL}/api/{instance}/chats?limit=50",
+            f"{WAHA_URL}/api/{instance}/chats",
             f"{WAHA_URL}/api/chats?session={instance}&limit=50",
             f"{WAHA_URL}/api/chats?session={instance}",
-            f"{WAHA_URL}/api/{instance}/chats",
-            f"{WAHA_URL}/api/chats/{instance}",
         ]
         for route in waha_routes:
             try:
@@ -1899,7 +1899,7 @@ async def whatsapp_sync(body: dict):
 
         if not chats:
             # Return success with 0 stats instead of 502 error
-            return {"ok": True, "stats": stats, "note": "WAHA returned no chats. The session may need a few minutes after first connection, or /api/chats requires WAHA Plus."}
+            return {"ok": True, "stats": stats, "note": "WAHA returned no chats. Session may need a few minutes after first connection to load history. Try again in 1-2 min."}
         # Ordena por timestamp desc e limita aos 30 mais recentes para não travar
         chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)[:30]
         stats["chats"] = len(chats)
@@ -1946,8 +1946,8 @@ async def whatsapp_sync(body: dict):
                 # ── 3. Fetch messages for this chat ──────────────
                 msgs_data = []
                 for msg_route in [
+                    f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=100&downloadMedia=false",
                     f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=100&downloadMedia=false",
-                    f"{WAHA_URL}/api/{instance}/messages?chatId={chat_id}&limit=100",
                     f"{WAHA_URL}/api/chats/{chat_id}/messages?session={instance}&limit=100",
                 ]:
                     try:
@@ -2030,7 +2030,7 @@ async def backfill_instances(body: dict):
     updated = 0
     async with httpx.AsyncClient(timeout=60) as client:
         chats = []
-        for route in [f"{WAHA_URL}/api/chats?session={instance}", f"{WAHA_URL}/api/{instance}/chats"]:
+        for route in [f"{WAHA_URL}/api/{instance}/chats", f"{WAHA_URL}/api/chats?session={instance}"]:
             try:
                 r = await client.get(route, headers=waha_headers(), timeout=15)
                 if r.status_code == 200:
