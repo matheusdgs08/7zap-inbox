@@ -3208,3 +3208,182 @@ async def report_financial_forecast(tenant_id: str):
         "renewals_this_month": forecast,
         "plan_breakdown": {p: sum(1 for f in forecast if f["plan"]==p) for p in plan_prices}
     }
+
+
+# ─── MISSING ENDPOINTS — added by audit ─────────────────────────────────────
+
+# ── /admin/tenants — SuperAdmin tenant management via main app ────────────────
+@app.get("/admin/tenants", dependencies=[Depends(verify_key)])
+async def admin_list_tenants():
+    """List all tenants with user count and MRR info (superadmin use)."""
+    try:
+        rows = supabase.table("tenants").select("id,name,plan,is_blocked,created_at,activated_at,trial_ends_at").order("created_at", desc=True).execute().data or []
+        plan_prices = {"trial": 0, "starter": 149, "pro": 299, "business": 599, "enterprise": 1200}
+        total_mrr = 0
+        result = []
+        for t in rows:
+            users_count = supabase.table("users").select("id", count="exact").eq("tenant_id", t["id"]).execute().count or 0
+            price = plan_prices.get(t.get("plan", "starter"), 0)
+            if not t.get("is_blocked"):
+                total_mrr += price
+            result.append({**t, "user_count": users_count, "mrr": price})
+        return {"tenants": result, "total_mrr": total_mrr}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/tenants", dependencies=[Depends(verify_key)])
+async def admin_create_tenant(body: dict):
+    """Create a new tenant and admin user (superadmin use)."""
+    import secrets, string
+    name = (body.get("name") or "").strip()
+    email = (body.get("email") or "").strip().lower()
+    plan = body.get("plan", "starter")
+    phone = (body.get("phone") or "").replace("+", "").replace(" ", "")
+
+    if not name or not email:
+        raise HTTPException(status_code=400, detail="name and email are required")
+
+    # Check duplicate
+    existing = supabase.table("tenants").select("id").eq("name", name).execute().data
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Tenant '{name}' already exists")
+
+    tid = str(uuid.uuid4())
+    try:
+        supabase.table("tenants").insert({"id": tid, "name": name, "plan": plan,
+            "ai_credits": 0, "ai_credits_limit": 0, "created_at": datetime.utcnow().isoformat()}).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create tenant: {e}")
+
+    # Create admin user
+    alphabet = string.ascii_letters + string.digits
+    temp_pw = "".join(secrets.choice(alphabet) for _ in range(10))
+    uid_val = str(uuid.uuid4())
+    pw_hash = bcrypt.hashpw(temp_pw.encode(), bcrypt.gensalt()).decode()
+    supabase.table("users").insert({"id": uid_val, "tenant_id": tid, "name": name,
+        "email": email, "password_hash": pw_hash, "role": "admin",
+        "created_at": datetime.utcnow().isoformat()}).execute()
+
+    # Generate invite code
+    invite_code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    supabase.table("invite_codes").insert({"code": invite_code, "tenant_id": tid,
+        "created_by": uid_val, "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat()}).execute()
+
+    invite_url = f"https://7zap-inbox-frontend.vercel.app/?invite={invite_code}"
+
+    # Try to send WhatsApp invite
+    whatsapp_sent = False
+    if phone and WAHA_URL:
+        try:
+            msg = (f"Olá! Sua conta no 7zap Inbox foi criada. 🎉\n\n"
+                   f"*Empresa:* {name}\n*Email:* {email}\n*Senha temp:* {temp_pw}\n\n"
+                   f"Acesse: {invite_url}\n\nAlterNe sua senha no primeiro acesso.")
+            r2 = requests.post(f"{WAHA_URL}/api/sendText",
+                headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
+                json={"session": "default", "chatId": f"{phone}@c.us", "text": msg}, timeout=5)
+            whatsapp_sent = r2.status_code == 201
+        except Exception:
+            pass
+
+    return {"ok": True, "tenant_id": tid, "invite_url": invite_url,
+            "temp_password": temp_pw, "whatsapp_sent": whatsapp_sent}
+
+
+@app.put("/admin/tenants/{tenant_id}/plan", dependencies=[Depends(verify_key)])
+async def admin_update_tenant_plan(tenant_id: str, body: dict):
+    plan = body.get("plan", "starter")
+    supabase.table("tenants").update({"plan": plan}).eq("id", tenant_id).execute()
+    return {"ok": True}
+
+
+@app.put("/admin/tenants/{tenant_id}/block", dependencies=[Depends(verify_key)])
+async def admin_block_tenant(tenant_id: str, body: dict):
+    blocked = bool(body.get("blocked", True))
+    supabase.table("tenants").update({"is_blocked": blocked}).eq("id", tenant_id).execute()
+    return {"ok": True}
+
+
+@app.post("/admin/tenants/{tenant_id}/resend-invite", dependencies=[Depends(verify_key)])
+async def admin_resend_invite(tenant_id: str, body: dict):
+    """Generate fresh invite link and optionally send via WhatsApp."""
+    import secrets, string
+    phone = (body.get("phone") or "").replace("+", "").replace(" ", "")
+
+    admin = supabase.table("users").select("id,name").eq("tenant_id", tenant_id).eq("role", "admin").limit(1).execute().data
+    if not admin:
+        raise HTTPException(status_code=404, detail="Tenant admin not found")
+    admin_user = admin[0]
+
+    invite_code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    supabase.table("invite_codes").insert({"code": invite_code, "tenant_id": tenant_id,
+        "created_by": admin_user["id"], "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat()}).execute()
+    invite_url = f"https://7zap-inbox-frontend.vercel.app/?invite={invite_code}"
+
+    whatsapp_sent = False
+    if phone and WAHA_URL:
+        try:
+            msg = f"Seu link de acesso ao 7zap Inbox:\n{invite_url}"
+            r2 = requests.post(f"{WAHA_URL}/api/sendText",
+                headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
+                json={"session": "default", "chatId": f"{phone}@c.us", "text": msg}, timeout=5)
+            whatsapp_sent = r2.status_code == 201
+        except Exception:
+            pass
+
+    return {"ok": True, "invite_url": invite_url, "whatsapp_sent": whatsapp_sent}
+
+
+# ── /contacts/sync-profile-pictures ───────────────────────────────────────────
+@app.post("/contacts/sync-profile-pictures", dependencies=[Depends(verify_key)])
+async def sync_profile_pictures(tenant_id: str):
+    """Batch-sync profile pictures for all contacts of a tenant that haven't been synced yet."""
+    try:
+        contacts = supabase.table("contacts").select("id,phone").eq("tenant_id", tenant_id)\
+            .is_("profile_picture_url", "null").limit(50).execute().data or []
+
+        # Get active instance for tenant
+        inst_row = supabase.table("gateway_instances").select("instance_name").eq("tenant_id", tenant_id)\
+            .eq("status", "connected").limit(1).execute().data
+        if not inst_row:
+            return {"ok": True, "synced": 0, "message": "No connected instance"}
+        instance_name = inst_row[0]["instance_name"]
+
+        synced = 0
+        for c in contacts:
+            phone = c["phone"]
+            clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+            if not clean.startswith("55"):
+                clean = "55" + clean
+            try:
+                r = requests.get(
+                    f"{WAHA_URL}/api/contacts/profile-picture",
+                    params={"session": instance_name, "contactId": f"{clean}@c.us"},
+                    headers={"x-api-key": WAHA_KEY}, timeout=3
+                )
+                if r.status_code == 200:
+                    url = r.json().get("url", "")
+                    if url:
+                        supabase.table("contacts").update(
+                            {"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}
+                        ).eq("id", c["id"]).execute()
+                        synced += 1
+            except Exception:
+                pass
+        return {"ok": True, "synced": synced, "total": len(contacts)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── /conversations/{id}/auto-mode ─────────────────────────────────────────────
+@app.put("/conversations/{conv_id}/auto-mode", dependencies=[Depends(verify_key)])
+async def set_conv_auto_mode(conv_id: str, body: dict):
+    """Enable/disable per-conversation copilot auto-mode."""
+    enabled = bool(body.get("enabled", False))
+    try:
+        supabase.table("conversations").update(
+            {"copilot_auto_mode": enabled, "updated_at": datetime.utcnow().isoformat()}
+        ).eq("id", conv_id).execute()
+        return {"ok": True, "copilot_auto_mode": enabled}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
