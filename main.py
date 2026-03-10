@@ -402,7 +402,7 @@ class UpdateCopilotPrompt(BaseModel):
 
 class CreateBroadcast(BaseModel):
     tenant_id: str; name: str; message: str; interval_min: int = 60; interval_max: int = 120
-    scheduled_at: Optional[str] = None; recipients: List[dict]
+    scheduled_at: Optional[str] = None; recipients: List[dict]; ai_personalize: bool = False
 
 class ScheduledMessageCreate(BaseModel):
     tenant_id: str; conversation_id: Optional[str] = None; contact_name: Optional[str] = None
@@ -1372,9 +1372,9 @@ async def suggest_broadcast_message(body: dict):
 
 @app.post("/broadcasts", dependencies=[Depends(verify_key)])
 async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
-    bcast = supabase.table("broadcasts").insert({"tenant_id": body.tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0}).execute().data[0]
+    bcast = supabase.table("broadcasts").insert({"tenant_id": body.tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0, "ai_personalize": body.ai_personalize}).execute().data[0]
     if body.recipients:
-        supabase.table("broadcast_recipients").insert([{"broadcast_id": bcast["id"], "phone": r["phone"], "name": r.get("name"), "contact_id": r.get("contact_id"), "status": "pending"} for r in body.recipients]).execute()
+        supabase.table("broadcast_recipients").insert([{"broadcast_id": bcast["id"], "phone": r["phone"], "name": r.get("name"), "contact_id": r.get("contact_id"), "conversation_id": r.get("conversation_id"), "status": "pending"} for r in body.recipients]).execute()
     if not body.scheduled_at:
         bg.add_task(run_broadcast, bcast["id"], body.interval_min, body.interval_max)
     return {"broadcast": bcast}
@@ -1388,24 +1388,56 @@ async def cancel_broadcast(broadcast_id: str):
     supabase.table("broadcasts").update({"status": "cancelled"}).eq("id", broadcast_id).execute()
     return {"ok": True}
 
+async def generate_personalized_message(tenant_id: str, conversation_id: str, contact_name: str, contact_phone: str) -> str:
+    """Gera mensagem personalizada via Claude usando histórico + prompt do tenant."""
+    try:
+        # Busca tenant prompt
+        tenant = supabase.table("tenants").select("copilot_prompt, name").eq("id", tenant_id).single().execute().data
+        tenant_prompt = tenant.get("copilot_prompt") or f"Você é um atendente de {tenant.get('name', 'nossa empresa')}. Seja cordial e objetivo."
+        # Busca últimas mensagens da conversa
+        history = []
+        if conversation_id:
+            msgs = supabase.table("messages").select("direction,content,created_at").eq("conversation_id", conversation_id).order("created_at", desc=True).limit(20).execute().data
+            for m in reversed(msgs):
+                role = "Cliente" if m["direction"] == "inbound" else "Atendente"
+                history.append(f"{role}: {m.get('content','')}")
+        hist_text = "\n".join(history) if history else "Sem histórico disponível."
+        system = f"{tenant_prompt}\n\nVocê deve criar uma mensagem de reengajamento curta e personalizada para retomar o contato com este cliente que está inativo há alguns dias. A mensagem deve ser natural, não soar como disparo em massa, e fazer referência ao contexto da última conversa quando possível. Use {'{nome}'} se quiser incluir o nome."
+        user_msg = f"Nome do cliente: {contact_name or 'Cliente'}\nTelefone: {contact_phone}\n\nÚltimas mensagens:\n{hist_text}\n\nGere uma mensagem de reengajamento curta (máx 2 parágrafos) para enviar agora via WhatsApp."
+        msg = await call_ai(system, user_msg, max_tokens=300)
+        return msg.replace("{nome}", contact_name or "").replace("{telefone}", contact_phone or "")
+    except Exception as e:
+        print(f"[AI personalize error] {e}")
+        return f"Olá {contact_name or ''}! Tudo bem? Gostaríamos de retomar nosso contato. 😊"
+
 async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int):
     supabase.table("broadcasts").update({"status": "sending", "started_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
     bcast = supabase.table("broadcasts").select("*").eq("id", broadcast_id).single().execute().data
     recipients = supabase.table("broadcast_recipients").select("*").eq("broadcast_id", broadcast_id).eq("status", "pending").execute().data
+    ai_personalize = bcast.get("ai_personalize", False)
     sent = 0; failed = 0
     for rec in recipients:
-        # Check cancelled every 5 messages (not every message) to reduce DB calls
+        # Check cancelled every 5 messages to reduce DB calls
         if sent % 5 == 0:
             bcast_status = supabase.table("broadcasts").select("status").eq("id", broadcast_id).single().execute().data
             if bcast_status and bcast_status["status"] == "cancelled": break
-        msg = bcast["message"].replace("{nome}", rec.get("name") or "").replace("{telefone}", rec.get("phone") or "")
+        # Generate message: AI personalized or template substitution
+        if ai_personalize:
+            msg = await generate_personalized_message(
+                bcast["tenant_id"],
+                rec.get("conversation_id"),
+                rec.get("name") or "",
+                rec.get("phone") or ""
+            )
+        else:
+            msg = bcast["message"].replace("{nome}", rec.get("name") or "").replace("{telefone}", rec.get("phone") or "")
         ok = False
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(), json={"session": "default", "chatId": f"{rec['phone']}@c.us", "text": msg})
                 ok = r.status_code in [200, 201]
         except: pass
-        supabase.table("broadcast_recipients").update({"status": "sent" if ok else "failed", "sent_at": datetime.utcnow().isoformat() if ok else None}).eq("id", rec["id"]).execute()
+        supabase.table("broadcast_recipients").update({"status": "sent" if ok else "failed", "sent_at": datetime.utcnow().isoformat() if ok else None, "sent_message": msg}).eq("id", rec["id"]).execute()
         if ok: sent += 1
         else: failed += 1
         supabase.table("broadcasts").update({"sent_count": sent, "failed_count": failed}).eq("id", broadcast_id).execute()
