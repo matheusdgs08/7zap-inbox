@@ -3279,9 +3279,10 @@ async def admin_create_tenant(body: dict):
             msg = (f"Olá! Sua conta no 7zap Inbox foi criada. 🎉\n\n"
                    f"*Empresa:* {name}\n*Email:* {email}\n*Senha temp:* {temp_pw}\n\n"
                    f"Acesse: {invite_url}\n\nAlterNe sua senha no primeiro acesso.")
-            r2 = requests.post(f"{WAHA_URL}/api/sendText",
-                headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
-                json={"session": "default", "chatId": f"{phone}@c.us", "text": msg}, timeout=5)
+            async with httpx.AsyncClient(timeout=5) as _hc:
+                r2 = await _hc.post(f"{WAHA_URL}/api/sendText",
+                    headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
+                    json={"session": "default", "chatId": f"{phone}@c.us", "text": msg})
             whatsapp_sent = r2.status_code == 201
         except Exception:
             pass
@@ -3324,9 +3325,10 @@ async def admin_resend_invite(tenant_id: str, body: dict):
     if phone and WAHA_URL:
         try:
             msg = f"Seu link de acesso ao 7zap Inbox:\n{invite_url}"
-            r2 = requests.post(f"{WAHA_URL}/api/sendText",
-                headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
-                json={"session": "default", "chatId": f"{phone}@c.us", "text": msg}, timeout=5)
+            async with httpx.AsyncClient(timeout=5) as _hc:
+                r2 = await _hc.post(f"{WAHA_URL}/api/sendText",
+                    headers={"x-api-key": WAHA_KEY, "Content-Type": "application/json"},
+                    json={"session": "default", "chatId": f"{phone}@c.us", "text": msg})
             whatsapp_sent = r2.status_code == 201
         except Exception:
             pass
@@ -3356,11 +3358,12 @@ async def sync_profile_pictures(tenant_id: str):
             if not clean.startswith("55"):
                 clean = "55" + clean
             try:
-                r = requests.get(
-                    f"{WAHA_URL}/api/contacts/profile-picture",
-                    params={"session": instance_name, "contactId": f"{clean}@c.us"},
-                    headers={"x-api-key": WAHA_KEY}, timeout=3
-                )
+                async with httpx.AsyncClient(timeout=3) as _hc:
+                    r = await _hc.get(
+                        f"{WAHA_URL}/api/contacts/profile-picture",
+                        params={"session": instance_name, "contactId": f"{clean}@c.us"},
+                        headers={"x-api-key": WAHA_KEY}
+                    )
                 if r.status_code == 200:
                     url = r.json().get("url", "")
                     if url:
