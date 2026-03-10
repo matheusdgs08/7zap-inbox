@@ -650,6 +650,27 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
             _preview = (content[:80] if content else "")
             supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": uc, "last_message_preview": _preview}).eq("id", conv_id).execute()
+            # Lazy-sync profile picture if not yet fetched
+            try:
+                _contact_pic = supabase.table("contacts").select("profile_picture_url,last_sync_at").eq("id", contact_id).single().execute().data
+                _needs_pic = not _contact_pic or not _contact_pic.get("profile_picture_url")
+                _stale = _contact_pic and _contact_pic.get("last_sync_at") and (datetime.utcnow() - datetime.fromisoformat(_contact_pic["last_sync_at"].replace("Z",""))).days > 7
+                if (_needs_pic or _stale) and instance_name:
+                    async def _sync_pic(ph=phone, inst=instance_name, cid=contact_id):
+                        try:
+                            clean = "".join(c for c in ph if c.isdigit())
+                            chat_id = f"{clean}@c.us"
+                            async with httpx.AsyncClient(timeout=6) as _c:
+                                _r = await _c.get(f"{WAHA_URL}/api/contacts/profile-picture",
+                                    headers=waha_headers(), params={"session": inst, "contactId": chat_id})
+                                if _r.status_code == 200:
+                                    d = _r.json()
+                                    url = d.get("eurl") or d.get("url") or d.get("profilePictureUrl")
+                                    if url:
+                                        supabase.table("contacts").update({"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}).eq("id", cid).execute()
+                        except: pass
+                    asyncio.create_task(_sync_pic())
+            except: pass
             # Invalida cache para forçar reload no frontend
             cache_del(f"msgs:{conv_id}:latest")  # Força reload imediato no próximo poll (3s)
             # Bust ALL conversation cache keys for this tenant (including per-user keys)
@@ -808,7 +829,7 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
             if u and u.get("role") != "admin" and u.get("allowed_instances"):
                 allowed = u["allowed_instances"]
 
-        q = supabase.table("conversations").select("*, contacts(id,name,phone,tags), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
+        q = supabase.table("conversations").select("*, contacts(id,name,phone,tags,profile_picture_url), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
         if before: q = q.lt("last_message_at", before)
         convs = q.order("last_message_at", desc=True).limit(limit).execute().data
@@ -1283,8 +1304,13 @@ async def get_profile_picture(phone: str, instance: str = "default"):
             )
             if r.status_code == 200:
                 data = r.json()
-                # WAHA retorna {"eurl": "...", "tag": "..."} ou {"url": "..."}
                 url = data.get("eurl") or data.get("url") or data.get("profilePictureUrl")
+                # Persist to DB so next load is instant (no WAHA call)
+                if url and phone:
+                    try:
+                        clean = "".join(c for c in phone if c.isdigit())
+                        supabase.table("contacts").update({"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}).eq("phone", clean).execute()
+                    except: pass
                 return {"url": url}
     except Exception as e:
         print(f"[profile_picture] erro {phone}: {e}")
