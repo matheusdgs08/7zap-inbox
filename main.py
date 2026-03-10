@@ -148,6 +148,7 @@ if INBOX_API_KEY.endswith("_CHANGE_ME"):
     import warnings; warnings.warn("⚠️  INBOX_API_KEY não configurada — usando valor padrão inseguro!")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+MONITOR_PHONE     = os.getenv("MONITOR_PHONE", "")  # ex: 5511940774447 — recebe alertas do sistema
 
 # ── AI HELPER — usa OpenAI GPT-4o Mini (mais barato) com fallback pro Claude ──
 async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = True, timeout: int = 30) -> str:
@@ -299,6 +300,112 @@ async def fix_existing_sessions_webhook():
     except Exception as e:
         print(f"[STARTUP] fix_existing_sessions_webhook error: {e}")
 
+# ── MONITORAMENTO DE SAÚDE DO WAHA ───────────────────────────────────────────
+# Estado interno: rastreia o que já foi alertado pra não spammar
+_monitor_state: dict = {
+    "waha_down": False,       # True se WAHA não responde
+    "sessions_down": set(),   # sessões que estão offline
+    "last_alert_at": {},      # ts do último alerta por chave (anti-spam)
+}
+
+async def _send_monitor_alert(text: str, key: str, cooldown_min: int = 30):
+    """Envia alerta via WhatsApp pro MONITOR_PHONE. Respeita cooldown pra não spammar."""
+    if not MONITOR_PHONE or not WAHA_URL:
+        return
+    now = datetime.utcnow().timestamp()
+    last = _monitor_state["last_alert_at"].get(key, 0)
+    if now - last < cooldown_min * 60:
+        return  # dentro do cooldown, não manda de novo
+    _monitor_state["last_alert_at"][key] = now
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Usa a primeira sessão disponível que esteja WORKING
+            sessions_resp = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+            sessions = sessions_resp.json() if sessions_resp.status_code == 200 else []
+            working = next((s["name"] for s in sessions if s.get("status") == "WORKING"), None)
+            if not working:
+                print(f"[monitor] Não tem sessão WORKING pra enviar alerta: {text}")
+                return
+            await client.post(
+                f"{WAHA_URL}/api/sendText",
+                headers=waha_headers(),
+                json={"session": working, "chatId": f"{MONITOR_PHONE}@c.us", "text": text}
+            )
+            print(f"[monitor] ✅ Alerta enviado para {MONITOR_PHONE}: {text[:60]}")
+    except Exception as e:
+        print(f"[monitor] ❌ Falha ao enviar alerta: {e}")
+
+async def _check_waha_health():
+    """Verifica saúde do WAHA e sessões. Envia alertas se necessário."""
+    if not WAHA_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code}")
+
+        # WAHA respondeu — se estava down, avisa que voltou
+        if _monitor_state["waha_down"]:
+            _monitor_state["waha_down"] = False
+            await _send_monitor_alert(
+                "✅ *7CRM — WAHA voltou!*\n\nServidor WhatsApp respondendo normalmente.",
+                key="waha_up", cooldown_min=5
+            )
+
+        sessions = resp.json() or []
+        current_down = set()
+
+        for s in sessions:
+            name = s.get("name", "")
+            status = s.get("status", "")
+            if status not in ("WORKING", "STARTING"):
+                current_down.add(name)
+
+        # Sessões que ficaram offline agora (não estavam antes)
+        newly_down = current_down - _monitor_state["sessions_down"]
+        # Sessões que voltaram
+        newly_up = _monitor_state["sessions_down"] - current_down
+
+        for name in newly_down:
+            # Tenta pegar o número da sessão pra deixar o alerta mais útil
+            session_info = next((s for s in sessions if s.get("name") == name), {})
+            status = session_info.get("status", "UNKNOWN")
+            me = session_info.get("me", {})
+            phone_display = me.get("pushname") or me.get("id", name) if me else name
+            await _send_monitor_alert(
+                f"🔴 *7CRM — Sessão desconectada!*\n\n"
+                f"Sessão: `{name}`\n"
+                f"Número: {phone_display}\n"
+                f"Status: {status}\n\n"
+                f"Acesse: http://89.167.96.250:3000\n"
+                f"Reconecte escaneando o QR Code.",
+                key=f"session_down_{name}", cooldown_min=60
+            )
+
+        for name in newly_up:
+            await _send_monitor_alert(
+                f"✅ *7CRM — Sessão reconectada!*\n\nSessão `{name}` está WORKING novamente.",
+                key=f"session_up_{name}", cooldown_min=5
+            )
+
+        _monitor_state["sessions_down"] = current_down
+
+    except Exception as e:
+        print(f"[monitor] WAHA não respondeu: {e}")
+        if not _monitor_state["waha_down"]:
+            _monitor_state["waha_down"] = True
+            await _send_monitor_alert(
+                f"🔴 *7CRM — WAHA offline!*\n\n"
+                f"Servidor WhatsApp não está respondendo.\n"
+                f"VPS: 89.167.96.250\n\n"
+                f"Verifique: http://89.167.96.250:3000\n"
+                f"Erro: {str(e)[:100]}",
+                key="waha_down", cooldown_min=30
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def keepalive_loop():
     await asyncio.sleep(15)
     ping_count = 0
@@ -317,6 +424,9 @@ async def keepalive_loop():
                 supabase.table("contacts").select("id").limit(1).execute()
             except:
                 pass
+        # A cada 2 pings (2 min), verifica saúde do WAHA e sessões
+        if ping_count % 2 == 0:
+            asyncio.create_task(_check_waha_health())
 # DISABLED:         # A cada 10 pings (10 min), re-verifica webhooks WAHA
         # ensure_webhooks DESATIVADO - 7gateway relay ja entrega as mensagens.
         # Causa entrega dupla se ativado: WAHA->relay->inbox E WAHA->inbox direto.
@@ -903,12 +1013,12 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         if not contact_id:
             # Try insert
             try:
-            new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data
-        except Exception as _dup:
-            if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
-                new_contact = supabase.table("contacts").select("*").eq("tenant_id", tid).eq("phone", phone).execute().data
-            else:
-                raise
+                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data
+            except Exception as _dup:
+                if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
+                    new_contact = supabase.table("contacts").select("*").eq("tenant_id", tid).eq("phone", phone).execute().data
+                else:
+                    raise
             if new_contact:
                 contact_id = new_contact[0]["id"]
             else:
@@ -2305,13 +2415,13 @@ async def whatsapp_sync(body: dict):
                         supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
                 else:
                     try:
-                    contact_id = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
-                except Exception as _dup:
-                    if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
-                        existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).single().execute().data
-                        contact_id = existing["id"] if existing else None
-                    else:
-                        raise
+                        contact_id = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
+                    except Exception as _dup:
+                        if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
+                            existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).single().execute().data
+                            contact_id = existing["id"] if existing else None
+                        else:
+                            raise
                     stats["contacts_created"] += 1
 
                 # Upsert conversation
