@@ -876,7 +876,7 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 50):
         except: pass
         return list(reversed(data))
     msgs = await run_sync(_fetch)
-    cache_set(cache_key, msgs, ttl=15)  # Baixo TTL — webhook invalida ativamente em ~0ms
+    cache_set(cache_key, msgs, ttl=30)  # Webhook invalida ativamente ao receber msg nova
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
 
@@ -1462,28 +1462,39 @@ async def whatsapp_instances():
 
 @app.get("/whatsapp/tenant-instances", dependencies=[Depends(verify_key)])
 async def whatsapp_tenant_instances(tenant_id: str):
-    """Lista instâncias do tenant com status real-time"""
+    """Lista instâncias do tenant com status real-time — requests paralelos"""
+    # Check cache (30s TTL) to avoid hammering WAHA on every poll
+    cache_key = f"instances:{tenant_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
     plan = tenant.get("plan", "starter")
     max_numbers = PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])["numbers"]
     db_instances = supabase.table("gateway_instances").select("*").eq("tenant_id", tenant_id).order("created_at").execute().data
-    result = []
-    for inst in db_instances:
+
+    async def get_waha_status(inst):
         inst_name = inst.get("instance_name") or inst["id"]
-        live_status = {"connected": False, "phone": ""}
-        if WAHA_URL:
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    r = await client.get(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
-                    if r.status_code == 200:
-                        data = r.json()
-                        connected = data.get("status") == "WORKING"
-                        me = data.get("me") or {}
-                        phone = me.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
-                        live_status = {"connected": connected, "phone": phone}
-            except: pass
-        result.append({**inst, **live_status})
-    return {"instances": result, "max_numbers": max_numbers, "plan": plan}
+        if not WAHA_URL:
+            return {**inst, "connected": False, "phone": inst.get("phone", "")}
+        try:
+            async with httpx.AsyncClient(timeout=4) as client:
+                r = await client.get(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
+                if r.status_code == 200:
+                    data = r.json()
+                    connected = data.get("status") == "WORKING"
+                    me = data.get("me") or {}
+                    phone = me.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
+                    return {**inst, "connected": connected, "phone": phone or inst.get("phone", "")}
+        except: pass
+        return {**inst, "connected": False, "phone": inst.get("phone", "")}
+
+    # Fetch all instances IN PARALLEL
+    result = await asyncio.gather(*[get_waha_status(inst) for inst in db_instances])
+    response = {"instances": list(result), "max_numbers": max_numbers, "plan": plan}
+    cache_set(cache_key, response, ttl=25)  # cache 25s
+    return response
 
 @app.post("/whatsapp/create-instance", dependencies=[Depends(verify_key)])
 async def whatsapp_create_instance(body: dict):
