@@ -1571,6 +1571,8 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
 async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
+    # Invalidate message cache so next poll fetches fresh (including this outbound msg)
+    cache_del(f"msgs:{conv_id}:latest")
     if not body.is_internal_note:
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "last_message_preview": "✓ " + body.text[:78]}).eq("id", conv_id).execute()
         session = conv.get("instance_name") or "default"
