@@ -2615,8 +2615,16 @@ async def whatsapp_sync(body: dict):
             existing_contacts = supabase.table("contacts").select("id,phone,name").eq("tenant_id", tenant_id).limit(50).execute().data or []
             if existing_contacts:
                 # Build fake chat objects from existing contacts so the loop below works
-                chats = [{"id": f"{c['phone']}@c.us", "name": c.get("name",""), "timestamp": 0, "_from_db": True} for c in existing_contacts]
-                print(f"[SYNC] Fallback: syncing {len(chats)} known contacts from DB")
+                # Fallback: only sync contacts that already have a conversation for THIS instance
+                # Do NOT create new conversations for contacts that haven't messaged this instance
+                existing_convs = supabase.table("conversations").select("id,contact_id,contacts(phone,name)").eq("tenant_id", tenant_id).eq("instance_name", instance).execute().data or []
+                chats = []
+                for conv in existing_convs:
+                    phone = (conv.get("contacts") or {}).get("phone", "")
+                    name = (conv.get("contacts") or {}).get("name", "")
+                    if phone:
+                        chats.append({"id": f"{phone}@c.us", "name": name, "timestamp": 0, "_from_db": True})
+                print(f"[SYNC] Fallback: syncing {len(chats)} contacts with existing convs for instance {instance}")
             else:
                 # Truly nothing to work with — try to fetch recent messages directly from WAHA
                 # This handles the case where WAHA has chats but no /api/chats endpoint
