@@ -1445,6 +1445,8 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
             ]:
                 try:
                     r = await client.get(url, headers=waha_headers())
+                    if r.status_code == 400:
+                        break  # NOWEB store not enabled — skip silently, don't crash session
                     if r.status_code == 200:
                         d = r.json()
                         raw = d if isinstance(d, list) else d.get("messages", d.get("data", []))
@@ -2614,6 +2616,8 @@ async def whatsapp_sync(body: dict):
                 ]:
                     try:
                         mr = await client.get(msg_route, headers=waha_headers(), timeout=15)
+                        if mr.status_code == 400:
+                            break  # NOWEB store not enabled — skip silently
                         if mr.status_code == 200:
                             md = mr.json()
                             msgs_data = md if isinstance(md, list) else md.get("messages", md.get("data", []))
