@@ -768,27 +768,42 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
     # Resolve LID to real phone number via WAHA if needed
     if "@lid" in phone and instance_name:
+        lid_raw = phone
         try:
             async with httpx.AsyncClient(timeout=6) as _c:
-                # WAHA Plus: GET /api/contacts?session=X&contactId=Y (with @lid)
-                _r = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
-                                  params={"session": instance_name, "contactId": phone})
+                # Try 1: WAHA v2 path style GET /api/{session}/contacts?contactId=LID
+                _r = await _c.get(f"{WAHA_URL}/api/{instance_name}/contacts",
+                                  headers=waha_headers(), params={"contactId": phone})
+                print(f"[LID_RESOLVE] try1 status={_r.status_code} body={_r.text[:200]}")
+                _resolved = None
                 if _r.status_code == 200:
                     _d = _r.json()
                     if isinstance(_d, list): _d = _d[0] if _d else {}
-                    # Try to get real phone from id field
-                    _real_id = _d.get("id", {})
-                    if isinstance(_real_id, dict):
-                        _real_phone = _real_id.get("user", "") or _real_id.get("_serialized", "")
-                    else:
-                        _real_phone = str(_real_id)
-                    _real_phone = _real_phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
-                    if _real_phone and "@lid" not in _real_phone and _real_phone.replace("+","").replace(" ","").isdigit():
-                        print(f"[LID_RESOLVE] {phone} → {_real_phone}")
-                        phone = _real_phone
-                    elif _d.get("number"):
-                        phone = str(_d["number"])
-                        print(f"[LID_RESOLVE] via number: {phone}")
+                    _rid = _d.get("id", {})
+                    _candidate = (_d.get("number") or _d.get("phone") or
+                                  (_rid.get("user","") if isinstance(_rid,dict) else str(_rid)))
+                    _candidate = str(_candidate).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
+                    if _candidate and _candidate.replace("+","").isdigit(): _resolved = _candidate
+
+                if not _resolved:
+                    # Try 2: original style GET /api/contacts?session=X&contactId=Y
+                    _r2 = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
+                                       params={"session": instance_name, "contactId": phone})
+                    print(f"[LID_RESOLVE] try2 status={_r2.status_code} body={_r2.text[:200]}")
+                    if _r2.status_code == 200:
+                        _d2 = _r2.json()
+                        if isinstance(_d2, list): _d2 = _d2[0] if _d2 else {}
+                        _rid2 = _d2.get("id", {})
+                        _candidate2 = (_d2.get("number") or _d2.get("phone") or
+                                       (_rid2.get("user","") if isinstance(_rid2,dict) else str(_rid2)))
+                        _candidate2 = str(_candidate2).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
+                        if _candidate2 and _candidate2.replace("+","").isdigit(): _resolved = _candidate2
+
+                if _resolved:
+                    print(f"[LID_RESOLVE] {lid_raw} -> {_resolved}")
+                    phone = _resolved
+                else:
+                    print(f"[LID_RESOLVE] could not resolve {lid_raw}, keeping as LID")
         except Exception as _e:
             print(f"[LID_RESOLVE] failed: {_e}")
 
