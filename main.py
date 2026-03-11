@@ -1286,7 +1286,7 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
 async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 10, instance_name: Optional[str] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
     limit = min(limit, 50)
-    cache_key = f"convs:{tenant_id}:{status}:{user_id}:{before or 'first'}"
+    cache_key = f"convs:{tenant_id}:{status}:{user_id}:{instance_name or 'all'}:{before or 'first'}"
 
     # Só usa cache na primeira página (sem cursor)
     if not before:
