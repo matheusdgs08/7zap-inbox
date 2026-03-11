@@ -1387,20 +1387,23 @@ async def sync_contact_names(tenant_id: str):
 
 @app.get("/conversations/{conv_id}/history", dependencies=[Depends(verify_key)])
 async def get_history(conv_id: str, limit: int = 50):
-    """Serve mensagens do DB imediatamente. Dispara sync WAHA em background se necessário."""
+    """Serve mensagens do DB. Se DB vazio, faz sync WAHA síncrono antes de responder."""
     def _fetch_db():
-        # 1. Busca mensagens do DB (rápido — já estão lá via webhook)
         db_msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at", desc=True).limit(limit).execute().data or []
         db_msgs = list(reversed(db_msgs))
         try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
         except: pass
         return db_msgs
 
-    # Serve do DB instantaneamente
     msgs = await run_sync(_fetch_db)
 
-    # Background: sempre busca WAHA em background para garantir mensagens atualizadas
-    asyncio.create_task(_waha_sync_chat_bg(conv_id, limit))
+    if not msgs:
+        # DB vazio — faz sync síncrono do WAHA antes de responder
+        await _waha_sync_chat_bg(conv_id, limit)
+        msgs = await run_sync(_fetch_db)
+    else:
+        # DB tem mensagens — sync em background
+        asyncio.create_task(_waha_sync_chat_bg(conv_id, limit))
 
     return {"messages": msgs, "has_more": len(msgs) == limit}
 
@@ -1460,9 +1463,21 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
                 for i in range(0, len(to_insert), 50):
                     try: supabase.table("messages").insert(to_insert[i:i+50]).execute()
                     except: pass
+                # Update last_message_preview with the most recent message
+                try:
+                    last = sorted(to_insert, key=lambda m: m.get("created_at",""))[-1]
+                    preview = last.get("content","")[:100]
+                    supabase.table("conversations").update({
+                        "last_message_preview": preview,
+                        "last_message_at": last.get("created_at")
+                    }).eq("id", conv_id).execute()
+                except: pass
             await run_sync(_save)
             # Invalidate cache so next poll picks up new messages
             cache_del(f"msgs:{conv_id}:latest")
+            # Clear conversation cache so preview updates on next poll
+            for k in list(_cache.keys()):
+                if k.startswith(f"convs:{conv.get('tenant_id')}"): cache_del(k)
     except Exception as e:
         print(f"[WAHA_BG_SYNC] {conv_id}: {e}")
 
