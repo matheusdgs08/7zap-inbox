@@ -1305,8 +1305,8 @@ async def delete_conversation(conv_id: str):
     return {"ok": True}
 
 @app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
-async def get_messages(conv_id: str, before: str = None, limit: int = 50):
-    limit = min(limit, 100)
+async def get_messages(conv_id: str, before: str = None, limit: int = 10):
+    limit = min(limit, 50)
     cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
     if cached:
