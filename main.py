@@ -702,8 +702,12 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     # Formato WAHA
     if "payload" in payload and isinstance(payload["payload"], dict):
         data = payload["payload"]
-        if data.get("fromMe"): return {"ok": True}
-        raw_from = data.get("from", "")
+        is_from_me = data.get("fromMe", False)
+        # Para mensagens enviadas (fromMe), o contato é o destinatário ("to"), não o remetente ("from")
+        if is_from_me:
+            raw_from = data.get("to") or data.get("chatId") or data.get("from", "")
+        else:
+            raw_from = data.get("from", "")
         if "@g" in raw_from: return {"ok": True}  # ignora grupos
         if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
         contact_name_override = None  # may be set by LID resolver
@@ -753,7 +757,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         push_name = ""  # Evolution API doesn't provide push name easily
         data = payload.get("data", {})
         key = data.get("key", {})
-        if key.get("fromMe"): return {"ok": True}
+        is_from_me = key.get("fromMe", False)
         phone = key.get("remoteJid", "").replace("@s.whatsapp.net", "").replace("@g.us", "")
         if not phone: return {"ok": True}
         if "broadcast" in phone.lower(): return {"ok": True}  # ignora broadcast
@@ -915,7 +919,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 conv_query = conv_query.eq("instance_name", instance_name)
             convs = conv_query.limit(1).execute().data
             if convs:
-                conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + 1
+                conv_id = convs[0]["id"]; uc = (convs[0].get("unread_count") or 0) + (0 if is_from_me else 1)
             else:
                 insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
                 if instance_name:
@@ -952,7 +956,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 msg_insert = {
                     "conversation_id": conv_id,
                     "tenant_id": tid,
-                    "direction": "inbound",
+                    "direction": "outbound" if is_from_me else "inbound",
                     "content": content,
                     "type": stored_type,
                     "waha_id": waha_id or None
@@ -973,7 +977,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 supabase.table("messages").insert({
                     "conversation_id": conv_id,
                     "tenant_id": tid,
-                    "direction": "inbound",
+                    "direction": "outbound" if is_from_me else "inbound",
                     "content": content,
                     "type": "text"
                 }).execute()
@@ -1216,8 +1220,11 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         event = payload.get("event", "")
         if "payload" in payload and isinstance(payload["payload"], dict):
             data = payload["payload"]
-            if data.get("fromMe"): return {"ok": True, "skipped": "fromMe"}
-            raw_from = data.get("from", "")
+            is_from_me = data.get("fromMe", False)
+            if is_from_me:
+                raw_from = data.get("to") or data.get("chatId") or data.get("from", "")
+            else:
+                raw_from = data.get("from", "")
             if "@g" in raw_from: return {"ok": True, "skipped": "group"}
             if "@lid" in raw_from:
                 phone = raw_from
