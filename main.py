@@ -1283,9 +1283,9 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
 
 @app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 10, instance_name: Optional[str] = None):
+async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
-    limit = min(limit, 50)
+    limit = min(limit, 100)
     cache_key = f"convs:{tenant_id}:{status}:{user_id}:{instance_name or 'all'}:{before or 'first'}"
 
     # Só usa cache na primeira página (sem cursor)
