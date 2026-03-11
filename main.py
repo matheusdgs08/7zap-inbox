@@ -427,10 +427,9 @@ async def keepalive_loop():
         # A cada 2 pings (2 min), verifica saúde do WAHA e sessões
         if ping_count % 2 == 0:
             asyncio.create_task(_check_waha_health())
-# DISABLED:         # A cada 10 pings (10 min), re-verifica webhooks WAHA
-        # ensure_webhooks DESATIVADO - 7gateway relay ja entrega as mensagens.
-        # Causa entrega dupla se ativado: WAHA->relay->inbox E WAHA->inbox direto.
-        # if ping_count % 10 == 0: await ensure_webhooks()
+        # A cada 10 pings (10 min), re-verifica webhooks WAHA
+        if ping_count % 10 == 0:
+            asyncio.create_task(ensure_webhooks())
         await asyncio.sleep(60)
 
 async def _startup_sync_names():
@@ -1881,6 +1880,8 @@ async def whatsapp_check_connected(instance: str = "default"):
                 if status == "WORKING":
                     me = data.get("me") or {}
                     phone = me.get("id", "").replace("@c.us", "").replace("@s.whatsapp.net", "")
+                    # Configura webhook imediatamente ao detectar conexão
+                    asyncio.create_task(ensure_webhooks())
                     return {"connected": True, "phone": phone}
         return {"connected": False}
     except:
