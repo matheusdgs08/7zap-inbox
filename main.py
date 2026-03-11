@@ -796,7 +796,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         # Tenant isolation: find tenant via gateway_instance, not loop-all
         tid = None
         if instance_name:
-            inst_row = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).maybe_single().execute().data
+            _rows = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).limit(1).execute().data
+            inst_row = _rows[0] if _rows else None
             if inst_row:
                 tid = inst_row["tenant_id"]
         if not tid:
@@ -1198,7 +1199,8 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         # Test tenant lookup
         tid = None
         if instance_name:
-            inst_row = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).maybe_single().execute().data
+            _rows = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).limit(1).execute().data
+            inst_row = _rows[0] if _rows else None
             if inst_row:
                 tid = inst_row["tenant_id"]
         
@@ -1263,7 +1265,8 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
     def _query():
         allowed = None
         if user_id:
-            u = supabase.table("users").select("allowed_instances,role").eq("id", user_id).maybe_single().execute().data
+            _ur = supabase.table("users").select("allowed_instances,role").eq("id", user_id).limit(1).execute().data
+            u = _ur[0] if _ur else None
             if u and u.get("role") != "admin" and u.get("allowed_instances"):
                 allowed = u["allowed_instances"]
 
@@ -1358,7 +1361,8 @@ async def get_messages(conv_id: str, before: str = None, limit: int = 10):
 @app.get("/users/me/preferences", dependencies=[Depends(verify_key)])
 async def get_user_preferences(user_id: str):
     def _get():
-        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        _up = supabase.table("users").select("preferences").eq("id", user_id).limit(1).execute().data
+        u = _up[0] if _up else None
         return u.get("preferences") or {} if u else {}
     prefs = await run_sync(_get)
     return {"preferences": prefs}
@@ -1366,7 +1370,8 @@ async def get_user_preferences(user_id: str):
 @app.put("/users/me/preferences", dependencies=[Depends(verify_key)])
 async def save_user_preferences(user_id: str, body: dict = Body(...)):
     def _save():
-        u = supabase.table("users").select("preferences").eq("id", user_id).maybe_single().execute().data
+        _up = supabase.table("users").select("preferences").eq("id", user_id).limit(1).execute().data
+        u = _up[0] if _up else None
         current = (u.get("preferences") or {}) if u else {}
         current.update(body)
         supabase.table("users").update({"preferences": current}).eq("id", user_id).execute()
@@ -1451,7 +1456,8 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
     """Background task: busca mensagens do WAHA e salva no DB sem bloquear o cliente."""
     try:
         def _get_conv():
-            return supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).maybe_single().execute().data
+            _cr = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).limit(1).execute().data
+            return _cr[0] if _cr else None
         conv = await run_sync(_get_conv)
         if not conv: return
         phone = (conv.get("contacts") or {}).get("phone", "")
@@ -2756,9 +2762,11 @@ async def backfill_instances(body: dict):
             phone = "".join(c for c in phone_raw if c.isdigit())
             if not phone or len(phone) < 8: continue
             # Find contact then conversation
-            contact = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).maybe_single().execute().data
+            _ctr = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).limit(1).execute().data
+            contact = _ctr[0] if _ctr else None
             if not contact: continue
-            conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact["id"]).maybe_single().execute().data
+            _cvr = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact["id"]).limit(1).execute().data
+            conv = _cvr[0] if _cvr else None
             if not conv: continue
             if not conv.get("instance_name"):
                 supabase.table("conversations").update({"instance_name": instance}).eq("id", conv["id"]).execute()
