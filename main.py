@@ -2825,6 +2825,232 @@ async def backfill_instances(body: dict):
         except: continue
     return {"ok": True, "instance": instance, "chats_checked": len(chats), "updated": updated}
 
+# ── DEEP SYNC — importa TODO histórico do WAHA store página por página ────────
+@app.post("/whatsapp/deep-sync", dependencies=[Depends(verify_key)])
+async def deep_sync(body: dict):
+    """
+    Varre todos os chats do WAHA store e importa TODAS as mensagens para o banco.
+    Busca página por página (100 msgs por vez) até zerar cada chat.
+    Ideal para rodar após reconexão com fullSync.
+    { tenant_id, instance }
+    """
+    tenant_id = body.get("tenant_id")
+    instance  = body.get("instance")
+    if not tenant_id or not instance:
+        raise HTTPException(status_code=400, detail="tenant_id e instance obrigatórios")
+
+    stats = {"chats": 0, "conversations_created": 0, "contacts_created": 0, "messages_saved": 0, "errors": 0}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 1. Buscar todos os chats do store
+        chats = []
+        for route in [
+            f"{WAHA_URL}/api/{instance}/chats?limit=500",
+            f"{WAHA_URL}/api/chats?session={instance}&limit=500",
+        ]:
+            try:
+                r = await client.get(route, headers=waha_headers(), timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
+                    if chats: break
+            except: continue
+
+        if not chats:
+            return {"ok": True, "stats": stats, "message": "Store vazio — fullSync ainda em andamento"}
+
+        stats["chats"] = len(chats)
+
+        def _get_or_create_contact(phone_raw: str, name: str):
+            # Normalize phone
+            if "@lid" in phone_raw:
+                phone = phone_raw  # keep @lid
+            else:
+                phone = phone_raw.replace("@s.whatsapp.net","").replace("@c.us","")
+            existing = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).limit(1).execute().data
+            if existing:
+                return existing[0]["id"], False
+            new_c = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name or phone}).execute().data
+            return new_c[0]["id"], True
+
+        def _get_or_create_conv(contact_id: str):
+            existing = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).eq("contact_id", contact_id).eq("instance_name", instance).limit(1).execute().data
+            if existing:
+                return existing[0]["id"], False
+            new_c = supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "instance_name": instance, "status": "open", "kanban_stage": "new"}).execute().data
+            return new_c[0]["id"], True
+
+        # 2. Para cada chat, buscar mensagens página por página
+        for chat in chats:
+            chat_id = chat.get("id", "")
+            if not chat_id or "@g.us" in chat_id:  # skip grupos
+                continue
+            chat_name = chat.get("name") or chat_id.split("@")[0]
+
+            try:
+                contact_id, c_created = await run_sync(lambda p=chat_id.split("@")[0], n=chat_name: _get_or_create_contact(p, n))
+                if c_created: stats["contacts_created"] += 1
+                conv_id, cv_created = await run_sync(lambda cid=contact_id: _get_or_create_conv(cid))
+                if cv_created: stats["conversations_created"] += 1
+            except Exception as e:
+                stats["errors"] += 1
+                continue
+
+            # Buscar mensagens em páginas de 100
+            last_msg_id = None
+            total_for_chat = 0
+            MAX_PAGES = 50  # máximo 5000 mensagens por chat
+
+            for _ in range(MAX_PAGES):
+                try:
+                    url = f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=100&downloadMedia=false"
+                    if last_msg_id:
+                        url += f"&before={last_msg_id}"
+                    r = await client.get(url, headers=waha_headers(), timeout=30)
+                    if r.status_code != 200: break
+                    raw = r.json()
+                    page_msgs = raw if isinstance(raw, list) else raw.get("messages", raw.get("data", []))
+                    if not page_msgs: break
+
+                    # Get existing waha_ids to dedup
+                    def _get_existing():
+                        return {m["waha_id"] for m in supabase.table("messages").select("waha_id").eq("conversation_id", conv_id).execute().data or [] if m.get("waha_id")}
+                    existing_ids = await run_sync(_get_existing)
+
+                    to_insert = []
+                    for m in page_msgs:
+                        waha_id = m.get("id", "")
+                        if isinstance(waha_id, dict): waha_id = waha_id.get("id", waha_id.get("_serialized", ""))
+                        if waha_id and waha_id in existing_ids: continue
+                        ts = m.get("timestamp", 0)
+                        from_me = m.get("fromMe", False)
+                        body_text = m.get("body") or m.get("text") or ""
+                        if not body_text:
+                            t = m.get("type","")
+                            body_text = "[Imagem]" if "image" in t else "[Áudio]" if "audio" in t or t=="ptt" else "[Vídeo]" if "video" in t else "[Documento]" if "document" in t else "[Mensagem]"
+                        if not body_text: continue
+                        to_insert.append({
+                            "conversation_id": conv_id,
+                            "direction": "outbound" if from_me else "inbound",
+                            "content": body_text,
+                            "type": "text",
+                            "waha_id": waha_id or None,
+                            "created_at": datetime.utcfromtimestamp(ts).isoformat() + "+00:00" if ts else None,
+                        })
+
+                    if to_insert:
+                        def _insert(rows=to_insert):
+                            for i in range(0, len(rows), 50):
+                                try: supabase.table("messages").insert(rows[i:i+50]).execute()
+                                except: pass
+                        await run_sync(_insert)
+                        stats["messages_saved"] += len(to_insert)
+                        total_for_chat += len(to_insert)
+
+                    # Cursor para próxima página
+                    last_item = page_msgs[-1]
+                    last_id = last_item.get("id","")
+                    if isinstance(last_id, dict): last_id = last_id.get("id", last_id.get("_serialized",""))
+                    if last_id == last_msg_id or len(page_msgs) < 100: break
+                    last_msg_id = last_id
+
+                except Exception as e:
+                    stats["errors"] += 1
+                    break
+
+            # Atualizar last_message_at e preview da conversa
+            if total_for_chat > 0:
+                try:
+                    last_msg = supabase.table("messages").select("content,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+                    if last_msg:
+                        supabase.table("conversations").update({
+                            "last_message_at": last_msg[0]["created_at"],
+                            "last_message_preview": last_msg[0]["content"][:100]
+                        }).eq("id", conv_id).execute()
+                except: pass
+
+    return {"ok": True, "stats": stats}
+
+
+# ── RESOLVE LIDs — resolve LIDs para números reais e mescla duplicatas ─────────
+@app.post("/whatsapp/resolve-lids", dependencies=[Depends(verify_key)])
+async def resolve_lids(body: dict):
+    """
+    1. Tenta resolver LIDs para números reais via WAHA store
+    2. Mescla conversas duplicadas do mesmo contato na mesma instância
+    { tenant_id, instance }
+    """
+    tenant_id = body.get("tenant_id")
+    instance  = body.get("instance")
+    if not tenant_id or not instance:
+        raise HTTPException(status_code=400, detail="tenant_id e instance obrigatórios")
+
+    stats = {"lids_resolved": 0, "duplicates_merged": 0, "errors": 0}
+
+    # 1. Buscar contatos com @lid nessa instância
+    def _get_lid_contacts():
+        convs = supabase.table("conversations").select("id,contact_id,contacts(id,phone,name)").eq("tenant_id", tenant_id).eq("instance_name", instance).execute().data or []
+        lid_convs = [c for c in convs if "@lid" in (c.get("contacts") or {}).get("phone","")]
+        return lid_convs
+
+    lid_convs = await run_sync(_get_lid_contacts)
+
+    # 2. Tentar resolver via WAHA contacts store
+    async with httpx.AsyncClient(timeout=30) as client:
+        for conv in lid_convs:
+            contact = conv.get("contacts") or {}
+            lid_phone = contact.get("phone","")
+            lid_digits = lid_phone.replace("@lid","").replace("@c.us","").strip()
+            if not lid_digits: continue
+
+            try:
+                # Tentar buscar o contato pelo LID no WAHA store
+                r = await client.get(f"{WAHA_URL}/api/{instance}/contacts/{lid_digits}@lid", headers=waha_headers(), timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    real_phone = data.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
+                    name = data.get("name") or data.get("pushName") or contact.get("name","")
+                    if real_phone and "@lid" not in real_phone and real_phone != lid_digits:
+                        # Atualizar contato com número real
+                        def _update(cid=contact["id"], phone=real_phone, n=name):
+                            supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
+                        await run_sync(_update)
+                        stats["lids_resolved"] += 1
+            except: pass
+
+    # 3. Mesclar conversas duplicadas (mesmo contact_id + instance_name)
+    def _find_duplicates():
+        convs = supabase.table("conversations").select("id,contact_id,last_message_at,created_at").eq("tenant_id", tenant_id).eq("instance_name", instance).order("last_message_at", desc=True).execute().data or []
+        seen = {}
+        dups = []
+        for c in convs:
+            key = c["contact_id"]
+            if key in seen:
+                dups.append((seen[key], c["id"]))  # (keep_id, merge_id)
+            else:
+                seen[key] = c["id"]
+        return dups
+
+    duplicates = await run_sync(_find_duplicates)
+
+    for keep_id, merge_id in duplicates:
+        try:
+            def _merge(kid=keep_id, mid=merge_id):
+                # Mover mensagens da conversa duplicada para a principal
+                supabase.table("messages").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
+                # Mover tarefas
+                try: supabase.table("tasks").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
+                except: pass
+                # Deletar a duplicata
+                supabase.table("conversations").delete().eq("id", mid).execute()
+            await run_sync(_merge)
+            stats["duplicates_merged"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+
+    return {"ok": True, "stats": stats}
+
+
 # ── AUTH — Recuperação de Senha ───────────────────────────
 @app.post("/auth/forgot-password")
 async def forgot_password(body: dict):
