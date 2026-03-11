@@ -1536,7 +1536,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
                 body = "[Imagem]" if "image" in t else "[Áudio]" if "audio" in t or t=="ptt" else "[Vídeo]" if "video" in t else "[Documento]" if "document" in t else ""
             if not body: continue
             row = {"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound" if from_me else "inbound",
-                   "content": body, "type": "text", "created_at": datetime.utcfromtimestamp(ts).isoformat() if ts else datetime.utcnow().isoformat()}
+                   "content": body, "type": "text", "created_at": (datetime.utcfromtimestamp(ts).isoformat() + "+00:00") if ts else (datetime.utcnow().isoformat() + "+00:00")}
             if waha_id: row["waha_id"] = waha_id
             to_insert.append(row)
         if to_insert:
@@ -2730,7 +2730,7 @@ async def whatsapp_sync(body: dict):
                         # Determine direction
                         from_me = msg.get("fromMe", False) or msg.get("from_me", False)
                         direction = "outbound" if from_me else "inbound"
-                        created_at = datetime.utcfromtimestamp(msg_ts).isoformat() if msg_ts else datetime.utcnow().isoformat()
+                        created_at = (datetime.utcfromtimestamp(msg_ts).isoformat() + "+00:00") if msg_ts else (datetime.utcnow().isoformat() + "+00:00")
 
                         row = {
                             "conversation_id": conv_id,
