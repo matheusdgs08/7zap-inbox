@@ -706,9 +706,23 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         raw_from = data.get("from", "")
         if "@g" in raw_from: return {"ok": True}  # ignora grupos
         if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
-        # Preserve @lid — only strip @c.us and @s.whatsapp.net
+        # NOWEB engine sends LID (@lid) instead of real phone number
+        # Try to extract real phone from other fields first
         if "@lid" in raw_from:
-            phone = raw_from  # keep full JID including @lid
+            # Check if there's a real phone in other payload fields
+            _source = data.get("_data", {}) if isinstance(data.get("_data"), dict) else {}
+            _real_phone = (
+                data.get("from_phone") or
+                data.get("phoneNumber") or
+                _source.get("from", "") or
+                ""
+            )
+            # If we can extract digits from a non-LID field, use it
+            if _real_phone and "@lid" not in _real_phone:
+                phone = _real_phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
+            else:
+                # Keep LID for now — will try to resolve via WAHA /contacts below
+                phone = raw_from  # e.g. "188377416622286@lid"
         else:
             phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
         if not phone: return {"ok": True}
@@ -751,6 +765,32 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
     # Captura session/instance_name do webhook
     instance_name = payload.get("session") or payload.get("instance") or payload.get("instanceName") or ""
+
+    # Resolve LID to real phone number via WAHA if needed
+    if "@lid" in phone and instance_name:
+        try:
+            async with httpx.AsyncClient(timeout=6) as _c:
+                # WAHA Plus: GET /api/contacts?session=X&contactId=Y (with @lid)
+                _r = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
+                                  params={"session": instance_name, "contactId": phone})
+                if _r.status_code == 200:
+                    _d = _r.json()
+                    if isinstance(_d, list): _d = _d[0] if _d else {}
+                    # Try to get real phone from id field
+                    _real_id = _d.get("id", {})
+                    if isinstance(_real_id, dict):
+                        _real_phone = _real_id.get("user", "") or _real_id.get("_serialized", "")
+                    else:
+                        _real_phone = str(_real_id)
+                    _real_phone = _real_phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
+                    if _real_phone and "@lid" not in _real_phone and _real_phone.replace("+","").replace(" ","").isdigit():
+                        print(f"[LID_RESOLVE] {phone} → {_real_phone}")
+                        phone = _real_phone
+                    elif _d.get("number"):
+                        phone = str(_d["number"])
+                        print(f"[LID_RESOLVE] via number: {phone}")
+        except Exception as _e:
+            print(f"[LID_RESOLVE] failed: {_e}")
 
     try:
         # Tenant isolation: find tenant via gateway_instance, not loop-all
