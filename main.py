@@ -665,29 +665,10 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         sess_status = sess_payload.get("status", "") if isinstance(sess_payload, dict) else ""
         sess_name = payload.get("session", "")
 
-        # Auto-reconnect: FAILED ou STOPPED → tenta reconectar após 10s
+        # Auto-reconnect: DISABLED — causa loop STOPPED→RESTART→STOPPED
         if sess_status in ("FAILED", "STOPPED") and sess_name:
-            print(f"[WEBHOOK] session.status {sess_status} para {sess_name} — agendando reconexão automática")
-            async def _auto_reconnect(instance_name=sess_name, status=sess_status):
-                try:
-                    import asyncio as _asyncio
-                    await _asyncio.sleep(10)  # aguarda 10s antes de tentar
-                    # Atualiza status no banco
-                    supabase.table("gateway_instances").update({"status": "disconnected"}).eq("instance_name", instance_name).execute()
-                    if not WAHA_URL:
-                        return
-                    from httpx import AsyncClient as _AsyncClient
-                    async with _AsyncClient(timeout=15) as cl:
-                        # Tenta restart da sessão no WAHA
-                        r = await cl.post(f"{WAHA_URL}/api/sessions/{instance_name}/restart",
-                            headers=waha_headers())
-                        if r.status_code in (200, 201):
-                            print(f"[AUTO-RECONNECT] Sessão {instance_name} reiniciada com sucesso")
-                        else:
-                            print(f"[AUTO-RECONNECT] Restart retornou {r.status_code} para {instance_name}")
-                except Exception as e:
-                    print(f"[AUTO-RECONNECT] Erro ao reconectar {instance_name}: {e}")
-            asyncio.create_task(_auto_reconnect())
+            print(f"[WEBHOOK] session.status {sess_status} para {sess_name} — atualizando banco (sem auto-restart)")
+            supabase.table("gateway_instances").update({"status": "disconnected"}).eq("instance_name", sess_name).execute()
 
         if sess_status == "WORKING" and sess_name:
             print(f"[WEBHOOK] session.status WORKING para {sess_name} — disparando auto-sync")
