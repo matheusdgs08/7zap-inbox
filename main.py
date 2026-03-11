@@ -510,7 +510,7 @@ def verify_key(x_api_key: str = Header(...)):
     if x_api_key != INBOX_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ── MEDIA PROXY ───────────────────────────────────────────
-@app.get("/media/proxy", dependencies=[Depends(verify_key)])
+@app.get("/media/proxy", dependencies=[Depends(get_current_user)])
 async def media_proxy(url: str):
     """Proxy WAHA media through backend (adds auth header, avoids CORS)"""
     from fastapi.responses import Response
