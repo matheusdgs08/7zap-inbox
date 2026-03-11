@@ -234,6 +234,7 @@ async def start_keepalive():
 
 async def ensure_webhooks():
     """Auto-configure webhooks for all active WAHA sessions that are missing it."""
+    return  # DISABLED: PUT to WAHA causes session restart loop
     if not WAHA_URL:
         return
     webhook_url = f"{BACKEND_URL}/webhook/message"
@@ -271,6 +272,7 @@ async def ensure_webhooks():
 
 async def fix_existing_sessions_webhook():
     """Corrige sessoes existentes que ainda usam /webhook/message → /webhook/inbox"""
+    return  # DISABLED: PUT to WAHA causes session restart loop
     if not WAHA_URL:
         return
     try:
