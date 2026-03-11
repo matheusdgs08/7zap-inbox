@@ -706,6 +706,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         raw_from = data.get("from", "")
         if "@g" in raw_from: return {"ok": True}  # ignora grupos
         if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
+        contact_name_override = None  # may be set by LID resolver
         # NOWEB engine sends LID (@lid) instead of real phone number
         # Try to extract real phone from other fields first
         if "@lid" in raw_from:
@@ -799,11 +800,28 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                         _candidate2 = str(_candidate2).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
                         if _candidate2 and _candidate2.replace("+","").isdigit(): _resolved = _candidate2
 
+                # Also capture verifiedName/pushname for contact naming
+                _lid_name = None
+                for _dd in [locals().get("_d2"), locals().get("_d")]:
+                    if isinstance(_dd, dict):
+                        _lid_name = _dd.get("verifiedName") or _dd.get("pushname") or _dd.get("name")
+                        if _lid_name: break
+
                 if _resolved:
-                    print(f"[LID_RESOLVE] {lid_raw} -> {_resolved}")
+                    print(f"[LID_RESOLVE] {lid_raw} -> {_resolved} name={_lid_name}")
                     phone = _resolved
+                    if _lid_name and not contact_name_override:
+                        contact_name_override = _lid_name
                 else:
-                    print(f"[LID_RESOLVE] could not resolve {lid_raw}, keeping as LID")
+                    # Use numeric part of LID as phone (e.g. 196954919301283)
+                    _lid_digits = lid_raw.replace("@lid","").replace("@c.us","").strip()
+                    if _lid_digits.isdigit():
+                        phone = _lid_digits
+                        print(f"[LID_RESOLVE] using digits: {phone} name={_lid_name}")
+                        if _lid_name and not contact_name_override:
+                            contact_name_override = _lid_name
+                    else:
+                        print(f"[LID_RESOLVE] could not resolve {lid_raw}, keeping as LID")
         except Exception as _e:
             print(f"[LID_RESOLVE] failed: {_e}")
 
@@ -833,6 +851,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 # Update name if still set to the raw phone (never got a real name)
                 existing_name = contacts[0].get("name", "")
                 if existing_name == phone or existing_name == "" or (existing_name and "@" in existing_name):
+                    if contact_name_override:
+                        supabase.table("contacts").update({"name": contact_name_override}).eq("id", contact_id).execute()
                     async def _update_name(contact_id=contact_id, phone=phone, instance_name=instance_name):
                         try:
                             if not instance_name: return
@@ -852,7 +872,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             else:
                 # Create contact with phone as placeholder name
                 # Use pushName from payload if available, otherwise fall back to phone
-                initial_name = push_name if (push_name and not push_name.replace("+","").replace(" ","").replace("-","").isdigit()) else phone
+                initial_name = (contact_name_override or push_name) if ((contact_name_override or push_name) and not (contact_name_override or push_name).replace("+","").replace(" ","").replace("-","").isdigit()) else phone
                 try:
                     new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": initial_name}).execute().data[0]
                 except Exception as _dup:
