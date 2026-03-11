@@ -1300,10 +1300,13 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
     def _query():
         allowed = None
         if user_id:
-            _ur = supabase.table("users").select("allowed_instances,role").eq("id", user_id).limit(1).execute().data
-            u = _ur[0] if _ur else None
-            if u and u.get("role") != "admin" and u.get("allowed_instances"):
-                allowed = u["allowed_instances"]
+            try:
+                _ur = supabase.table("users").select("allowed_instances,role").eq("id", user_id).limit(1).execute().data
+                u = _ur[0] if _ur else None
+                if u and u.get("role") != "admin" and u.get("allowed_instances"):
+                    allowed = u["allowed_instances"]
+            except Exception:
+                pass  # allowed_instances column may not exist yet — skip filter
 
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags,profile_picture_url), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
