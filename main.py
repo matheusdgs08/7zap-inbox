@@ -1818,7 +1818,7 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
 # ── TENANT ───────────────────────────────────────────────
 @app.get("/tenant", dependencies=[Depends(verify_key)])
 async def get_tenant(tenant_id: str):
-    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at,kanban_columns").eq("id", tenant_id).single().execute().data
+    tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
     if tenant:
         credits, plan, limit = get_tenant_credits(tenant_id)
         tenant["ai_credits"] = credits
