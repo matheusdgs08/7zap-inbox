@@ -813,11 +813,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                     if _lid_name and not contact_name_override:
                         contact_name_override = _lid_name
                 else:
-                    # Use numeric part of LID as phone (e.g. 196954919301283)
+                    # Use LID as phone (with @lid suffix so send works correctly)
                     _lid_digits = lid_raw.replace("@lid","").replace("@c.us","").strip()
                     if _lid_digits.isdigit():
-                        phone = _lid_digits
-                        print(f"[LID_RESOLVE] using digits: {phone} name={_lid_name}")
+                        phone = f"{_lid_digits}@lid"  # Keep @lid so waha_send_msg uses correct chatId
+                        print(f"[LID_RESOLVE] using lid phone: {phone} name={_lid_name}")
                         if _lid_name and not contact_name_override:
                             contact_name_override = _lid_name
                     else:
@@ -1283,7 +1283,7 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
 
 @app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 10):
+async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 10, instance_name: Optional[str] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
     limit = min(limit, 50)
     cache_key = f"convs:{tenant_id}:{status}:{user_id}:{before or 'first'}"
@@ -1308,6 +1308,7 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
         q = supabase.table("conversations").select("*, contacts(id,name,phone,tags,profile_picture_url), users!assigned_to(id,name,avatar_color)").eq("tenant_id", tenant_id)
         if status and status != "all": q = q.eq("status", status)
         if before: q = q.lt("last_message_at", before)
+        if instance_name: q = q.eq("instance_name", instance_name)
         convs = q.order("last_message_at", desc=True).limit(limit).execute().data
         if not convs:
             return convs
@@ -1756,6 +1757,10 @@ async def update_contact(contact_id: str, body: dict):
             update["name"] = name
     if "notes" in body:
         update["notes"] = body["notes"]
+    if "phone" in body and body["phone"]:
+        update["phone"] = body["phone"].strip()
+    if "tags" in body:
+        update["tags"] = body["tags"]
     if not update:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
     update["updated_at"] = datetime.utcnow().isoformat()
