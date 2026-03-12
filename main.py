@@ -693,12 +693,16 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     if "@g.us" in from_raw:
         return {"ok": True, "skipped": "group"}
 
-    # Limpa o phone — LID não pode ser resolvido no NOWEB, descarta
+    # Limpa o phone — LID: usa os dígitos do LID como identificador temporário
     if "@lid" in from_raw:
-        print(f"[BUBBLE-TRANSLATE] LID ignorado (não resolvível no NOWEB): {from_raw}")
-        return {"ok": True, "skipped": "lid_unresolvable"}
-    
-    phone = from_raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
+        lid_digits = from_raw.replace("@lid", "").strip()
+        phone = lid_digits  # usa LID como phone — melhor chegar do que perder
+        if not notify_name:
+            notify_name = msg.get("notifyName") or msg.get("pushName") or lid_digits
+        print(f"[BUBBLE-TRANSLATE] LID aceito como phone={phone} name={notify_name}")
+    else:
+        phone = from_raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
+
     if not phone:
         return {"ok": False, "reason": "no phone"}
 
