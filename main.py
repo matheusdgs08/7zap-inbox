@@ -653,9 +653,8 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     Usado pela sessão Estudio7 (t98c38c-8d2a2c).
     """
     # Ignora eventos que não são mensagem
-    # Aceita APENAS "message" (inbound) — "message.any" inclui outbound e causaria duplicata
     event_type = payload.get("event", "")
-    if event_type not in ("message",):
+    if event_type not in ("message", "message.any"):
         return {"ok": True, "skipped": event_type}
 
     msg = payload.get("payload", {})
@@ -670,9 +669,20 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     timestamp = msg.get("timestamp", 0)
     session = payload.get("session", "")
 
-    # Ignora mensagens enviadas por nós (fromMe) — só processa inbound
+    # Ignora mensagens enviadas por nós (fromMe)
     if from_me:
         return {"ok": True, "skipped": "fromMe"}
+
+    # Dedup por messageId via Redis (evita processar message + message.any duas vezes)
+    msg_id = msg.get("id", "")
+    if msg_id and redis_client:
+        dedup_key = f"bubble_dedup:{msg_id}"
+        try:
+            if redis_client.get(dedup_key):
+                return {"ok": True, "skipped": "duplicate"}
+            redis_client.setex(dedup_key, 30, "1")  # expira em 30s
+        except Exception:
+            pass  # se Redis falhar, continua sem dedup
 
     # Ignora grupos
     if "@g.us" in from_raw:
