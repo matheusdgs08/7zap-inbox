@@ -791,28 +791,43 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             raw_from = data.get("to") or data.get("chatId") or data.get("from", "")
         else:
             raw_from = data.get("from", "")
-        if "@g" in raw_from: return {"ok": True}  # ignora grupos
         if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
-        contact_name_override = None  # may be set by LID resolver
-        # NOWEB engine sends LID (@lid) instead of real phone number
-        # Try to extract real phone from other fields first
-        if "@lid" in raw_from:
-            # Check if there's a real phone in other payload fields
-            _source = data.get("_data", {}) if isinstance(data.get("_data"), dict) else {}
-            _real_phone = (
-                data.get("from_phone") or
-                data.get("phoneNumber") or
-                _source.get("from", "") or
-                ""
-            )
-            # If we can extract digits from a non-LID field, use it
-            if _real_phone and "@lid" not in _real_phone:
-                phone = _real_phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
-            else:
-                # Keep LID for now — will try to resolve via WAHA /contacts below
-                phone = raw_from  # e.g. "188377416622286@lid"
+
+        # Detecta se é grupo
+        is_group = "@g.us" in raw_from or "@g." in raw_from
+        participant_phone = ""
+        participant_name = ""
+
+        if is_group:
+            # Grupo: phone = ID do grupo (ex: 5511999@g.us → store as "5511999@g.us")
+            phone = raw_from  # mantém @g.us para identificar grupo
+            group_id = raw_from  # chatId para envio
+            # Participante que enviou (campo "author" ou "participant" no WAHA)
+            participant_raw = data.get("author") or data.get("participant") or ""
+            participant_phone = participant_raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
+            participant_name = data.get("notifyName") or data.get("pushName") or participant_phone
         else:
-            phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
+            group_id = ""
+            contact_name_override = None  # may be set by LID resolver
+            # NOWEB engine sends LID (@lid) instead of real phone number
+            # Try to extract real phone from other fields first
+            if "@lid" in raw_from:
+                # Check if there's a real phone in other payload fields
+                _source = data.get("_data", {}) if isinstance(data.get("_data"), dict) else {}
+                _real_phone = (
+                    data.get("from_phone") or
+                    data.get("phoneNumber") or
+                    _source.get("from", "") or
+                    ""
+                )
+                # If we can extract digits from a non-LID field, use it
+                if _real_phone and "@lid" not in _real_phone:
+                    phone = _real_phone.replace("@c.us", "").replace("@s.whatsapp.net", "")
+                else:
+                    # Keep LID for now — will try to resolve via WAHA /contacts below
+                    phone = raw_from  # e.g. "188377416622286@lid"
+            else:
+                phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
         if not phone: return {"ok": True}
         content = data.get("body") or data.get("text") or ""
         msg_type = data.get("type", "chat")
@@ -838,6 +853,9 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     # Formato Evolution API legado
     else:
         push_name = ""  # Evolution API doesn't provide push name easily
+        is_group = False
+        participant_name = ""
+        group_id = ""
         data = payload.get("data", {})
         key = data.get("key", {})
         is_from_me = key.get("fromMe", False)
@@ -1007,6 +1025,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 0}
                 if instance_name:
                     insert_data["instance_name"] = instance_name
+                if is_group:
+                    insert_data["is_group"] = True
                 try:
                     conv = supabase.table("conversations").insert(insert_data).execute().data[0]
                 except Exception:
@@ -1050,6 +1070,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                     msg_insert["media_mimetype"] = media_mimetype
                 if media_filename:
                     msg_insert["media_filename"] = media_filename
+                if is_group and participant_name:
+                    msg_insert["participant_name"] = participant_name
                 supabase.table("messages").insert(msg_insert).execute()
             except Exception as insert_err:
                 err_str = str(insert_err)
@@ -1374,10 +1396,10 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
         return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
 
 @app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None):
+async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None, is_group: Optional[bool] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
     limit = min(limit, 100)
-    cache_key = f"convs:{tenant_id}:{status}:{user_id}:{instance_name or 'all'}:{before or 'first'}"
+    cache_key = f"convs:{tenant_id}:{status}:{user_id}:{instance_name or 'all'}:{before or 'first'}:{is_group}"
 
     # Só usa cache na primeira página (sem cursor)
     if not before:
@@ -1403,6 +1425,8 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
         if status and status != "all": q = q.eq("status", status)
         if before: q = q.lt("last_message_at", before)
         if instance_name: q = q.eq("instance_name", instance_name)
+        if is_group is True: q = q.eq("is_group", True)
+        elif is_group is False: q = q.or_("is_group.is.null,is_group.eq.false")  # normais: null ou false
         convs = q.order("last_message_at", desc=True).limit(limit).execute().data
         if not convs:
             return convs
@@ -2810,8 +2834,8 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
                 except Exception as e:
                     print(f"[DEEP-SYNC] Route {route} failed: {e}")
 
-        # Filtra grupos, @lid (Facebook-linked) e ordena por mais recente
-        chats = [c for c in chats if not (c.get("isGroup") or "@g.us" in str(c.get("id","")) or "@lid" in str(c.get("id","")))]
+        # Filtra apenas @lid (Facebook-linked) — grupos agora são incluídos
+        chats = [c for c in chats if "@lid" not in str(c.get("id",""))]
         chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)
 
         stats = {"chats_total": len(chats), "chats_done": 0,
@@ -2823,10 +2847,23 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
             try:
                 raw_id = chat.get("id", "")
                 phone_raw = raw_id.get("user", "") if isinstance(raw_id, dict) else str(raw_id)
-                phone = "".join(c for c in phone_raw if c.isdigit())
-                if not phone or len(phone) < 8:
+                is_chat_group = (chat.get("isGroup") or "@g.us" in str(raw_id) or
+                                 (isinstance(raw_id, dict) and raw_id.get("server") == "g.us"))
+
+                if is_chat_group:
+                    # Para grupos: phone = "groupid@g.us", chat_id = "groupid@g.us"
+                    if isinstance(raw_id, dict):
+                        group_raw = raw_id.get("user", "") or raw_id.get("_serialized", "")
+                    else:
+                        group_raw = str(raw_id).replace("@g.us", "")
+                    phone = f"{group_raw}@g.us"
+                    chat_id = phone
+                else:
+                    phone = "".join(c for c in phone_raw if c.isdigit())
+                    chat_id = f"{phone}@c.us"
+
+                if not phone or len(phone) < 4:
                     continue
-                chat_id = f"{phone}@c.us"
                 name = chat.get("name") or phone
 
                 # Upsert contact
@@ -2863,6 +2900,8 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
                                 "instance_name": instance}
                     if last_msg_at:
                         conv_row["last_message_at"] = last_msg_at
+                    if is_chat_group:
+                        conv_row["is_group"] = True
                     conv_id = supabase.table("conversations").insert(conv_row).execute().data[0]["id"]
                     stats["conversations_created"] += 1
 
@@ -3090,10 +3129,18 @@ async def whatsapp_sync(body: dict):
                     phone_raw = raw_id.get("user", ""); is_group = raw_id.get("server", "") == "g.us"
                 else:
                     phone_raw = str(raw_id); is_group = "@g.us" in phone_raw
-                if is_group or chat.get("isGroup"): continue
-                phone = "".join(c for c in phone_raw if c.isdigit())
-                if not phone or len(phone) < 8: stats["skipped"] += 1; continue
-                chat_id = f"{phone}@c.us"
+                if is_group or chat.get("isGroup"):
+                    # Grupos: phone = "groupid@g.us"
+                    if isinstance(raw_id, dict):
+                        g_user = raw_id.get("user", "") or raw_id.get("_serialized", "")
+                    else:
+                        g_user = phone_raw.replace("@g.us", "")
+                    phone = f"{g_user}@g.us"
+                    chat_id = phone
+                else:
+                    phone = "".join(c for c in phone_raw if c.isdigit())
+                    chat_id = f"{phone}@c.us"
+                if not phone or len(phone) < 4: stats["skipped"] += 1; continue
                 name = chat.get("name") or phone
 
                 # Upsert contact — always update name if it came from WhatsApp
@@ -3122,7 +3169,10 @@ async def whatsapp_sync(body: dict):
                     if not existing_conv[0].get("instance_name"):
                         supabase.table("conversations").update({"instance_name": instance}).eq("id", conv_id).execute()
                 else:
-                    conv_id = supabase.table("conversations").insert({"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": chat.get("unreadCount", 0), "instance_name": instance}).execute().data[0]["id"]
+                    conv_insert = {"tenant_id": tenant_id, "contact_id": contact_id, "status": "open", "kanban_stage": "new", "unread_count": chat.get("unreadCount", 0), "instance_name": instance}
+                    if is_group or chat.get("isGroup"):
+                        conv_insert["is_group"] = True
+                    conv_id = supabase.table("conversations").insert(conv_insert).execute().data[0]["id"]
                     stats["conversations_created"] += 1
                 last_ts = chat.get("timestamp", 0)
                 if last_ts:
@@ -3235,9 +3285,12 @@ async def backfill_instances(body: dict):
                 phone_raw = raw_id.get("user", ""); is_group = raw_id.get("server", "") == "g.us"
             else:
                 phone_raw = str(raw_id); is_group = "@g.us" in phone_raw
-            if is_group or chat.get("isGroup"): continue
-            phone = "".join(c for c in phone_raw if c.isdigit())
-            if not phone or len(phone) < 8: continue
+            if is_group or chat.get("isGroup"):
+                g_user = phone_raw.replace("@g.us", "") if not isinstance(raw_id, dict) else raw_id.get("user", phone_raw)
+                phone = f"{g_user}@g.us"
+            else:
+                phone = "".join(c for c in phone_raw if c.isdigit())
+            if not phone or len(phone) < 4: continue
             # Find contact then conversation
             _ctr = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).limit(1).execute().data
             contact = _ctr[0] if _ctr else None
