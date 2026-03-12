@@ -1,4 +1,5 @@
 import asyncio
+import random
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body, UploadFile, File, Form, Request
 import concurrent.futures
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
@@ -1704,7 +1705,18 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
             print(f"[AUTOPILOT] Sem créditos: {err}")
             return
 
-        # 7. Gera resposta com IA
+        # 7a. Delay humano: aguarda 2-4 minutos antes de responder
+        delay_secs = random.randint(120, 240)
+        print(f"[AUTOPILOT] Aguardando {delay_secs}s (delay humano) para conv={conv_id[:8]}")
+        await asyncio.sleep(delay_secs)
+
+        # Verifica se não chegou outra mensagem durante o delay (evita resposta duplicada)
+        recent_check = supabase.table("messages").select("id,direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+        if recent_check and recent_check[0].get("direction") == "outbound":
+            print(f"[AUTOPILOT] Mensagem outbound detectada durante delay — abortando para não duplicar")
+            return
+
+        # 7b. Gera resposta com IA
         all_msgs = supabase.table("messages").select(
             "direction,content,is_internal_note,created_at"
         ).eq("conversation_id", conv_id).order("created_at").execute().data
@@ -1713,16 +1725,53 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
         existing_summary = supabase.table("conversations").select("ai_summary").eq("id", conv_id).single().execute().data or {}
         summary = await get_or_generate_summary(conv_id, old_msgs, existing_summary.get("ai_summary"))
 
+        # Transcreve áudios recentes que ainda não foram transcritos
+        audio_msgs_to_transcribe = [m for m in recent_msgs if m.get("type") in ("audio", "ptt") and m.get("direction") == "inbound" and m.get("content", "").startswith("[Áudio")]
+        for amsg in audio_msgs_to_transcribe[:3]:  # máximo 3 áudios por vez
+            try:
+                msg_id = amsg.get("id")
+                media_url = amsg.get("media_url")
+                if media_url:
+                    async with httpx.AsyncClient(timeout=20) as _c:
+                        ar = await _c.get(media_url, headers=waha_headers())
+                        if ar.status_code == 200:
+                            import openai as _oai
+                            _oai_client = _oai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+                            if _oai_client.api_key:
+                                import io
+                                audio_bytes = ar.content
+                                transcript = await _oai_client.audio.transcriptions.create(
+                                    model="whisper-1",
+                                    file=("audio.ogg", io.BytesIO(audio_bytes), "audio/ogg"),
+                                    language="pt"
+                                )
+                                transcribed = transcript.text.strip()
+                                if transcribed:
+                                    # Atualiza conteúdo no histórico local para o contexto da IA
+                                    amsg["content"] = f"[Áudio transcrito: {transcribed}]"
+                                    print(f"[AUTOPILOT] Áudio transcrito: {transcribed[:80]}")
+            except Exception as _ae:
+                print(f"[AUTOPILOT] Erro transcrição áudio: {_ae}")
+
+        # Reconstrói histórico com transcrições
+        history_lines = []
+        for m in recent_msgs:
+            role = "Cliente" if m.get("direction") == "inbound" else "Atendente"
+            c = m.get("content", "")
+            if c and not m.get("is_internal_note"):
+                history_lines.append(f"{role}: {c}")
+        history_str_final = "\n".join(history_lines) if history_lines else history_str
+
         company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or \
             f"Você é atendente da empresa. Seja simpático e objetivo."
-        system = company_prompt + "\n\nResponda a mensagem do cliente de forma natural e breve. Máximo 2 frases. Sem explicações."
+        system = company_prompt + "\n\nResponda a mensagem do cliente de forma natural e breve. Se o cliente fez múltiplas perguntas, responda todas em uma única mensagem. Máximo 3 frases. Sem explicações."
 
         context_parts = []
         if summary:
             context_parts.append(f"[RESUMO]\n{summary}\n[FIM DO RESUMO]")
-        context_parts.append(f"[ÚLTIMAS MENSAGENS]\n{history_str}")
+        context_parts.append(f"[ÚLTIMAS MENSAGENS]\n{history_str_final}")
 
-        reply_text = await call_ai(system, "\n\n".join(context_parts) + "\n\nResponda ao cliente:", max_tokens=200, prefer_openai=False)
+        reply_text = await call_ai(system, "\n\n".join(context_parts) + "\n\nResponda ao cliente:", max_tokens=300, prefer_openai=False)
 
         if not reply_text or not reply_text.strip():
             print(f"[AUTOPILOT] IA retornou resposta vazia")
