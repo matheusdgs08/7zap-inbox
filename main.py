@@ -65,6 +65,34 @@ def cache_del(key):
         except: pass
     _cache.pop(key, None)
 
+# ── Auto-pilot pause helpers ───────────────────────────────────────────────
+# Quando atendente responde manualmente, pausa o auto-pilot da conversa por
+# AUTOPILOT_PAUSE_SECS (default 30min). Usa Redis com TTL para auto-expirar.
+AUTOPILOT_PAUSE_SECS = 1800  # 30 minutos
+
+def autopilot_pause(conv_id: str, secs: int = AUTOPILOT_PAUSE_SECS):
+    """Pausa o auto-pilot para uma conversa por `secs` segundos."""
+    r = _get_redis()
+    if r:
+        try: r.setex(f"7crm:ap_pause:{conv_id}", secs, "1")
+        except: pass
+
+def autopilot_is_paused(conv_id: str) -> bool:
+    """Retorna True se o auto-pilot está pausado para esta conversa."""
+    r = _get_redis()
+    if r:
+        try: return bool(r.exists(f"7crm:ap_pause:{conv_id}"))
+        except: pass
+    return False
+
+def autopilot_resume(conv_id: str):
+    """Remove a pausa manualmente (ex: quando atendente quiser reativar)."""
+    r = _get_redis()
+    if r:
+        try: r.delete(f"7crm:ap_pause:{conv_id}")
+        except: pass
+# ──────────────────────────────────────────────────────────────────────────
+
 def cache_is_stale(key):
     r = _get_redis()
     if r:
@@ -1621,6 +1649,11 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
     # Invalidate message cache so next poll fetches fresh (including this outbound msg)
     cache_del(f"msgs:{conv_id}:latest")
+    # Pausa auto-pilot por 30min quando atendente responde manualmente
+    # (sent_by preenchido = atendente humano; ausente = sistema/auto-pilot)
+    if body.sent_by and not body.is_internal_note:
+        autopilot_pause(conv_id)
+        print(f"[AUTOPILOT] Pausado 30min — atendente {body.sent_by[:8]} respondeu manualmente em conv={conv_id[:8]}")
     if not body.is_internal_note:
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "last_message_preview": "✓ " + body.text[:78]}).eq("id", conv_id).execute()
         session = conv.get("instance_name") or "default"
@@ -1657,6 +1690,11 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
         # 2. Verifica se auto-pilot está pausado NESTA conversa especificamente
         if conv.get("copilot_auto_mode") is False or conv.get("copilot_auto_mode") == "false":
             print(f"[AUTOPILOT] Pausado nesta conversa {conv_id}")
+            return
+
+        # 2b. Verifica pausa temporária (atendente respondeu manualmente nos últimos 30min)
+        if autopilot_is_paused(conv_id):
+            print(f"[AUTOPILOT] Pausa temporária ativa — atendente respondeu recentemente em conv={conv_id[:8]}")
             return
 
         # 3. Busca config da instância (prioridade sobre tenant)
@@ -1869,6 +1907,10 @@ async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(
         "direction": "outbound", "content": display, "type": msg_type,
         "sent_by": sent_by, "is_internal_note": False
     }).execute().data[0]
+    # Pausa auto-pilot por 30min quando atendente envia mídia
+    if sent_by:
+        autopilot_pause(conv_id)
+        print(f"[AUTOPILOT] Pausado 30min — atendente {sent_by[:8]} enviou mídia em conv={conv_id[:8]}")
     supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute()
     session = conv.get("instance_name") or "default"
     phone = conv["contacts"]["phone"]
@@ -4655,15 +4697,37 @@ async def sync_profile_pictures(tenant_id: str):
 # ── /conversations/{id}/auto-mode ─────────────────────────────────────────────
 @app.put("/conversations/{conv_id}/auto-mode", dependencies=[Depends(verify_key)])
 async def set_conv_auto_mode(conv_id: str, body: dict):
-    """Enable/disable per-conversation copilot auto-mode."""
+    """Enable/disable per-conversation copilot auto-mode.
+    enabled=True também remove a pausa temporária do Redis.
+    """
     enabled = bool(body.get("enabled", False))
     try:
         supabase.table("conversations").update(
             {"copilot_auto_mode": enabled, "updated_at": datetime.utcnow().isoformat()}
         ).eq("id", conv_id).execute()
-        return {"ok": True, "copilot_auto_mode": enabled}
+        # Se atendente reativou manualmente → remove pausa temporária
+        if enabled:
+            autopilot_resume(conv_id)
+        return {"ok": True, "copilot_auto_mode": enabled, "paused": False if enabled else autopilot_is_paused(conv_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/conversations/{conv_id}/auto-mode", dependencies=[Depends(verify_key)])
+async def get_conv_auto_mode(conv_id: str):
+    """Retorna status do auto-pilot para uma conversa: modo DB + pausa temporária Redis."""
+    conv = supabase.table("conversations").select("copilot_auto_mode,instance_name").eq("id", conv_id).single().execute().data
+    paused = autopilot_is_paused(conv_id)
+    r = _get_redis()
+    ttl = 0
+    if paused and r:
+        try: ttl = r.ttl(f"7crm:ap_pause:{conv_id}")
+        except: pass
+    return {
+        "copilot_auto_mode": conv.get("copilot_auto_mode"),
+        "paused_by_agent": paused,
+        "pause_ttl_secs": ttl,
+        "pause_ttl_mins": round(ttl / 60) if ttl > 0 else 0,
+    }
 
 
 # ── /tenant/kanban-columns — shared kanban column config ─────────────────────
