@@ -682,11 +682,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                     tenant_id = inst_row[0]["tenant_id"]
                     # Atualiza status da instância para connected
                     supabase.table("gateway_instances").update({"status": "connected"}).eq("instance_name", instance_name).execute()
-                    # Aguarda 60s para WAHA estabilizar e carregar histórico completo
-                    import asyncio as _asyncio
-                    await _asyncio.sleep(60)
-                    # Dispara deep-sync progressivo
-                    print(f"[AUTO-SYNC] Iniciando deep-sync para tenant={tenant_id[:8]} inst={instance_name}")
+                    # ESTÁGIO 1: imediato — busca contatos e conversas (sem mensagens)
+                    print(f"[AUTO-SYNC] Estágio 1 imediato para {instance_name}")
                     asyncio.create_task(_deep_sync_progressive(tenant_id, instance_name))
                     print(f"[AUTO-SYNC] Deep-sync enfileirado para {instance_name}")
                 except Exception as e:
@@ -2684,6 +2681,16 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
                 continue
 
         print(f"[DEEP-SYNC] Estágio 1 concluído: {stats['contacts_created']} contatos, {stats['conversations_created']} conversas")
+
+        # Atualiza Redis: aguardando estágio 2
+        # Usuário já vê todos os contatos no inbox nesse momento ✅
+        rr = _get_redis()
+        if rr:
+            rr.set(sync_key, json.dumps({"stage": 1, **stats, "status": "waiting_messages"}), ex=3600)
+
+        # Aguarda 60s — deixa WAHA estabilizar antes de buscar mensagens
+        print(f"[DEEP-SYNC] Contatos visíveis no inbox. Aguardando 60s para iniciar busca de mensagens...")
+        await asyncio.sleep(60)
 
         # Atualiza Redis: estágio 2 começa
         rr = _get_redis()
