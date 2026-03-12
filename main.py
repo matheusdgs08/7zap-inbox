@@ -2864,7 +2864,17 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
 
                 if not phone or len(phone) < 4:
                     continue
-                name = chat.get("name") or phone
+                name = chat.get("name") or chat.get("subject") or ""
+                # Para grupos sem nome, busca subject via API de grupos
+                if not name and is_chat_group:
+                    try:
+                        async with httpx.AsyncClient(timeout=5) as _gc:
+                            _gr = await _gc.get(f"{WAHA_URL}/api/{instance}/groups/{phone}", headers=waha_headers())
+                            if _gr.status_code == 200 and _gr.text.strip():
+                                name = _gr.json().get("subject", "") or ""
+                    except: pass
+                if not name:
+                    name = phone
 
                 # Upsert contact
                 existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
@@ -3151,7 +3161,15 @@ async def whatsapp_sync(body: dict):
                     phone = "".join(c for c in phone_raw if c.isdigit())
                     chat_id = f"{phone}@c.us"
                 if not phone or len(phone) < 4: stats["skipped"] += 1; continue
-                name = chat.get("name") or phone
+                name = chat.get("name") or chat.get("subject") or ""
+                if not name and (is_group or chat.get("isGroup")):
+                    try:
+                        async with httpx.AsyncClient(timeout=5) as _gc:
+                            _gr = await _gc.get(f"{WAHA_URL}/api/{instance}/groups/{phone}", headers=waha_headers())
+                            if _gr.status_code == 200 and _gr.text.strip():
+                                name = _gr.json().get("subject", "") or ""
+                    except: pass
+                if not name: name = phone
 
                 # Upsert contact — always update name if it came from WhatsApp
                 existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
