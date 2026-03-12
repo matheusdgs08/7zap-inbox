@@ -652,6 +652,9 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     convertido para o formato Z-API que o workflow do Bubble espera.
     Usado pela sessão Estudio7 (t98c38c-8d2a2c).
     """
+    import json as _json
+    print(f"[BUBBLE-TRANSLATE] RAW PAYLOAD: {_json.dumps(payload)[:800]}")
+
     # Ignora eventos que não são mensagem
     event_type = payload.get("event", "")
     if event_type not in ("message", "message.any"):
