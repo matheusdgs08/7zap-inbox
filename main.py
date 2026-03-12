@@ -678,38 +678,12 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     if "@g.us" in from_raw:
         return {"ok": True, "skipped": "group"}
 
-    # Limpa o phone — resolve LID se necessário
+    # Limpa o phone — LID não pode ser resolvido no NOWEB, descarta
     if "@lid" in from_raw:
-        # Tenta resolver LID → telefone real via WAHA
-        try:
-            async with httpx.AsyncClient(timeout=6) as _c:
-                _r = await _c.get(f"{WAHA_URL}/api/contacts",
-                                  headers=waha_headers(),
-                                  params={"session": session, "contactId": from_raw})
-                if _r.status_code == 200 and _r.text.strip():
-                    _d = _r.json()
-                    if isinstance(_d, list): _d = _d[0] if _d else {}
-                    _rid = _d.get("id", {})
-                    _candidate = (_d.get("number") or _d.get("phone") or
-                                  (_rid.get("user","") if isinstance(_rid,dict) else str(_rid)))
-                    _candidate = str(_candidate).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
-                    if _candidate and _candidate.replace("+","").isdigit():
-                        phone = _candidate
-                        if not notify_name:
-                            notify_name = _d.get("pushname") or _d.get("name") or ""
-                    else:
-                        # LID não resolvido — descarta (não mandar número errado pro Bubble)
-                        print(f"[BUBBLE-TRANSLATE] LID não resolvido: {from_raw}, descartando")
-                        return {"ok": True, "skipped": "lid_unresolved"}
-                else:
-                    print(f"[BUBBLE-TRANSLATE] WAHA contacts retornou {_r.status_code} para {from_raw}")
-                    return {"ok": True, "skipped": "lid_unresolved"}
-        except Exception as _e:
-            print(f"[BUBBLE-TRANSLATE] erro ao resolver LID {from_raw}: {_e}")
-            return {"ok": True, "skipped": "lid_error"}
-    else:
-        phone = from_raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
-
+        print(f"[BUBBLE-TRANSLATE] LID ignorado (não resolvível no NOWEB): {from_raw}")
+        return {"ok": True, "skipped": "lid_unresolvable"}
+    
+    phone = from_raw.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
     if not phone:
         return {"ok": False, "reason": "no phone"}
 
