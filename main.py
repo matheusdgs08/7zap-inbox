@@ -4240,11 +4240,14 @@ async def social_login(body: dict):
 # ── RELATÓRIOS / ANALYTICS ────────────────────────────────
 
 @app.get("/reports/messages", dependencies=[Depends(verify_key)])
-async def report_messages(tenant_id: str, days: int = 30):
+async def report_messages(tenant_id: str, days: int = 30, instance_name: str = None):
     """Mensagens por dia e por hora — heatmap"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    # Get conversations for this tenant
-    convs = supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data
+    # Get conversations for this tenant (optionally filtered by instance)
+    q = supabase.table("conversations").select("id").eq("tenant_id", tenant_id)
+    if instance_name:
+        q = q.eq("instance_name", instance_name)
+    convs = q.execute().data
     conv_ids = [c["id"] for c in convs]
     if not conv_ids:
         return {"by_day": [], "by_hour": [], "by_weekday": [], "total": 0}
@@ -4283,11 +4286,14 @@ async def report_messages(tenant_id: str, days: int = 30):
             "total": len(msgs), "inbound": inbound, "outbound": outbound}
 
 @app.get("/reports/agents", dependencies=[Depends(verify_key)])
-async def report_agents(tenant_id: str, days: int = 30):
+async def report_agents(tenant_id: str, days: int = 30, instance_name: str = None):
     """Performance por atendente"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     users = supabase.table("users").select("id,name,email,role").eq("tenant_id", tenant_id).execute().data
-    convs = supabase.table("conversations").select("id,assigned_to,status,created_at,last_message_at").eq("tenant_id", tenant_id).gte("created_at", since).execute().data
+    q = supabase.table("conversations").select("id,assigned_to,status,created_at,last_message_at").eq("tenant_id", tenant_id).gte("created_at", since)
+    if instance_name:
+        q = q.eq("instance_name", instance_name)
+    convs = q.execute().data
     
     agent_map = {u["id"]: {"id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"],
                            "total_convs": 0, "resolved": 0, "active": 0, "msgs_sent": 0} for u in users}
@@ -4313,9 +4319,12 @@ async def report_agents(tenant_id: str, days: int = 30):
     return {"agents": agents_list, "period_days": days}
 
 @app.get("/reports/broadcasts", dependencies=[Depends(verify_key)])
-async def report_broadcasts(tenant_id: str):
+async def report_broadcasts(tenant_id: str, instance_name: str = None):
     """Relatório de disparos — enviados, entregues e ROI (conversas geradas)"""
-    broadcasts = supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20).execute().data
+    q = supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20)
+    if instance_name:
+        q = q.eq("instance_name", instance_name)
+    broadcasts = q.execute().data
     result = []
     for b in broadcasts:
         sent = b.get("total_recipients") or b.get("sent_count") or 0
