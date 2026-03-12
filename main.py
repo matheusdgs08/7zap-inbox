@@ -1655,9 +1655,13 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
                 inst_cfg = _rows[0]
 
         tenant_data = conv.get("tenants") or {}
-        mode = inst_cfg.get("copilot_auto_mode") or tenant_data.get("copilot_auto_mode") or "off"
-        sched_start = inst_cfg.get("copilot_schedule_start") or tenant_data.get("copilot_schedule_start") or "18:00"
-        sched_end   = inst_cfg.get("copilot_schedule_end")   or tenant_data.get("copilot_schedule_end")   or "09:00"
+        # Modo APENAS da instância — NÃO herda do tenant para evitar ativar todas as instâncias
+        # Se a instância não tem config, padrão é "off"
+        mode = inst_cfg.get("copilot_auto_mode") or "off"
+        sched_start = inst_cfg.get("copilot_schedule_start") or "18:00"
+        sched_end   = inst_cfg.get("copilot_schedule_end")   or "09:00"
+        # Prompt: instância primeiro, fallback para tenant
+        company_prompt_override = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt")
 
         # 4. Decide se deve responder baseado no modo
         should_reply = False
