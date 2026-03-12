@@ -1632,6 +1632,7 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
     """Auto-pilot: verifica se deve responder automaticamente e envia via WAHA."""
     try:
         import datetime as _dt
+        print(f"[AUTOPILOT] START conv={conv_id[:8]} instance={instance_name}")
 
         # 1. Busca config da instância e dados da conversa
         conv = supabase.table("conversations").select(
@@ -1685,6 +1686,7 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
             else:
                 should_reply = start_mins <= now_mins < end_mins
 
+        print(f"[AUTOPILOT] conv={conv_id[:8]} instance={instance_name} mode={mode} inst_cfg_mode={inst_cfg.get('copilot_auto_mode')} should_reply={should_reply}")
         if not should_reply:
             print(f"[AUTOPILOT] Modo={mode}, não vai responder agora (schedule fora do horário ou off)")
             return
