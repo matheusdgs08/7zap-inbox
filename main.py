@@ -2452,6 +2452,104 @@ async def onboarding_save_prompt(body: dict, admin=Depends(require_admin)):
     supabase.table("tenants").update({"copilot_prompt": prompt, "onboarding_done": True, "updated_at": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
     return {"ok": True}
 
+@app.post("/onboarding/questionnaire", dependencies=[Depends(verify_key)])
+async def onboarding_questionnaire(body: dict, admin=Depends(require_admin)):
+    """Gera prompt do Co-pilot via questionário guiado — não precisa de histórico de conversas."""
+    tenant_id = body.get("tenant_id")
+    answers = body.get("answers", {})  # dict com as respostas do formulário
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+    if not answers:
+        raise HTTPException(status_code=400, detail="Respostas do questionário são obrigatórias")
+
+    tenant = supabase.table("tenants").select("id, name, plan, ai_credits").eq("id", tenant_id).single().execute().data
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant não encontrado")
+
+    # Questionário consome apenas 50 créditos (muito mais barato que análise de histórico)
+    ok, remaining, err = consume_credit(tenant_id, 50)
+    if not ok:
+        raise HTTPException(status_code=402, detail=f"Créditos insuficientes. {err}")
+
+    # Monta contexto das respostas
+    empresa         = answers.get("empresa", "")
+    segmento        = answers.get("segmento", "")
+    tom             = answers.get("tom", "")
+    produtos        = answers.get("produtos", "")
+    duvidas_comuns  = answers.get("duvidas_comuns", "")
+    regras          = answers.get("regras", "")
+    objetivo        = answers.get("objetivo", "")
+
+    user_prompt = f"""Você é um especialista em atendimento ao cliente e CRM.
+
+Com base nas informações abaixo fornecidas pelo dono da empresa, gere um prompt de sistema completo e detalhado para um Co-pilot de IA que vai sugerir respostas para os atendentes desta empresa no WhatsApp.
+
+INFORMAÇÕES DA EMPRESA:
+- Nome / Segmento: {empresa} — {segmento}
+- Tom de voz desejado: {tom}
+- Produtos / Serviços oferecidos: {produtos}
+- Dúvidas mais comuns dos clientes: {duvidas_comuns}
+- Regras importantes de atendimento: {regras}
+- Principal objetivo do atendimento: {objetivo}
+
+INSTRUÇÕES PARA O PROMPT GERADO:
+1. Escreva na perspectiva de instruções para a IA (ex: "Você é o assistente de atendimento da empresa X...")
+2. Inclua tom de voz, como cumprimentar, como se despedir
+3. Liste os produtos/serviços com detalhes úteis para o atendente
+4. Inclua respostas sugeridas para as dúvidas mais comuns
+5. Deixe claro as regras e limites do atendimento
+6. Instrua a IA a sempre perguntar o nome do cliente se não souber
+7. O prompt deve ser em português brasileiro
+8. Seja específico e prático — o Co-pilot vai usar isso para sugerir respostas reais
+
+PROMPT DO CO-PILOT:"""
+
+    generated_prompt = await call_ai(
+        "Você é especialista em criar prompts de sistema para assistentes de atendimento ao cliente via WhatsApp. Seus prompts são específicos, práticos e em português brasileiro.",
+        user_prompt,
+        max_tokens=2000,
+        timeout=60
+    )
+
+    # Salva o prompt no banco
+    supabase.table("tenants").update({
+        "copilot_prompt": generated_prompt,
+        "onboarding_done": True,
+        "onboarding_last_run": datetime.utcnow().isoformat()
+    }).eq("id", tenant_id).execute()
+
+    # Gera resumo para mostrar ao usuário
+    summary_prompt = f"""Baseado no prompt abaixo, gere um resumo executivo em bullet points para mostrar ao usuário o que a IA vai fazer pelo atendimento dele.
+
+REGRAS:
+- Máximo 5 bullet points curtos
+- Tom positivo e animador
+- NÃO revelar instruções técnicas do prompt
+- Mostre: tom de voz, assuntos que sabe responder, o que a IA vai fazer
+- Formato: "• [item]"
+- Em português
+
+PROMPT:
+{generated_prompt[:1500]}
+
+RESUMO:"""
+
+    summary = await call_ai(
+        "Você cria resumos concisos em bullet points.",
+        summary_prompt,
+        max_tokens=200
+    )
+
+    supabase.table("tenants").update({"copilot_prompt_summary": summary}).eq("id", tenant_id).execute()
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "credits_remaining": remaining
+    }
+
+
 # ── PLAN FEATURES ────────────────────────────────────────
 PLAN_FEATURES = {
     "trial":     {"agents": 3,   "numbers": 1,   "ai_credits": 1000,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
