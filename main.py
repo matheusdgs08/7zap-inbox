@@ -1751,19 +1751,21 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
 async def waha_send_msg(phone: str, text: str, session: str = "default"):
     """Envia mensagem via WAHA — usa session correta da conversa"""
     try:
-        # Normalize phone: if @lid keep as-is, otherwise append @c.us
-        if "@" in phone:
-            chat_id = phone
-        else:
-            chat_id = f"{phone}@c.us"
+        # Normaliza phone: remove @suffix e re-adiciona @c.us
+        phone_clean = phone.split("@")[0] if "@" in phone else phone
+        chat_id = f"{phone_clean}@c.us"
+        payload = {"session": session, "chatId": chat_id, "text": text}
+        print(f"[WAHA_SEND] session={session} chatId={chat_id} textlen={len(text)}")
         async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(
+            r = await client.post(
                 f"{WAHA_URL}/api/sendText",
                 headers=waha_headers(),
-                json={"session": session, "chatId": chat_id, "text": text}
+                json=payload
             )
-    except:
-        pass
+            print(f"[WAHA_SEND] status={r.status_code} body={r.text[:300]}")
+            return r
+    except Exception as _e:
+        print(f"[WAHA_SEND] ERRO: {_e}")
 
 @app.post("/conversations/{conv_id}/media", dependencies=[Depends(verify_key)])
 async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None)):
