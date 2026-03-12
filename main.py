@@ -809,15 +809,15 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                     if _lid_name and not contact_name_override:
                         contact_name_override = _lid_name
                 else:
-                    # Use LID as phone (with @lid suffix so send works correctly)
+                    # Could not resolve LID — store ONLY digits, never @lid in DB
                     _lid_digits = lid_raw.replace("@lid","").replace("@c.us","").strip()
                     if _lid_digits.isdigit():
-                        phone = f"{_lid_digits}@lid"  # Keep @lid so waha_send_msg uses correct chatId
-                        print(f"[LID_RESOLVE] using lid phone: {phone} name={_lid_name}")
+                        phone = _lid_digits  # Clean digits only, no @lid suffix
+                        print(f"[LID_RESOLVE] unresolved, using digits: {phone} name={_lid_name}")
                         if _lid_name and not contact_name_override:
                             contact_name_override = _lid_name
                     else:
-                        print(f"[LID_RESOLVE] could not resolve {lid_raw}, keeping as LID")
+                        print(f"[LID_RESOLVE] could not resolve {lid_raw}, skipping")
         except Exception as _e:
             print(f"[LID_RESOLVE] failed: {_e}")
 
@@ -1219,7 +1219,8 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
                 raw_from = data.get("from", "")
             if "@g" in raw_from: return {"ok": True, "skipped": "group"}
             if "@lid" in raw_from:
-                phone = raw_from
+                phone = raw_from.replace("@lid","").replace("@c.us","").strip()
+                phone = "".join(c for c in phone if c.isdigit())  # digits only
             else:
                 phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
             if not phone: return {"ok": False, "reason": "no phone"}
@@ -2624,8 +2625,8 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
                 except Exception as e:
                     print(f"[DEEP-SYNC] Route {route} failed: {e}")
 
-        # Filtra grupos e ordena por mais recente
-        chats = [c for c in chats if not (c.get("isGroup") or "@g.us" in str(c.get("id","")))]
+        # Filtra grupos, @lid (Facebook-linked) e ordena por mais recente
+        chats = [c for c in chats if not (c.get("isGroup") or "@g.us" in str(c.get("id","")) or "@lid" in str(c.get("id","")))]
         chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)
 
         stats = {"chats_total": len(chats), "chats_done": 0,
