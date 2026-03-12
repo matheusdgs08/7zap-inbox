@@ -1741,8 +1741,24 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
         # 9. Envia via WAHA
         phone = (conv.get("contacts") or {}).get("phone", "")
         if phone and instance_name:
-            await waha_send_msg(phone, reply_text.strip(), instance_name)
-            print(f"[AUTOPILOT] Enviado para {phone} via {instance_name}: {reply_text[:60]}")
+            # Detecta LID: número muito longo (>13 dígitos) = ID interno WhatsApp
+            # NOWEB sem store não consegue entregar para LIDs
+            digits_only = "".join(c for c in str(phone) if c.isdigit())
+            is_lid = len(digits_only) > 13 and not digits_only.startswith("55")
+            if is_lid:
+                print(f"[AUTOPILOT] AVISO: phone={phone} parece ser LID (NOWEB sem store). Mensagem salva no CRM mas pode não chegar. Use WEBJS ou habilite NOWEB store.")
+                # Tenta mesmo assim com @lid — pode funcionar em alguns casos
+                chat_id_lid = f"{digits_only}@lid"
+                try:
+                    async with httpx.AsyncClient(timeout=15) as _c:
+                        _r = await _c.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(),
+                            json={"session": instance_name, "chatId": chat_id_lid, "text": reply_text.strip()})
+                        print(f"[AUTOPILOT] LID send status={_r.status_code} body={_r.text[:200]}")
+                except Exception as _se:
+                    print(f"[AUTOPILOT] LID send erro: {_se}")
+            else:
+                r = await waha_send_msg(phone, reply_text.strip(), instance_name)
+                print(f"[AUTOPILOT] Enviado para {phone} via {instance_name}: {reply_text[:60]}")
 
     except Exception as _e:
         print(f"[AUTOPILOT] Erro: {_e}")
