@@ -750,6 +750,25 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
     # Suporte a ambos formatos: WAHA e Evolution API legado
     event = payload.get("event", "")
 
+    # ── Evento message.reaction — alguém reagiu a uma mensagem ──
+    if event == "message.reaction":
+        try:
+            data = payload.get("payload", {})
+            reaction_val = data.get("reaction", {})
+            reacted_msg_id = reaction_val.get("msgId") if isinstance(reaction_val, dict) else data.get("msgId", "")
+            emoji = (reaction_val.get("reaction") if isinstance(reaction_val, dict) else reaction_val) or ""
+            sender = data.get("from", "") or data.get("participant", "")
+            instance_name = payload.get("session", "")
+            if reacted_msg_id and instance_name:
+                # Atualiza a mensagem no banco pela waha_id
+                row = supabase.table("messages").select("id").eq("waha_id", reacted_msg_id).limit(1).execute().data
+                if row:
+                    supabase.table("messages").update({"reaction": emoji, "reaction_by": sender or "them"}).eq("id", row[0]["id"]).execute()
+                    print(f"[REACTION] {emoji} em {reacted_msg_id} por {sender}")
+        except Exception as e:
+            print(f"[REACTION] erro: {e}")
+        return {"ok": True}
+
     # ── Evento session.status — auto-sync + auto-reconnect ──
     if event == "session.status":
         sess_payload = payload.get("payload", {})
@@ -1800,7 +1819,43 @@ async def mark_conversation_unread(conv_id: str):
     supabase.table("conversations").update({"unread_count": 1}).eq("id", conv_id).execute()
     return {"ok": True}
 
-@app.put("/conversations/{conv_id}/resolve", dependencies=[Depends(verify_key)])
+@app.post("/conversations/{conv_id}/unread", dependencies=[Depends(verify_key)])
+async def mark_conversation_unread(conv_id: str):
+    supabase.table("conversations").update({"unread_count": 1}).eq("id", conv_id).execute()
+    return {"ok": True}
+
+@app.post("/messages/{msg_id}/react", dependencies=[Depends(verify_key)])
+async def react_to_message(msg_id: str, body: dict):
+    """Envia reação a uma mensagem via WAHA. body: {reaction: '👍', tenant_id, conversation_id}"""
+    reaction = body.get("reaction", "")
+    conv_id = body.get("conversation_id")
+    if not conv_id:
+        raise HTTPException(status_code=400, detail="conversation_id obrigatório")
+    # Busca mensagem e conversa
+    msg = supabase.table("messages").select("waha_id").eq("id", msg_id).single().execute().data
+    if not msg or not msg.get("waha_id"):
+        return {"ok": False, "error": "Mensagem sem waha_id — não é possível reagir"}
+    conv = supabase.table("conversations").select("instance_name, contacts(phone)").eq("id", conv_id).single().execute().data
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+    session = conv.get("instance_name") or "default"
+    waha_id = msg["waha_id"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.put(
+                f"{WAHA_URL}/api/reaction",
+                headers=waha_headers(),
+                json={"session": session, "messageId": waha_id, "reaction": reaction}
+            )
+            if r.status_code in (200, 201, 204):
+                # Salva reação no banco para exibir localmente
+                supabase.table("messages").update({"reaction": reaction, "reaction_by": "me"}).eq("id", msg_id).execute()
+                return {"ok": True}
+            return {"ok": False, "error": f"WAHA {r.status_code}: {r.text[:100]}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 async def resolve_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "resolved", "kanban_stage": "resolved", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
