@@ -4289,12 +4289,25 @@ async def report_messages(tenant_id: str, days: int = 30, instance_name: str = N
 async def report_agents(tenant_id: str, days: int = 30, instance_name: str = None):
     """Performance por atendente"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    users = supabase.table("users").select("id,name,email,role").eq("tenant_id", tenant_id).execute().data
+    users = supabase.table("users").select("id,name,email,role,allowed_instances").eq("tenant_id", tenant_id).execute().data
     q = supabase.table("conversations").select("id,assigned_to,status,created_at,last_message_at").eq("tenant_id", tenant_id).gte("created_at", since)
     if instance_name:
         q = q.eq("instance_name", instance_name)
     convs = q.execute().data
-    
+
+    # When filtering by instance, only include users who have access to it
+    # (admin always included; agent included if allowed_instances is empty OR contains this instance)
+    if instance_name:
+        # Get the gateway_instance id for this instance_name
+        inst_row = supabase.table("gateway_instances").select("id").eq("tenant_id", tenant_id).eq("instance_name", instance_name).execute().data
+        inst_id = inst_row[0]["id"] if inst_row else None
+        def has_access(u):
+            if u.get("role") == "admin": return True
+            allowed = u.get("allowed_instances") or []
+            if not allowed: return True  # empty = all instances
+            return (instance_name in allowed) or (inst_id and inst_id in allowed)
+        users = [u for u in users if has_access(u)]
+
     agent_map = {u["id"]: {"id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"],
                            "total_convs": 0, "resolved": 0, "active": 0, "msgs_sent": 0} for u in users}
     
