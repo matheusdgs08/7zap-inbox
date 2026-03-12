@@ -2696,10 +2696,27 @@ async def activate_plan(body: dict, admin=Depends(require_super_admin)):
     return {"ok": True, "plan": plan}
 
 # ── ONBOARDING INTELIGENTE ────────────────────────────────
+@app.get("/onboarding/conv-count", dependencies=[Depends(verify_key)])
+async def onboarding_conv_count(tenant_id: str, instance_name: str = None):
+    """Retorna quantas conversas com conteúdo existem para uma instância — usado para mostrar indicador de qualidade."""
+    try:
+        q = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id)
+        if instance_name:
+            q = q.eq("instance_name", instance_name)
+        result = q.execute()
+        total = result.count or 0
+        # Qualidade: 0% a 100% baseado em 50 conversas
+        quality = min(100, round((total / 50) * 100))
+        label = "Ruim" if quality < 20 else "Básico" if quality < 50 else "Bom" if quality < 80 else "Ótimo"
+        return {"total": total, "quality_pct": quality, "quality_label": label, "target": 50}
+    except Exception as e:
+        return {"total": 0, "quality_pct": 0, "quality_label": "Sem dados", "target": 50}
+
 @app.post("/onboarding/analyze", dependencies=[Depends(verify_key)])
 async def onboarding_analyze(body: dict):
     tenant_id = body.get("tenant_id")
     days = body.get("days", 90)
+    instance_name = body.get("instance_name")  # OBRIGATÓRIO — cada número é independente
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
     tenant = supabase.table("tenants").select("id, name, plan, copilot_prompt, onboarding_last_run").eq("id", tenant_id).single().execute().data
@@ -2710,9 +2727,13 @@ async def onboarding_analyze(body: dict):
     ok, remaining, err = consume_credit(tenant_id, 1000)
     if not ok: raise HTTPException(status_code=402, detail=f"São necessários 1.000 créditos para esta análise. {err}")
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    conversations = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since).limit(conv_limit).execute().data
+    # Filtrar por instância — cada número é independente
+    q = supabase.table("conversations").select("id, contacts(name, phone)").eq("tenant_id", tenant_id).gte("created_at", since)
+    if instance_name:
+        q = q.eq("instance_name", instance_name)
+    conversations = q.limit(conv_limit).execute().data
     if not conversations:
-        raise HTTPException(status_code=404, detail="Nenhuma conversa encontrada no período.")
+        raise HTTPException(status_code=404, detail=f"Nenhuma conversa encontrada{' para este número' if instance_name else ''} nos últimos {days} dias.")
     supabase.table("tenants").update({"onboarding_last_run": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
     all_samples = []
     for conv in conversations[:conv_limit]:
@@ -2741,11 +2762,16 @@ async def onboarding_analyze(body: dict):
         timeout=90
     )
 
-    # Save real prompt to DB (never sent to frontend)
-    supabase.table("tenants").update({
-        "copilot_prompt": generated_prompt,
-        "onboarding_last_run": datetime.utcnow().isoformat()
-    }).eq("id", tenant_id).execute()
+    # Save real prompt to DB — per instance if instance_name provided, otherwise fallback to tenant
+    if instance_name:
+        supabase.table("gateway_instances").update({
+            "copilot_prompt": generated_prompt
+        }).eq("tenant_id", tenant_id).eq("instance_name", instance_name).execute()
+    else:
+        supabase.table("tenants").update({
+            "copilot_prompt": generated_prompt,
+            "onboarding_last_run": datetime.utcnow().isoformat()
+        }).eq("id", tenant_id).execute()
 
     # Generate a summary (shown to user — protects IP)
     summary_prompt = f"""Baseado no prompt abaixo, gere um resumo executivo em bullet points para mostrar ao usuário o que a IA aprendeu sobre o negócio dele.
