@@ -2467,10 +2467,7 @@ async def onboarding_questionnaire(body: dict, admin=Depends(require_admin)):
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant não encontrado")
 
-    # Questionário consome apenas 50 créditos (muito mais barato que análise de histórico)
-    ok, remaining, err = consume_credit(tenant_id, 50)
-    if not ok:
-        raise HTTPException(status_code=402, detail=f"Créditos insuficientes. {err}")
+    # Questionário é gratuito — faz parte do onboarding, não consome créditos
 
     # Monta contexto das respostas
     empresa         = answers.get("empresa", "")
@@ -2545,8 +2542,7 @@ RESUMO:"""
 
     return {
         "ok": True,
-        "summary": summary,
-        "credits_remaining": remaining
+        "summary": summary
     }
 
 
