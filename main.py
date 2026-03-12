@@ -1053,6 +1053,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             keys_to_del = [k for k in list(_cache.keys()) if k.startswith(f"convs:{tid}:")]
             for k in keys_to_del:
                 _cache.pop(k, None)
+
+            # ── AUTO-PILOT: responde automaticamente se modo ativo e mensagem inbound ──
+            if not is_from_me and conv_id and tid:
+                asyncio.create_task(_auto_pilot_reply(conv_id, tid, instance_name))
+
         return {"ok": True}
     except Exception as e:
         import traceback
@@ -1622,6 +1627,122 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
         session = conv.get("instance_name") or "default"
         bg.add_task(waha_send_msg, conv["contacts"]["phone"], body.text, session)
     return {"message": msg}
+
+async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
+    """Auto-pilot: verifica se deve responder automaticamente e envia via WAHA."""
+    try:
+        import datetime as _dt
+
+        # 1. Busca config da instância e dados da conversa
+        conv = supabase.table("conversations").select(
+            "id,status,copilot_auto_mode,contacts(phone),tenants(plan,ai_credits,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end)"
+        ).eq("id", conv_id).single().execute().data
+        if not conv:
+            return
+
+        # 2. Verifica se auto-pilot está pausado NESTA conversa especificamente
+        if conv.get("copilot_auto_mode") is False or conv.get("copilot_auto_mode") == "false":
+            print(f"[AUTOPILOT] Pausado nesta conversa {conv_id}")
+            return
+
+        # 3. Busca config da instância (prioridade sobre tenant)
+        inst_cfg = {}
+        if instance_name:
+            _rows = supabase.table("gateway_instances").select(
+                "copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end"
+            ).eq("instance_name", instance_name).limit(1).execute().data
+            if _rows:
+                inst_cfg = _rows[0]
+
+        tenant_data = conv.get("tenants") or {}
+        mode = inst_cfg.get("copilot_auto_mode") or tenant_data.get("copilot_auto_mode") or "off"
+        sched_start = inst_cfg.get("copilot_schedule_start") or tenant_data.get("copilot_schedule_start") or "18:00"
+        sched_end   = inst_cfg.get("copilot_schedule_end")   or tenant_data.get("copilot_schedule_end")   or "09:00"
+
+        # 4. Decide se deve responder baseado no modo
+        should_reply = False
+        if mode == "always":
+            should_reply = True
+        elif mode == "per_conv":
+            # per_conv: a IA só responde se explicitamente ativada nesta conversa (auto_mode=True)
+            # Como não pausado (checado acima), consideramos ativo por padrão
+            should_reply = True
+        elif mode == "schedule":
+            now = _dt.datetime.utcnow()
+            # Converte para horário de Brasília (UTC-3)
+            now_brt = now - _dt.timedelta(hours=3)
+            sh, sm = map(int, sched_start.split(":"))
+            eh, em = map(int, sched_end.split(":"))
+            now_mins = now_brt.hour * 60 + now_brt.minute
+            start_mins = sh * 60 + sm
+            end_mins   = eh * 60 + em
+            if start_mins > end_mins:  # overnight
+                should_reply = now_mins >= start_mins or now_mins < end_mins
+            else:
+                should_reply = start_mins <= now_mins < end_mins
+
+        if not should_reply:
+            print(f"[AUTOPILOT] Modo={mode}, não vai responder agora (schedule fora do horário ou off)")
+            return
+
+        # 5. Verifica plano (Starter não tem IA)
+        plan = tenant_data.get("plan", "trial")
+        if plan == "starter":
+            print(f"[AUTOPILOT] Plano starter — sem auto-pilot")
+            return
+
+        # 6. Consome crédito
+        ok, remaining, err = consume_credit(tenant_id, 1)
+        if not ok:
+            print(f"[AUTOPILOT] Sem créditos: {err}")
+            return
+
+        # 7. Gera resposta com IA
+        all_msgs = supabase.table("messages").select(
+            "direction,content,is_internal_note,created_at"
+        ).eq("conversation_id", conv_id).order("created_at").execute().data
+
+        history_str, recent_msgs, old_msgs = trim_context(all_msgs, max_msgs=15)
+        existing_summary = supabase.table("conversations").select("ai_summary").eq("id", conv_id).single().execute().data or {}
+        summary = await get_or_generate_summary(conv_id, old_msgs, existing_summary.get("ai_summary"))
+
+        company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or \
+            f"Você é atendente da empresa. Seja simpático e objetivo."
+        system = company_prompt + "\n\nResponda a mensagem do cliente de forma natural e breve. Máximo 2 frases. Sem explicações."
+
+        context_parts = []
+        if summary:
+            context_parts.append(f"[RESUMO]\n{summary}\n[FIM DO RESUMO]")
+        context_parts.append(f"[ÚLTIMAS MENSAGENS]\n{history_str}")
+
+        reply_text = await call_ai(system, "\n\n".join(context_parts) + "\n\nResponda ao cliente:", max_tokens=200, prefer_openai=False)
+
+        if not reply_text or not reply_text.strip():
+            print(f"[AUTOPILOT] IA retornou resposta vazia")
+            return
+
+        # 8. Salva a mensagem no banco
+        msg_row = supabase.table("messages").insert({
+            "conversation_id": conv_id,
+            "tenant_id": tenant_id,
+            "direction": "outbound",
+            "content": reply_text.strip(),
+            "type": "text",
+        }).execute().data
+        supabase.table("conversations").update({
+            "last_message_at": datetime.utcnow().isoformat(),
+            "last_message_preview": "✓ " + reply_text.strip()[:78],
+        }).eq("id", conv_id).execute()
+
+        # 9. Envia via WAHA
+        phone = (conv.get("contacts") or {}).get("phone", "")
+        if phone and instance_name:
+            await waha_send_msg(phone, reply_text.strip(), instance_name)
+            print(f"[AUTOPILOT] Enviado para {phone} via {instance_name}: {reply_text[:60]}")
+
+    except Exception as _e:
+        print(f"[AUTOPILOT] Erro: {_e}")
+
 
 async def waha_send_msg(phone: str, text: str, session: str = "default"):
     """Envia mensagem via WAHA — usa session correta da conversa"""
