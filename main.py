@@ -2163,20 +2163,19 @@ async def buy_credits(body: dict):
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
-    """Salva config de IA por instância. Fallback: salva no tenant (legado)."""
+    """Salva config de IA — SEMPRE por instância. Sem fallback para tenant."""
+    if not body.instance_name:
+        raise HTTPException(400, "instance_name obrigatório — cada configuração é por número")
     update_data = {
         "copilot_auto_mode": body.copilot_auto_mode,
         "copilot_schedule_start": body.copilot_schedule_start,
         "copilot_schedule_end": body.copilot_schedule_end,
     }
-    if body.copilot_prompt:
+    if body.copilot_prompt is not None:
         update_data["copilot_prompt"] = body.copilot_prompt
-    if body.instance_name:
-        res = supabase.table("gateway_instances").update(update_data).eq("instance_name", body.instance_name).eq("tenant_id", body.tenant_id).execute()
-        return {"ok": True, "saved_to": "instance", "instance": body.instance_name}
-    else:
-        res = supabase.table("tenants").update({**update_data, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
-        return {"ok": True, "saved_to": "tenant"}
+    res = supabase.table("gateway_instances").update(update_data).eq("instance_name", body.instance_name).eq("tenant_id", body.tenant_id).execute()
+    print(f"[CONFIG_IA] Salvo instance={body.instance_name} mode={body.copilot_auto_mode}")
+    return {"ok": True, "saved_to": "instance", "instance": body.instance_name}
 
 @app.get("/whatsapp/instance-config", dependencies=[Depends(verify_key)])
 async def get_instance_config(tenant_id: str, instance_name: str):
