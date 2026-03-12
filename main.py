@@ -1373,22 +1373,22 @@ async def list_conversations(tenant_id: str, status: Optional[str] = None, user_
             # Include convs with null instance_name — legacy rows before multi-instance tracking
             convs = [c for c in convs if not c.get("instance_name") or c.get("instance_name") in allowed_names]
 
-        # Labels em paralelo via ThreadPool (last_message_preview já está na tabela conversations)
+        # Labels: lê direto do array conversations.labels[] + busca detalhes da tabela labels
         conv_ids = [c["id"] for c in convs]
-        if conv_ids:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                f_cl = pool.submit(lambda: supabase.table("conversation_labels").select("conversation_id,label_id").in_("conversation_id", conv_ids).execute().data)
-                f_lb = pool.submit(lambda: {lb["id"]: lb for lb in supabase.table("labels").select("id,name,color").eq("tenant_id", tenant_id).execute().data})
-                all_cl = f_cl.result()
-                label_details = f_lb.result()
-        else:
-            all_cl = []
-            label_details = {}
-        cl_map: dict = {}
-        for row in all_cl:
-            cl_map.setdefault(row["conversation_id"], []).append(row["label_id"])
+        # Coletar todos os label_ids únicos usados nas convs
+        all_label_ids = set()
         for c in convs:
-            c["labels"] = [label_details[lid] for lid in cl_map.get(c["id"], []) if lid in label_details]
+            for lid in (c.get("labels") or []):
+                all_label_ids.add(lid)
+        # Buscar detalhes dos labels (nome, cor)
+        label_details = {}
+        if all_label_ids:
+            lb_rows = supabase.table("labels").select("id,name,color").eq("tenant_id", tenant_id).execute().data
+            label_details = {lb["id"]: lb for lb in lb_rows}
+        # Montar labels enriquecidos para cada conversa
+        for c in convs:
+            raw_ids = c.get("labels") or []
+            c["labels"] = [label_details[lid] for lid in raw_ids if lid in label_details]
         return convs
 
     convs = await run_sync(_query)
@@ -1409,9 +1409,6 @@ async def delete_conversation(conv_id: str):
     """Delete a conversation and all its messages/tasks."""
     try:
         supabase.table("tasks").delete().eq("conversation_id", conv_id).execute()
-    except: pass
-    try:
-        supabase.table("conversation_labels").delete().eq("conversation_id", conv_id).execute()
     except: pass
     try:
         supabase.table("messages").delete().eq("conversation_id", conv_id).execute()
@@ -1988,11 +1985,13 @@ async def pending_conversation(conv_id: str):
 
 @app.put("/conversations/{conv_id}/labels", dependencies=[Depends(verify_key)])
 async def update_conversation_labels(conv_id: str, body: UpdateLabels):
-    # 1. Update conversation_labels table
-    supabase.table("conversation_labels").delete().eq("conversation_id", conv_id).execute()
-    if body.label_ids:
-        supabase.table("conversation_labels").insert([{"conversation_id": conv_id, "label_id": lid} for lid in body.label_ids]).execute()
-    # 2. Sync label names to contact.tags so label follows the phone number
+    # Salva label_ids direto no array conversations.labels[]
+    supabase.table("conversations").update({"labels": body.label_ids or []}).eq("id", conv_id).execute()
+    # Invalidar cache
+    for key in [f"convs:{conv_id}", "convs:*"]:
+        try: cache_del(key)
+        except: pass
+    # Sync label names to contact.tags so label follows the phone number
     try:
         conv = supabase.table("conversations").select("contact_id").eq("id", conv_id).single().execute().data
         if conv and body.label_ids:
@@ -2031,7 +2030,15 @@ async def update_label(label_id: str, body: dict):
 @app.delete("/labels/{label_id}", dependencies=[Depends(verify_key)])
 async def delete_label(label_id: str):
     # Remove from all conversations first
-    try: supabase.table("conversation_labels").delete().eq("label_id", label_id).execute()
+    # Remove o label_id do array labels[] de todas as conversas do tenant
+    try:
+        all_convs = supabase.table("conversations").select("id,labels").eq("tenant_id", body.get("tenant_id","")).execute().data
+        for c in all_convs:
+            raw = c.get("labels") or []
+            if label_id in raw:
+                supabase.table("conversations").update({"labels": [l for l in raw if l != label_id]}).eq("id", c["id"]).execute()
+    except Exception as e:
+        print(f"cleanup label from convs err: {e}")
     except: pass
     supabase.table("labels").delete().eq("id", label_id).execute()
     return {"ok": True}
@@ -2492,7 +2499,7 @@ async def whatsapp_delete_instance(body: dict):
                 except Exception as e: print(f"delete tasks err: {e}")
                 try: supabase.table("messages").delete().in_("conversation_id", conv_ids).execute()
                 except Exception as e: print(f"delete messages err: {e}")
-                try: supabase.table("conversation_labels").delete().in_("conversation_id", conv_ids).execute()
+                # labels agora são array na tabela conversations — não há conversation_labels
                 except Exception: pass
                 try: supabase.table("conversations").delete().in_("id", conv_ids).execute()
                 except Exception as e: print(f"delete convs err: {e}")
@@ -2535,7 +2542,7 @@ async def reset_tenant(body: dict, admin=Depends(require_super_admin)):
                 except Exception as e: results[f"msg_del_{i}"] = str(e)
                 try: supabase.table("tasks").delete().in_("conversation_id", chunk).execute()
                 except Exception: pass
-                try: supabase.table("conversation_labels").delete().in_("conversation_id", chunk).execute()
+                # labels agora são array na tabela conversations — não há conversation_labels
                 except Exception: pass
                 try: supabase.table("conversations").delete().in_("id", chunk).execute()
                 except Exception as e: results[f"conv_del_{i}"] = str(e)
