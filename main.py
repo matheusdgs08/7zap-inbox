@@ -2115,13 +2115,18 @@ async def whatsapp_create_instance(body: dict):
                 # Verificar se sessão já existe no WAHA antes de criar (evita duplicatas)
                 check = await client.get(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
                 if check.status_code != 200:
-                    # Criar sessão nova — sempre usar /webhook/inbox
+                    # Criar sessão nova — Store + FullSync habilitados por padrão
                     await client.post(f"{WAHA_URL}/api/sessions", headers=waha_headers(),
-                        json={"name": inst_name, "config": {"webhooks": [{
-                            "url": f"{BACKEND_URL}/webhook/inbox",
-                            "events": ["message", "message.any", "session.status"],
-                            "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
-                        }]}})
+                        json={"name": inst_name, "config": {
+                            "noweb": {
+                                "store": {"enabled": True, "fullSync": True}
+                            },
+                            "webhooks": [{
+                                "url": f"{BACKEND_URL}/webhook/inbox",
+                                "events": ["message", "message.any", "session.status"],
+                                "customHeaders": [{"name": "x-api-key", "value": WEBHOOK_SECRET}]
+                            }]
+                        }})
                     print(f"[CREATE-INSTANCE] Sessao {inst_name} criada no WAHA")
                 else:
                     print(f"[CREATE-INSTANCE] Sessao {inst_name} ja existe no WAHA, reutilizando")
@@ -2688,9 +2693,9 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
         if rr:
             rr.set(sync_key, json.dumps({"stage": 1, **stats, "status": "waiting_messages"}), ex=3600)
 
-        # Aguarda 60s — deixa WAHA estabilizar antes de buscar mensagens
-        print(f"[DEEP-SYNC] Contatos visíveis no inbox. Aguardando 60s para iniciar busca de mensagens...")
-        await asyncio.sleep(60)
+        # Aguarda 10s — deixa WAHA estabilizar antes de buscar mensagens
+        print(f"[DEEP-SYNC] Contatos visíveis no inbox. Aguardando 10s para iniciar busca de mensagens...")
+        await asyncio.sleep(10)
 
         # Atualiza Redis: estágio 2 começa
         rr = _get_redis()
