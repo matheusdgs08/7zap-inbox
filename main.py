@@ -1627,7 +1627,21 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
     if not body.is_internal_note:
         supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "last_message_preview": "✓ " + body.text[:78]}).eq("id", conv_id).execute()
         session = conv.get("instance_name") or "default"
-        bg.add_task(waha_send_msg, conv["contacts"]["phone"], body.text, session)
+        phone_raw = (conv.get("contacts") or {}).get("phone", "")
+        digits_only = "".join(c for c in str(phone_raw) if c.isdigit())
+        # LID: número > 13 dígitos não-BR = usa @lid, senão @c.us normal
+        if len(digits_only) > 13 and not digits_only.startswith("55"):
+            async def _send_lid(p=digits_only, t=body.text, s=session):
+                try:
+                    async with httpx.AsyncClient(timeout=15) as _c:
+                        r = await _c.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(),
+                            json={"session": s, "chatId": f"{p}@lid", "text": t})
+                        print(f"[SEND_MANUAL] LID status={r.status_code}")
+                except Exception as e:
+                    print(f"[SEND_MANUAL] LID erro: {e}")
+            bg.add_task(_send_lid)
+        else:
+            bg.add_task(waha_send_msg, phone_raw, body.text, session)
     return {"message": msg}
 
 async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
