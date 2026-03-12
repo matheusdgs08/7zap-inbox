@@ -3041,6 +3041,16 @@ async def deep_sync_status(tenant_id: str, instance: str = "default", user=Depen
         return {"status": "error", "error": str(e)}
 
 
+@app.post("/whatsapp/trigger-deep-sync", dependencies=[Depends(verify_key)])
+async def trigger_deep_sync_bg(body: dict):
+    """Dispara deep sync progressivo como background task — retorna imediatamente."""
+    tenant_id = body.get("tenant_id")
+    instance  = body.get("instance_name") or body.get("instance", "default")
+    if not tenant_id or not instance:
+        raise HTTPException(status_code=400, detail="tenant_id e instance obrigatórios")
+    asyncio.create_task(_deep_sync_progressive(tenant_id, instance))
+    return {"ok": True, "message": f"Deep sync enfileirado para {instance}"}
+
 @app.post("/whatsapp/sync", dependencies=[Depends(verify_key)])
 async def whatsapp_sync(body: dict):
     tenant_id = body.get("tenant_id")
