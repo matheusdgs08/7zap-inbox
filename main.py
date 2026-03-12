@@ -569,11 +569,12 @@ class CreateQuickReply(BaseModel):
     title: str; content: str
 
 class UpdateCopilotPrompt(BaseModel):
-    tenant_id: str; copilot_prompt: str
+    tenant_id: str
+    instance_name: str  # obrigatório — config sempre por instância
+    copilot_prompt: Optional[str] = None
     copilot_auto_mode: str = "off"
     copilot_schedule_start: str = "18:00"
     copilot_schedule_end: str = "09:00"
-    instance_name: Optional[str] = None
 
 class CreateBroadcast(BaseModel):
     tenant_id: str; name: str; message: str; interval_min: int = 60; interval_max: int = 120
