@@ -653,8 +653,9 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     Usado pela sessão Estudio7 (t98c38c-8d2a2c).
     """
     # Ignora eventos que não são mensagem
+    # Aceita APENAS "message" (inbound) — "message.any" inclui outbound e causaria duplicata
     event_type = payload.get("event", "")
-    if event_type not in ("message", "message.any"):
+    if event_type not in ("message",):
         return {"ok": True, "skipped": event_type}
 
     msg = payload.get("payload", {})
@@ -668,6 +669,10 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
     notify_name = msg.get("notifyName") or msg.get("pushName") or ""
     timestamp = msg.get("timestamp", 0)
     session = payload.get("session", "")
+
+    # Ignora mensagens enviadas por nós (fromMe) — só processa inbound
+    if from_me:
+        return {"ok": True, "skipped": "fromMe"}
 
     # Ignora grupos
     if "@g.us" in from_raw:
