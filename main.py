@@ -573,6 +573,7 @@ class UpdateCopilotPrompt(BaseModel):
     copilot_auto_mode: str = "off"
     copilot_schedule_start: str = "18:00"
     copilot_schedule_end: str = "09:00"
+    instance_name: Optional[str] = None
 
 class CreateBroadcast(BaseModel):
     tenant_id: str; name: str; message: str; interval_min: int = 60; interval_max: int = 120
@@ -1954,7 +1955,7 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
     # Busca todas as mensagens + dados da conversa/tenant
     all_msgs = supabase.table("messages")         .select("direction,content,is_internal_note,created_at")         .eq("conversation_id", conv_id)         .order("created_at").execute().data
 
-    conv = supabase.table("conversations")         .select("ai_summary, tenant_id, tenants(copilot_prompt, name)")         .eq("id", conv_id).single().execute().data
+    conv = supabase.table("conversations")         .select("ai_summary, tenant_id, instance_name, tenants(copilot_prompt, name)")         .eq("id", conv_id).single().execute().data
 
     # Divide em recentes (últimas 15) e antigas
     history_str, recent_msgs, old_msgs = trim_context(all_msgs, max_msgs=15)
@@ -1963,9 +1964,14 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
     existing_summary = conv.get("ai_summary")
     summary = await get_or_generate_summary(conv_id, old_msgs, existing_summary)
 
-    # Monta system prompt
-    tenant_data   = conv.get("tenants") or {}
-    company_prompt = tenant_data.get("copilot_prompt") or         f"Você é atendente da empresa {tenant_data.get('name', '')}. Seja simpático e objetivo."
+    # Monta system prompt — prioridade: instância > tenant > fallback
+    tenant_data = conv.get("tenants") or {}
+    instance_prompt = None
+    if conv.get("instance_name"):
+        inst_row = supabase.table("gateway_instances").select("copilot_prompt").eq("instance_name", conv["instance_name"]).limit(1).execute().data
+        if inst_row:
+            instance_prompt = inst_row[0].get("copilot_prompt")
+    company_prompt = instance_prompt or tenant_data.get("copilot_prompt") or         f"Você é atendente da empresa {tenant_data.get('name', '')}. Seja simpático e objetivo."
 
     system = company_prompt + "\n\nSugira apenas a próxima resposta do atendente, sem explicações. Breve e natural. Máximo 2 frases."
 
@@ -2012,9 +2018,44 @@ async def buy_credits(body: dict):
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
 async def update_copilot_prompt(body: UpdateCopilotPrompt):
-    # Only update mode/schedule — real prompt is protected and only set via onboarding
-    res = supabase.table("tenants").update({"copilot_auto_mode": body.copilot_auto_mode, "copilot_schedule_start": body.copilot_schedule_start, "copilot_schedule_end": body.copilot_schedule_end, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
-    return {"ok": True, "tenant": res.data[0]}
+    """Salva config de IA por instância. Fallback: salva no tenant (legado)."""
+    update_data = {
+        "copilot_auto_mode": body.copilot_auto_mode,
+        "copilot_schedule_start": body.copilot_schedule_start,
+        "copilot_schedule_end": body.copilot_schedule_end,
+    }
+    if body.copilot_prompt:
+        update_data["copilot_prompt"] = body.copilot_prompt
+    if body.instance_name:
+        res = supabase.table("gateway_instances").update(update_data).eq("instance_name", body.instance_name).eq("tenant_id", body.tenant_id).execute()
+        return {"ok": True, "saved_to": "instance", "instance": body.instance_name}
+    else:
+        res = supabase.table("tenants").update({**update_data, "updated_at": datetime.utcnow().isoformat()}).eq("id", body.tenant_id).execute()
+        return {"ok": True, "saved_to": "tenant"}
+
+@app.get("/whatsapp/instance-config", dependencies=[Depends(verify_key)])
+async def get_instance_config(tenant_id: str, instance_name: str):
+    """Retorna config de IA de uma instância específica."""
+    row = supabase.table("gateway_instances").select(
+        "instance_name,label,phone,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end"
+    ).eq("tenant_id", tenant_id).eq("instance_name", instance_name).limit(1).execute().data
+    if not row:
+        raise HTTPException(404, "Instância não encontrada")
+    return row[0]
+
+@app.put("/whatsapp/instance-config", dependencies=[Depends(verify_key)])
+async def update_instance_config(body: dict):
+    """Salva config de IA (prompt + modo + horário) por instância."""
+    tenant_id = body.get("tenant_id")
+    instance_name = body.get("instance_name")
+    if not tenant_id or not instance_name:
+        raise HTTPException(400, "tenant_id e instance_name obrigatórios")
+    update_data = {}
+    for field in ["copilot_prompt", "copilot_auto_mode", "copilot_schedule_start", "copilot_schedule_end"]:
+        if field in body:
+            update_data[field] = body[field]
+    res = supabase.table("gateway_instances").update(update_data).eq("instance_name", instance_name).eq("tenant_id", tenant_id).execute()
+    return {"ok": True, "instance": instance_name}
 
 # ── WHATSAPP CONNECTION (WAHA) ────────────────────────────
 @app.get("/whatsapp/status", dependencies=[Depends(verify_key)])
@@ -2528,7 +2569,11 @@ RESUMO:"""
 async def onboarding_save_prompt(body: dict, admin=Depends(require_admin)):
     tenant_id = body.get("tenant_id")
     prompt = body.get("prompt")
-    supabase.table("tenants").update({"copilot_prompt": prompt, "onboarding_done": True, "updated_at": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
+    instance_name = body.get("instance_name")
+    if instance_name:
+        supabase.table("gateway_instances").update({"copilot_prompt": prompt}).eq("instance_name", instance_name).eq("tenant_id", tenant_id).execute()
+    else:
+        supabase.table("tenants").update({"copilot_prompt": prompt, "onboarding_done": True, "updated_at": datetime.utcnow().isoformat()}).eq("id", tenant_id).execute()
     return {"ok": True}
 
 @app.post("/onboarding/questionnaire", dependencies=[Depends(verify_key)])
