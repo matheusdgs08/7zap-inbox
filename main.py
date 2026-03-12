@@ -675,12 +675,14 @@ async def bubble_translate(payload: dict, x_api_key: str = Header(default="")):
 
     # Dedup por messageId via Redis (evita processar message + message.any duas vezes)
     msg_id = msg.get("id", "")
-    if msg_id and redis_client:
-        dedup_key = f"bubble_dedup:{msg_id}"
+    if msg_id:
         try:
-            if redis_client.get(dedup_key):
-                return {"ok": True, "skipped": "duplicate"}
-            redis_client.setex(dedup_key, 30, "1")  # expira em 30s
+            _r = _get_redis()
+            if _r:
+                dedup_key = f"bubble_dedup:{msg_id}"
+                if _r.get(dedup_key):
+                    return {"ok": True, "skipped": "duplicate"}
+                _r.setex(dedup_key, 30, "1")  # expira em 30s
         except Exception:
             pass  # se Redis falhar, continua sem dedup
 
