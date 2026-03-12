@@ -682,18 +682,13 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                     tenant_id = inst_row[0]["tenant_id"]
                     # Atualiza status da instância para connected
                     supabase.table("gateway_instances").update({"status": "connected"}).eq("instance_name", instance_name).execute()
-                    # Aguarda 5s para WAHA estabilizar a sessão antes de sincronizar
+                    # Aguarda 60s para WAHA estabilizar e carregar histórico completo
                     import asyncio as _asyncio
-                    await _asyncio.sleep(5)
-                    # Dispara sync de histórico
-                    print(f"[AUTO-SYNC] Iniciando sync para tenant={tenant_id[:8]} inst={instance_name}")
-                    from httpx import AsyncClient as _AsyncClient
-                    async with _AsyncClient(timeout=60) as cl:
-                        sync_url = f"{BACKEND_URL}/whatsapp/sync" if BACKEND_URL else "http://localhost:8000/whatsapp/sync"
-                        await cl.post(sync_url,
-                            headers={"x-api-key": INBOX_API_KEY, "Content-Type": "application/json"},
-                            json={"tenant_id": tenant_id, "instance": instance_name})
-                    print(f"[AUTO-SYNC] Sync concluído para {instance_name}")
+                    await _asyncio.sleep(60)
+                    # Dispara deep-sync progressivo
+                    print(f"[AUTO-SYNC] Iniciando deep-sync para tenant={tenant_id[:8]} inst={instance_name}")
+                    asyncio.create_task(_deep_sync_progressive(tenant_id, instance_name))
+                    print(f"[AUTO-SYNC] Deep-sync enfileirado para {instance_name}")
                 except Exception as e:
                     print(f"[AUTO-SYNC] Erro: {e}")
             asyncio.create_task(_auto_sync_on_connect())
@@ -2584,6 +2579,230 @@ async def debug_waha_session(instance: str):
             results["all_sessions_error"] = str(e)
 
     return {"instance": instance, "waha_url": WAHA_URL, "diagnosis": results}
+
+# ── DEEP SYNC PROGRESSIVO ─────────────────────────────────────────────────────
+# Fluxo:
+#   Estágio 1 (rápido ~5s): busca todos os chats → cria contatos + conversas no banco
+#   Estágio 2 (background): para cada conversa, busca 500 mensagens (10 por vez)
+# O frontend atualiza em tempo real via Supabase Realtime.
+
+async def _deep_sync_progressive(tenant_id: str, instance: str):
+    """Deep sync em 2 estágios: contatos primeiro, mensagens depois aos poucos."""
+    sync_key = f"deep_sync:{tenant_id}:{instance}"
+    try:
+        r = _get_redis()
+        if r:
+            r.set(sync_key, json.dumps({"stage": 1, "chats_total": 0, "chats_done": 0,
+                "contacts_created": 0, "conversations_created": 0,
+                "messages_saved": 0, "status": "running"}), ex=3600)
+
+        tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
+        plan = tenant.get("plan", "starter") if tenant else "starter"
+        plan_days = {"starter": 30, "pro": 90, "business": 180, "trial": 90, "enterprise": 365}
+        days_limit = plan_days.get(plan, 30)
+        since_ts = int((datetime.utcnow() - timedelta(days=days_limit)).timestamp() * 1000)
+
+        # ── ESTÁGIO 1: Busca todos os chats e cria contatos + conversas ─────────
+        print(f"[DEEP-SYNC] Estágio 1: buscando chats para {instance}")
+        chats = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            for route in [
+                f"{WAHA_URL}/api/{instance}/chats?limit=200",
+                f"{WAHA_URL}/api/{instance}/chats",
+                f"{WAHA_URL}/api/chats?session={instance}&limit=200",
+            ]:
+                try:
+                    r2 = await client.get(route, headers=waha_headers(), timeout=20)
+                    if r2.status_code == 200:
+                        data = r2.json()
+                        chats = data if isinstance(data, list) else data.get("chats", data.get("data", []))
+                        if chats:
+                            print(f"[DEEP-SYNC] {len(chats)} chats via {route}")
+                            break
+                except Exception as e:
+                    print(f"[DEEP-SYNC] Route {route} failed: {e}")
+
+        # Filtra grupos e ordena por mais recente
+        chats = [c for c in chats if not (c.get("isGroup") or "@g.us" in str(c.get("id","")))]
+        chats = sorted(chats, key=lambda c: c.get("timestamp", 0), reverse=True)
+
+        stats = {"chats_total": len(chats), "chats_done": 0,
+                 "contacts_created": 0, "conversations_created": 0, "messages_saved": 0}
+
+        # Cria todos os contatos e conversas sem mensagens (rápido)
+        conv_queue = []  # lista de (conv_id, chat_id, contact_name) para buscar mensagens depois
+        for chat in chats:
+            try:
+                raw_id = chat.get("id", "")
+                phone_raw = raw_id.get("user", "") if isinstance(raw_id, dict) else str(raw_id)
+                phone = "".join(c for c in phone_raw if c.isdigit())
+                if not phone or len(phone) < 8:
+                    continue
+                chat_id = f"{phone}@c.us"
+                name = chat.get("name") or phone
+
+                # Upsert contact
+                existing = supabase.table("contacts").select("id,name").eq("tenant_id", tenant_id).eq("phone", phone).execute().data
+                if existing:
+                    contact_id = existing[0]["id"]
+                    if name and name != phone and not existing[0].get("name"):
+                        supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
+                else:
+                    try:
+                        contact_id = supabase.table("contacts").insert({"tenant_id": tenant_id, "phone": phone, "name": name}).execute().data[0]["id"]
+                        stats["contacts_created"] += 1
+                    except Exception as dup:
+                        if "duplicate" in str(dup).lower() or "23505" in str(dup):
+                            ex2 = supabase.table("contacts").select("id").eq("tenant_id", tenant_id).eq("phone", phone).single().execute().data
+                            contact_id = ex2["id"] if ex2 else None
+                        else:
+                            continue
+                if not contact_id:
+                    continue
+
+                # Upsert conversation
+                existing_conv = supabase.table("conversations").select("id,instance_name").eq("tenant_id", tenant_id).eq("contact_id", contact_id).execute().data
+                if existing_conv:
+                    conv_id = existing_conv[0]["id"]
+                    if not existing_conv[0].get("instance_name"):
+                        supabase.table("conversations").update({"instance_name": instance}).eq("id", conv_id).execute()
+                else:
+                    last_ts = chat.get("timestamp", 0)
+                    last_msg_at = datetime.utcfromtimestamp(last_ts).isoformat() if last_ts else None
+                    conv_row = {"tenant_id": tenant_id, "contact_id": contact_id,
+                                "status": "open", "kanban_stage": "new",
+                                "unread_count": chat.get("unreadCount", 0),
+                                "instance_name": instance}
+                    if last_msg_at:
+                        conv_row["last_message_at"] = last_msg_at
+                    conv_id = supabase.table("conversations").insert(conv_row).execute().data[0]["id"]
+                    stats["conversations_created"] += 1
+
+                conv_queue.append((conv_id, chat_id, name))
+            except Exception as e:
+                print(f"[DEEP-SYNC] Erro ao criar contato/conversa: {e}")
+                continue
+
+        print(f"[DEEP-SYNC] Estágio 1 concluído: {stats['contacts_created']} contatos, {stats['conversations_created']} conversas")
+
+        # Atualiza Redis: estágio 2 começa
+        rr = _get_redis()
+        if rr:
+            rr.set(sync_key, json.dumps({"stage": 2, **stats, "status": "running"}), ex=3600)
+
+        # ── ESTÁGIO 2: Busca mensagens em lotes de 10 conversas ──────────────────
+        print(f"[DEEP-SYNC] Estágio 2: buscando mensagens de {len(conv_queue)} conversas")
+        BATCH = 10
+        for batch_start in range(0, len(conv_queue), BATCH):
+            batch = conv_queue[batch_start:batch_start + BATCH]
+            async with httpx.AsyncClient(timeout=30) as client:
+                for conv_id, chat_id, name in batch:
+                    try:
+                        msgs_data = []
+                        for msg_route in [
+                            f"{WAHA_URL}/api/{instance}/chats/{chat_id}/messages?limit=500&downloadMedia=false",
+                            f"{WAHA_URL}/api/messages?session={instance}&chatId={chat_id}&limit=500&downloadMedia=false",
+                        ]:
+                            try:
+                                mr = await client.get(msg_route, headers=waha_headers(), timeout=20)
+                                if mr.status_code == 400:
+                                    break  # NOWEB store não habilitado
+                                if mr.status_code == 200:
+                                    md = mr.json()
+                                    msgs_data = md if isinstance(md, list) else md.get("messages", md.get("data", []))
+                                    if msgs_data:
+                                        break
+                            except:
+                                continue
+
+                        if not msgs_data:
+                            stats["chats_done"] += 1
+                            continue
+
+                        # Dedup com mensagens já existentes
+                        existing_msgs = supabase.table("messages").select("waha_id").eq("conversation_id", conv_id).execute().data or []
+                        existing_ids = {m["waha_id"] for m in existing_msgs if m.get("waha_id")}
+
+                        to_insert = []
+                        for msg in msgs_data:
+                            try:
+                                msg_ts = msg.get("timestamp", 0) or msg.get("t", 0)
+                                if msg_ts and msg_ts * 1000 < since_ts:
+                                    continue
+                                ext_id = msg.get("id") or msg.get("_serialized") or ""
+                                if isinstance(ext_id, dict):
+                                    ext_id = ext_id.get("_serialized", ext_id.get("id", ""))
+                                if ext_id and ext_id in existing_ids:
+                                    continue
+                                body_text = msg.get("body") or msg.get("text") or msg.get("caption") or ""
+                                type_map = {"chat": "text", "image": "image", "audio": "audio",
+                                            "ptt": "audio", "video": "video", "document": "document", "sticker": "image"}
+                                our_type = type_map.get(msg.get("type", "chat"), "text")
+                                from_me = msg.get("fromMe", False) or msg.get("from_me", False)
+                                created_at = (datetime.utcfromtimestamp(msg_ts).isoformat() + "+00:00") if msg_ts else (datetime.utcnow().isoformat() + "+00:00")
+                                row = {"conversation_id": conv_id, "tenant_id": tenant_id,
+                                       "direction": "outbound" if from_me else "inbound",
+                                       "content": body_text, "type": our_type, "created_at": created_at}
+                                if ext_id:
+                                    row["waha_id"] = ext_id
+                                to_insert.append(row)
+                            except:
+                                continue
+
+                        # Insere em chunks de 50
+                        for i in range(0, len(to_insert), 50):
+                            chunk = to_insert[i:i+50]
+                            try:
+                                supabase.table("messages").insert(chunk).execute()
+                                stats["messages_saved"] += len(chunk)
+                            except:
+                                pass
+
+                        stats["chats_done"] += 1
+                    except Exception as e:
+                        print(f"[DEEP-SYNC] Erro ao buscar mensagens de {chat_id}: {e}")
+                        stats["chats_done"] += 1
+                        continue
+
+            # Atualiza progresso no Redis após cada lote
+            rr = _get_redis()
+            if rr:
+                rr.set(sync_key, json.dumps({"stage": 2, **stats, "status": "running"}), ex=3600)
+            print(f"[DEEP-SYNC] Lote {batch_start//BATCH + 1}: {stats['chats_done']}/{stats['chats_total']} conversas, {stats['messages_saved']} mensagens")
+
+            # Pequena pausa entre lotes para não sobrecarregar o WAHA
+            await asyncio.sleep(1)
+
+        # Finalizado
+        rr = _get_redis()
+        if rr:
+            rr.set(sync_key, json.dumps({"stage": 2, **stats, "status": "done"}), ex=3600)
+        print(f"[DEEP-SYNC] Concluído: {stats['messages_saved']} mensagens de {stats['chats_done']} conversas")
+
+    except Exception as e:
+        print(f"[DEEP-SYNC] Erro geral: {e}")
+        rr = _get_redis()
+        if rr:
+            rr.set(sync_key, json.dumps({"status": "error", "error": str(e)}), ex=3600)
+
+
+@app.get("/whatsapp/deep-sync-status")
+async def deep_sync_status(tenant_id: str, instance: str = "default", user=Depends(get_current_user)):
+    """Retorna o progresso do deep sync em tempo real."""
+    if user["tenant_id"] != tenant_id and user["role"] != "admin":
+        raise HTTPException(403)
+    sync_key = f"deep_sync:{tenant_id}:{instance}"
+    rr = _get_redis()
+    if not rr:
+        return {"status": "unavailable", "message": "Redis não disponível"}
+    try:
+        raw = rr.get(sync_key)
+        if not raw:
+            return {"status": "idle", "message": "Nenhum sync em andamento"}
+        return json.loads(raw)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 
 @app.post("/whatsapp/sync", dependencies=[Depends(verify_key)])
 async def whatsapp_sync(body: dict):
