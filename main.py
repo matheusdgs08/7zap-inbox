@@ -1045,6 +1045,49 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 if is_group and participant_name:
                     msg_insert["participant_name"] = participant_name
                 supabase.table("messages").insert(msg_insert).execute()
+                # ── Auto-transcrição de áudio (background) ──────────────
+                if stored_type == "audio" and media_url and (OPENAI_API_KEY or ANTHROPIC_API_KEY):
+                    _saved_id = supabase.table("messages").select("id").eq("conversation_id", conv_id).eq("waha_id", waha_id).maybe_single().execute()
+                    _msg_id = (_saved_id.data or {}).get("id") if _saved_id and _saved_id.data else None
+                    if _msg_id:
+                        async def _transcribe_audio(msg_id=_msg_id, url=media_url):
+                            try:
+                                async with httpx.AsyncClient(timeout=30) as _c:
+                                    ar = await _c.get(url, headers=waha_headers())
+                                    if ar.status_code != 200: return
+                                    import io
+                                    audio_bytes = io.BytesIO(ar.content)
+                                    transcript_text = ""
+                                    if OPENAI_API_KEY:
+                                        import openai as _oai
+                                        _oai_client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                                        t = await _oai_client.audio.transcriptions.create(
+                                            model="whisper-1",
+                                            file=("audio.ogg", audio_bytes, "audio/ogg"),
+                                            language="pt"
+                                        )
+                                        transcript_text = t.text.strip()
+                                    elif ANTHROPIC_API_KEY:
+                                        # Fallback: use Claude to transcribe via base64
+                                        import base64 as _b64
+                                        audio_b64 = _b64.b64encode(ar.content).decode()
+                                        headers_a = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+                                        payload_a = {"model": "claude-haiku-4-5-20251001", "max_tokens": 500,
+                                            "messages": [{"role": "user", "content": [
+                                                {"type": "text", "text": "Transcreva exatamente o que está sendo dito neste áudio em português. Responda APENAS com a transcrição, sem explicações."},
+                                                {"type": "document", "source": {"type": "base64", "media_type": "audio/ogg", "data": audio_b64}}
+                                            ]}]}
+                                        async with httpx.AsyncClient(timeout=30) as _ac:
+                                            _ar = await _ac.post("https://api.anthropic.com/v1/messages", json=payload_a, headers=headers_a)
+                                            _ad = _ar.json()
+                                            transcript_text = (_ad.get("content") or [{}])[0].get("text", "").strip()
+                                    if transcript_text:
+                                        supabase.table("messages").update({"ai_suggestion": f"🎤 {transcript_text}"}).eq("id", msg_id).execute()
+                                        print(f"[TRANSCRIPT] msg={msg_id[:8]}: {transcript_text[:60]}")
+                            except Exception as _te:
+                                print(f"[TRANSCRIPT] erro: {_te}")
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(_transcribe_audio())
             except Exception as insert_err:
                 err_str = str(insert_err)
                 if "duplicate" in err_str.lower() or "unique" in err_str.lower():
