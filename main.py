@@ -174,6 +174,11 @@ async def startup_event():
             print(f"[STARTUP] Broadcast preso cancelado: {b['name']} ({b['id']})")
     except Exception as e:
         print(f"[STARTUP] Erro ao cancelar broadcasts presos: {e}")
+    # Background loops
+    asyncio.create_task(keepalive_loop())
+    asyncio.create_task(fix_existing_sessions_webhook())
+    asyncio.create_task(watchguard_loop())
+    asyncio.create_task(scheduled_messages_loop())
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
@@ -265,11 +270,6 @@ JWT_SECRET        = os.getenv("JWT_SECRET") or "7crm_super_secret_CHANGE_ME_IN_P
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 security = HTTPBearer(auto_error=False)
 
-@app.on_event("startup")
-async def start_keepalive():
-    asyncio.create_task(keepalive_loop())
-    asyncio.create_task(fix_existing_sessions_webhook())
-    asyncio.create_task(watchguard_loop())
 
 async def ensure_webhooks():
     """Auto-configure webhooks for all active WAHA sessions that are missing it."""
@@ -556,8 +556,39 @@ async def enforce_tenant(
     tenant_id: str = "",
     user: dict = Depends(get_current_user)
 ) -> str:
-    """Retorna o tenant_id do JWT — ignora qualquer tenant_id passado na URL."""
-    return user["tenant_id"]
+    """
+    Retorna o tenant_id do JWT — ignora qualquer tenant_id passado na URL.
+    Também bloqueia tenants com is_blocked=True (trial expirado ou suspenso).
+    SuperAdmin (SUPER_ADMIN_TENANT) nunca é bloqueado.
+    """
+    tid = user["tenant_id"]
+    # SuperAdmin não é bloqueado
+    if tid == SUPER_ADMIN_TENANT:
+        return tid
+    # Verificar bloqueio — usa cache Redis se disponível
+    _cache_key = f"7crm:tenant_blocked:{tid}"
+    _blocked = None
+    try:
+        if r:
+            _v = r.get(_cache_key)
+            if _v is not None:
+                _blocked = _v == b"1"
+    except Exception:
+        pass
+    if _blocked is None:
+        try:
+            _t = supabase.table("tenants").select("is_blocked").eq("id", tid).single().execute().data
+            _blocked = bool(_t and _t.get("is_blocked"))
+            # Cache por 5 minutos para não sobrecarregar o banco
+            try:
+                if r: r.setex(_cache_key, 300, "1" if _blocked else "0")
+            except Exception:
+                pass
+        except Exception:
+            _blocked = False
+    if _blocked:
+        raise HTTPException(status_code=403, detail="Conta suspensa ou trial expirado. Acesse o painel para regularizar.")
+    return tid
 
 # ── MEDIA PROXY ───────────────────────────────────────────
 @app.get("/media/proxy", dependencies=[Depends(get_current_user)])
@@ -634,7 +665,8 @@ class CreateBroadcast(BaseModel):
     instance_name: Optional[str] = None  # instância para envio
 
 class ScheduledMessageCreate(BaseModel):
-    tenant_id: str; conversation_id: Optional[str] = None; contact_name: Optional[str] = None
+    tenant_id: Optional[str] = None  # ignorado — tenant vem do JWT
+    conversation_id: Optional[str] = None; contact_name: Optional[str] = None
     contact_phone: str; message: str; scheduled_at: str; recurrence: Optional[str] = None
 
 # ── AUTH ─────────────────────────────────────────────────
@@ -684,17 +716,23 @@ async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
 
 @app.put("/admin/users/{user_id}")
 async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(require_admin)):
+    # Garante que o usuário alvo pertence ao mesmo tenant do admin
+    target = supabase.table("users").select("id,tenant_id").eq("id", user_id).eq("tenant_id", admin["tenant_id"]).execute().data
+    if not target: raise HTTPException(status_code=404, detail="Usuário não encontrado")
     updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances, "phone": body.phone}.items() if v is not None}
     if body.password:
         if len(body.password) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
         updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
-    supabase.table("users").update(updates).eq("id", user_id).execute()
+    supabase.table("users").update(updates).eq("id", user_id).eq("tenant_id", admin["tenant_id"]).execute()
     return {"ok": True}
 
 @app.delete("/admin/users/{user_id}")
 async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
     if user_id == admin["sub"]: raise HTTPException(status_code=400, detail="Não pode excluir a própria conta")
-    supabase.table("users").update({"is_active": False}).eq("id", user_id).execute()
+    # Garante que o usuário alvo pertence ao mesmo tenant do admin
+    target = supabase.table("users").select("id,tenant_id").eq("id", user_id).eq("tenant_id", admin["tenant_id"]).execute().data
+    if not target: raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    supabase.table("users").update({"is_active": False}).eq("id", user_id).eq("tenant_id", admin["tenant_id"]).execute()
     return {"ok": True}
 
 # ── WEBHOOK — recebe mensagens do WAHA ───────────────────
@@ -832,7 +870,8 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         else:
             waha_id = str(_raw_id) if _raw_id else ""
         # Extract push name from WAHA payload (contact's WhatsApp display name)
-        push_name = data.get("notifyName") or data.get("pushName") or data.get("_data", {}).get("notifyName", "") if isinstance(data.get("_data"), dict) else data.get("notifyName") or data.get("pushName") or ""
+        _data_obj = data.get("_data") if isinstance(data.get("_data"), dict) else {}
+        push_name = (data.get("notifyName") or data.get("pushName") or _data_obj.get("notifyName") or "")
     # Formato Evolution API legado
     else:
         push_name = ""  # Evolution API doesn't provide push name easily
@@ -1352,84 +1391,6 @@ async def full_diagnostics(tenant_id: str):
 
 # ── CONVERSATIONS ────────────────────────────────────────
 
-@app.post("/debug/webhook-test")
-async def debug_webhook_test(payload: dict, x_api_key: str = Header(default="")):
-    """Debug: same as webhook but returns detailed error info"""
-    import traceback as tb_module
-    try:
-        event = payload.get("event", "")
-        if "payload" in payload and isinstance(payload["payload"], dict):
-            data = payload["payload"]
-            is_from_me = data.get("fromMe", False)
-            if is_from_me:
-                raw_from = data.get("to") or data.get("chatId") or data.get("from", "")
-            else:
-                raw_from = data.get("from", "")
-            if "@g" in raw_from: return {"ok": True, "skipped": "group"}
-            if "@lid" in raw_from:
-                phone = raw_from.replace("@lid","").replace("@c.us","").strip()
-                phone = "".join(c for c in phone if c.isdigit())  # digits only
-            else:
-                phone = raw_from.replace("@c.us", "").replace("@s.whatsapp.net", "")
-            if not phone: return {"ok": False, "reason": "no phone"}
-            content = data.get("body") or data.get("text") or ""
-            if not content: return {"ok": False, "reason": "no content"}
-        else:
-            return {"ok": False, "reason": "invalid payload format"}
-        
-        instance_name = payload.get("session") or ""
-        
-        # Test tenant lookup
-        tid = None
-        if instance_name:
-            _rows = supabase.table("gateway_instances").select("tenant_id").eq("instance_name", instance_name).limit(1).execute().data
-            inst_row = _rows[0] if _rows else None
-            if inst_row:
-                tid = inst_row["tenant_id"]
-        
-        if not tid:
-            return {"ok": False, "reason": "tenant not found for instance", "instance_name": instance_name}
-        
-        # Test contact lookup
-        contacts = supabase.table("contacts").select("id").eq("tenant_id", tid).eq("phone", phone).execute().data
-        contact_id = contacts[0]["id"] if contacts else None
-        
-        if not contact_id:
-            # Try insert
-            try:
-                new_contact = supabase.table("contacts").insert({"tenant_id": tid, "phone": phone, "name": phone}).execute().data
-            except Exception as _dup:
-                if "duplicate" in str(_dup).lower() or "23505" in str(_dup):
-                    new_contact = supabase.table("contacts").select("*").eq("tenant_id", tid).eq("phone", phone).execute().data
-                else:
-                    raise
-            if new_contact:
-                contact_id = new_contact[0]["id"]
-            else:
-                return {"ok": False, "reason": "failed to create contact"}
-        
-        # Test conv lookup
-        convs = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True).limit(1).execute().data
-        
-        # Test message insert
-        if convs:
-            conv_id = convs[0]["id"]
-            msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute().data
-            supabase.table("conversations").update({"last_message_at": datetime.utcnow().isoformat(), "unread_count": (convs[0].get("unread_count") or 0) + 1}).eq("id", conv_id).execute()
-            return {"ok": True, "action": "updated_existing", "conv_id": conv_id, "tid": tid, "phone": phone, "msg_id": msg[0]["id"] if msg else None}
-        else:
-            insert_data = {"contact_id": contact_id, "tenant_id": tid, "status": "open", "kanban_stage": "new", "unread_count": 1}
-            if instance_name:
-                insert_data["instance_name"] = instance_name
-            conv = supabase.table("conversations").insert(insert_data).execute().data
-            if not conv:
-                return {"ok": False, "reason": "failed to create conversation"}
-            conv_id = conv[0]["id"]
-            msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tid, "direction": "inbound", "content": content, "type": "text"}).execute().data
-            return {"ok": True, "action": "created_new_conv", "conv_id": conv_id, "tid": tid, "phone": phone}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
-
 @app.get("/conversations")
 async def list_conversations(tenant_id: str = Depends(enforce_tenant), status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None, is_group: Optional[bool] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
@@ -1718,9 +1679,10 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
         print(f"[WAHA_BG_SYNC] {conv_id}: {e}")
 
 
-@app.post("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
-async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
-    conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
+@app.post("/conversations/{conv_id}/messages")
+async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks, user=Depends(get_current_user)):
+    conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).single().execute().data
+    if not conv: raise HTTPException(status_code=404, detail="Conversa não encontrada")
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
     # Invalidate message cache so next poll fetches fresh (including this outbound msg)
     cache_del(f"msgs:{conv_id}:latest")
@@ -1891,11 +1853,14 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
         if not contact_phone:
             return
 
-        waha_resp = requests.post(f"{WAHA_URL}/api/sendText", json={
-            "session": instance_name, "chatId": f"{contact_phone}@s.whatsapp.net", "text": reply_text
-        }, headers={"X-Api-Key": WAHA_KEY}, timeout=15)
+        waha_resp_data = None
+        async with httpx.AsyncClient(timeout=15) as _wc:
+            _wr = await _wc.post(f"{WAHA_URL}/api/sendText", json={
+                "session": instance_name, "chatId": f"{contact_phone}@s.whatsapp.net", "text": reply_text
+            }, headers={"X-Api-Key": WAHA_KEY})
+            waha_resp_data = _wr
 
-        if waha_resp.status_code == 201:
+        if waha_resp_data and waha_resp_data.status_code == 201:
             supabase.table("messages").insert({
                 "conversation_id": conv_id, "direction": "outbound", "content": reply_text,
                 "type": "text", "ai_suggestion": True
@@ -1906,7 +1871,8 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
                 r.setex(wg_key, 3600, "1")
             print(f"[WATCHGUARD] ✅ Resposta enviada → conv={conv_id[:8]}")
         else:
-            print(f"[WATCHGUARD] ❌ Erro WAHA {waha_resp.status_code}: {waha_resp.text[:100]}")
+            status_code = waha_resp_data.status_code if waha_resp_data else "N/A"
+            print(f"[WATCHGUARD] ❌ Erro WAHA {status_code}")
 
     except Exception as e:
         print(f"[WATCHGUARD] Erro em _watchguard_reply conv={conv_id[:8]}: {e}")
@@ -2223,10 +2189,11 @@ async def waha_send_msg(phone: str, text: str, session: str = "default"):
     except Exception as _e:
         print(f"[WAHA_SEND] ERRO: {_e}")
 
-@app.post("/conversations/{conv_id}/media", dependencies=[Depends(verify_key)])
-async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None)):
+@app.post("/conversations/{conv_id}/media")
+async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None), user=Depends(get_current_user)):
     """Envia imagem ou documento via WhatsApp"""
-    conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
+    conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).single().execute().data
+    if not conv: raise HTTPException(status_code=404, detail="Conversa não encontrada")
     data = await file.read()
     b64 = base64.b64encode(data).decode()
     ftype = file.content_type or "application/octet-stream"
@@ -2272,13 +2239,13 @@ async def waha_send_media(phone: str, b64: str, mimetype: str, filename: str, ca
     except Exception as e:
         print(f"[waha_send_media] error: {e}")
 
-@app.put("/conversations/{conv_id}/assign", dependencies=[Depends(verify_key)])
-async def assign_conversation(conv_id: str, body: AssignConversation):
-    return supabase.table("conversations").update({"assigned_to": body.user_id, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
+@app.put("/conversations/{conv_id}/assign")
+async def assign_conversation(conv_id: str, body: AssignConversation, user=Depends(get_current_user)):
+    return supabase.table("conversations").update({"assigned_to": body.user_id, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data[0]
 
-@app.put("/conversations/{conv_id}/kanban", dependencies=[Depends(verify_key)])
-async def update_kanban(conv_id: str, body: UpdateKanban):
-    return supabase.table("conversations").update({"kanban_stage": body.stage, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
+@app.put("/conversations/{conv_id}/kanban")
+async def update_kanban(conv_id: str, body: UpdateKanban, user=Depends(get_current_user)):
+    return supabase.table("conversations").update({"kanban_stage": body.stage, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data[0]
 
 @app.post("/contacts/{contact_id}/block", dependencies=[Depends(verify_key)])
 async def block_contact(contact_id: str):
@@ -2365,7 +2332,10 @@ async def pending_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "pending", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
 @app.put("/conversations/{conv_id}/labels")
-async def update_conversation_labels(conv_id: str, body: UpdateLabels):
+async def update_conversation_labels(conv_id: str, body: UpdateLabels, user=Depends(get_current_user)):
+    # Verifica que a conversa pertence ao tenant do usuário
+    conv_check = supabase.table("conversations").select("id,contact_id").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data
+    if not conv_check: raise HTTPException(status_code=404, detail="Conversa não encontrada")
     # Salva label_ids direto no array conversations.labels[]
     supabase.table("conversations").update({"labels": body.label_ids or []}).eq("id", conv_id).execute()
     # Invalidar cache
@@ -2392,8 +2362,8 @@ async def get_labels(tenant_id: str = Depends(enforce_tenant)):
     return {"labels": rows}
 
 @app.post("/labels")
-async def create_label(body: dict):
-    tenant_id = body.get("tenant_id")
+async def create_label(body: dict, user=Depends(get_current_user)):
+    tenant_id = user["tenant_id"]  # sempre do JWT — nunca do body
     name = (body.get("name") or "").strip()
     color = body.get("color", "#00a884")
     if not name: raise HTTPException(400, "Nome obrigatório")
@@ -2982,8 +2952,9 @@ async def preview_resume_message(body: dict):
     return {"preview": msg, "credits_left": credits_left}
 
 @app.post("/broadcasts")
-async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
-    bcast = supabase.table("broadcasts").insert({"tenant_id": body.tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0, "ai_personalize": body.ai_personalize, "resume_conversation": body.resume_conversation, "instance_name": body.instance_name}).execute().data[0]
+async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks, user=Depends(get_current_user)):
+    tenant_id = user["tenant_id"]  # sempre do JWT — nunca do body
+    bcast = supabase.table("broadcasts").insert({"tenant_id": tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0, "ai_personalize": body.ai_personalize, "resume_conversation": body.resume_conversation, "instance_name": body.instance_name}).execute().data[0]
     if body.recipients:
         supabase.table("broadcast_recipients").insert([{"broadcast_id": bcast["id"], "phone": r["phone"], "name": r.get("name"), "contact_id": r.get("contact_id"), "conversation_id": r.get("conversation_id"), "status": "pending"} for r in body.recipients]).execute()
     if not body.scheduled_at:
@@ -3121,10 +3092,99 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
         await asyncio.sleep(random.randint(interval_min, interval_max))
     supabase.table("broadcasts").update({"status": "done", "finished_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
 
+# ── SCHEDULED MESSAGES RUNNER ────────────────────────────
+async def scheduled_messages_loop():
+    """
+    Background loop que roda a cada 60 segundos e dispara mensagens agendadas.
+    Verifica scheduled_messages com status='pending' e scheduled_at <= agora.
+    """
+    await asyncio.sleep(30)  # aguarda backend estabilizar no startup
+    print("[SCHEDULED] Loop iniciado")
+    while True:
+        try:
+            now_iso = datetime.utcnow().isoformat()
+            pending = supabase.table("scheduled_messages").select(
+                "id,tenant_id,conversation_id,contact_phone,message,recurrence"
+            ).eq("status", "pending").lte("scheduled_at", now_iso).limit(50).execute().data or []
+
+            for msg in pending:
+                msg_id = msg["id"]
+                try:
+                    conv_id = msg.get("conversation_id")
+                    tenant_id = msg.get("tenant_id")
+                    contact_phone = msg.get("contact_phone", "")
+                    text = msg.get("message", "")
+                    recurrence = msg.get("recurrence")  # "daily", "weekly", None
+
+                    if not text:
+                        supabase.table("scheduled_messages").update({"status": "failed"}).eq("id", msg_id).execute()
+                        continue
+
+                    # Buscar instância ativa do tenant
+                    inst_rows = supabase.table("gateway_instances").select(
+                        "instance_name"
+                    ).eq("tenant_id", tenant_id).eq("status", "connected").limit(1).execute().data
+                    session = inst_rows[0]["instance_name"] if inst_rows else "default"
+
+                    # Enviar via WAHA
+                    async with httpx.AsyncClient(timeout=15) as _c:
+                        chat_id = contact_phone if "@" in contact_phone else f"{''.join(c for c in str(contact_phone) if c.isdigit())}@c.us"
+                        r = await _c.post(
+                            f"{WAHA_URL}/api/sendText",
+                            headers=waha_headers(),
+                            json={"session": session, "chatId": chat_id, "text": text}
+                        )
+                    sent_ok = r.status_code in (200, 201)
+
+                    if sent_ok:
+                        # Salvar mensagem no banco se tiver conv_id
+                        if conv_id:
+                            supabase.table("messages").insert({
+                                "conversation_id": conv_id,
+                                "tenant_id": tenant_id,
+                                "direction": "outbound",
+                                "content": text,
+                                "type": "text",
+                            }).execute()
+                            supabase.table("conversations").update({
+                                "last_message_at": datetime.utcnow().isoformat(),
+                                "last_message_preview": "✓ " + text[:78]
+                            }).eq("id", conv_id).execute()
+
+                        # Recorrência: reagendar ou marcar como sent
+                        if recurrence == "daily":
+                            from datetime import timedelta
+                            next_at = (datetime.utcnow() + timedelta(days=1)).isoformat()
+                            supabase.table("scheduled_messages").update({"scheduled_at": next_at}).eq("id", msg_id).execute()
+                        elif recurrence == "weekly":
+                            from datetime import timedelta
+                            next_at = (datetime.utcnow() + timedelta(weeks=1)).isoformat()
+                            supabase.table("scheduled_messages").update({"scheduled_at": next_at}).eq("id", msg_id).execute()
+                        else:
+                            supabase.table("scheduled_messages").update({"status": "sent", "sent_at": datetime.utcnow().isoformat()}).eq("id", msg_id).execute()
+
+                        print(f"[SCHEDULED] ✅ Enviado msg={msg_id[:8]} para {contact_phone[:6]}***")
+                    else:
+                        supabase.table("scheduled_messages").update({"status": "failed"}).eq("id", msg_id).execute()
+                        print(f"[SCHEDULED] ❌ Falha WAHA status={r.status_code} msg={msg_id[:8]}")
+
+                except Exception as e:
+                    print(f"[SCHEDULED] Erro ao processar msg={msg_id[:8]}: {e}")
+                    try:
+                        supabase.table("scheduled_messages").update({"status": "failed"}).eq("id", msg_id).execute()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"[SCHEDULED] Erro no loop: {e}")
+
+        await asyncio.sleep(60)  # verifica a cada 1 minuto
+
 # ── SCHEDULED MESSAGES ───────────────────────────────────
 @app.post("/scheduled-messages")
-async def create_scheduled_message(body: ScheduledMessageCreate):
-    return {"scheduled_message": supabase.table("scheduled_messages").insert({"tenant_id": body.tenant_id, "conversation_id": body.conversation_id, "contact_name": body.contact_name, "contact_phone": body.contact_phone, "message": body.message, "scheduled_at": body.scheduled_at, "recurrence": body.recurrence, "status": "pending"}).execute().data[0]}
+async def create_scheduled_message(body: ScheduledMessageCreate, user=Depends(get_current_user)):
+    tenant_id = user["tenant_id"]  # sempre do JWT — nunca do body
+    return {"scheduled_message": supabase.table("scheduled_messages").insert({"tenant_id": tenant_id, "conversation_id": body.conversation_id, "contact_name": body.contact_name, "contact_phone": body.contact_phone, "message": body.message, "scheduled_at": body.scheduled_at, "recurrence": body.recurrence, "status": "pending"}).execute().data[0]}
 
 @app.get("/scheduled-messages")
 async def list_scheduled_messages(tenant_id: str = Depends(enforce_tenant), status: Optional[str] = None):
