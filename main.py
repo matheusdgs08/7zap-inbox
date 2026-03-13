@@ -1790,13 +1790,14 @@ async def _startup_autopilot_recovery():
     para conversas que ficaram com inbound sem resposta durante o restart.
     Janela: últimas 2 horas. Aguarda 90s para o app estabilizar antes de rodar.
     """
-    await asyncio.sleep(90)
+    await asyncio.sleep(20)  # aguarda apenas 20s para o app estabilizar
     import datetime as _dt
     print("[STARTUP_RECOVERY] Iniciando varredura de conversas presas...")
     try:
+        # Busca TODAS as instâncias com autopilot ativo — independente de watchguard
         instances = supabase.table("gateway_instances").select(
             "instance_name,tenant_id,copilot_auto_mode,copilot_watchguard"
-        ).eq("copilot_watchguard", True).execute().data or []
+        ).neq("copilot_auto_mode", "off").not_.is_("copilot_auto_mode", "null").execute().data or []
 
         recovered = 0
         cutoff_recent = (_dt.datetime.utcnow() - _dt.timedelta(hours=2)).isoformat()
@@ -1868,7 +1869,7 @@ async def watchguard_loop():
             await _watchguard_scan()
         except Exception as e:
             print(f"[WATCHGUARD] Erro no scan: {e}")
-        await asyncio.sleep(300)  # 5 minutos
+        await asyncio.sleep(120)  # 2 minutos — mais rápido para pegar conversas presas
 
 
 async def _watchguard_scan():
@@ -2021,7 +2022,7 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
             supabase.table("conversations").update({"last_message_at": "now()", "unread_count": 0}).eq("id", conv_id).execute()
             # Anti-spam: marca que já respondeu nesta conversa (TTL 1h)
             if r:
-                r.setex(wg_key, 3600, "1")
+                r.setex(wg_key, 900, "1")  # 15 min — re-tenta mais rápido se falhou
             print(f"[WATCHGUARD] ✅ Resposta enviada → conv={conv_id[:8]}")
         else:
             status_code = waha_resp_data.status_code if waha_resp_data else "N/A"
