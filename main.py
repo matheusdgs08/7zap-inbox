@@ -1680,11 +1680,23 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
         import datetime as _dt
         print(f"[AUTOPILOT] START conv={conv_id[:8]} instance={instance_name}")
 
+        # 0. Lock Redis — apenas UMA task pode rodar por conversa por vez
+        # Se outra task já está processando esta conversa, aborta silenciosamente
+        lock_key = f"7crm:ap_lock:{conv_id}"
+        r = _get_redis()
+        if r:
+            # SET NX EX = set only if not exists, com TTL de 8 minutos
+            acquired = r.set(lock_key, "1", nx=True, ex=480)
+            if not acquired:
+                print(f"[AUTOPILOT] Lock já ativo para conv={conv_id[:8]} — outra task em andamento, abortando")
+                return
+        
         # 1. Busca config da instância e dados da conversa
         conv = supabase.table("conversations").select(
             "id,status,copilot_auto_mode,contacts(phone),tenants(plan,ai_credits,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end)"
         ).eq("id", conv_id).single().execute().data
         if not conv:
+            if r: r.delete(lock_key)
             return
 
         # 2. Verifica se auto-pilot está pausado NESTA conversa especificamente
@@ -1861,8 +1873,16 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
                 r = await waha_send_msg(phone, reply_text.strip(), instance_name)
                 print(f"[AUTOPILOT] Enviado para {phone} via {instance_name}: {reply_text[:60]}")
 
+        # Libera lock após responder com sucesso
+        if r: r.delete(lock_key)
+
     except Exception as _e:
         print(f"[AUTOPILOT] Erro: {_e}")
+        # Garante liberação do lock mesmo em caso de erro
+        try:
+            _r2 = _get_redis()
+            if _r2: _r2.delete(f"7crm:ap_lock:{conv_id}")
+        except: pass
 
 
 async def waha_send_msg(phone: str, text: str, session: str = "default"):
