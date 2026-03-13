@@ -2039,7 +2039,7 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
     r = _get_redis()
-    window = random.randint(120, 240)
+    window = random.randint(45, 90)  # 45-90s — mais responsivo
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2065,8 +2065,8 @@ def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str
     """
     import time as _time
     r = _get_redis()
-    # Janela de debounce: 2-4 min aleatório (re-randomizado a cada mensagem nova)
-    window = random.randint(120, 240)
+    # Janela de debounce: 45-90s (aguarda cliente terminar de digitar)
+    window = random.randint(45, 90)
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -5442,5 +5442,34 @@ async def save_kanban_columns(body: dict):
     try:
         supabase.table("tenants").update({"kanban_columns": validated}).eq("id", tenant_id).execute()
         return {"ok": True, "columns": validated}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── /conversations/{id}/trigger-autopilot ─────────────────────────────────────
+@app.post("/conversations/{conv_id}/trigger-autopilot", dependencies=[Depends(verify_key)])
+async def trigger_autopilot(conv_id: str):
+    """Dispara o debounce do autopilot para uma conversa sem criar mensagem nova."""
+    try:
+        conv = supabase.table("conversations").select(
+            "id,status,instance_name,tenant_id,copilot_auto_mode"
+        ).eq("id", conv_id).single().execute().data
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversa não encontrada")
+        if conv.get("status") != "open":
+            return {"ok": False, "reason": "Conversa não está aberta"}
+        if conv.get("copilot_auto_mode") is False:
+            return {"ok": False, "reason": "Autopilot desligado nesta conversa"}
+        tenant_id = conv.get("tenant_id")
+        instance_name = conv.get("instance_name") or ""
+        # Limpa lock/wg_sent antigos para garantir que vai rodar
+        r = _get_redis()
+        if r:
+            r.delete(f"7crm:ap_lock:{conv_id}")
+            r.delete(f"7crm:wg_sent:{conv_id}")
+        asyncio.create_task(_autopilot_debounce_trigger_async(conv_id, tenant_id, instance_name))
+        return {"ok": True, "conv_id": conv_id, "message": "Debounce disparado — IA responde em 45-90s"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
