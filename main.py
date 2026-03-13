@@ -4140,8 +4140,10 @@ async def deep_sync(body: dict):
 @app.post("/whatsapp/resolve-lids", dependencies=[Depends(verify_key)])
 async def resolve_lids(body: dict):
     """
-    1. Tenta resolver LIDs para números reais via WAHA store
-    2. Mescla conversas duplicadas do mesmo contato na mesma instância
+    1. Detecta LIDs por comprimento do número (>13 dígitos) — não depende de sufixo @lid
+       pois o banco armazena os dígitos puros (ex: 237039245074536)
+    2. Tenta resolver para número real via WAHA contacts store (testa múltiplos formatos)
+    3. Mescla conversas duplicadas do mesmo contato na mesma instância
     { tenant_id, instance }
     """
     tenant_id = body.get("tenant_id")
@@ -4149,42 +4151,97 @@ async def resolve_lids(body: dict):
     if not tenant_id or not instance:
         raise HTTPException(status_code=400, detail="tenant_id e instance obrigatórios")
 
-    stats = {"lids_resolved": 0, "duplicates_merged": 0, "errors": 0}
+    stats = {"lids_found": 0, "lids_resolved": 0, "duplicates_merged": 0, "errors": 0, "detail": []}
 
-    # 1. Buscar contatos com @lid nessa instância
+    def _is_lid(phone: str) -> bool:
+        """LID = número com mais de 13 dígitos OU com sufixo @lid"""
+        digits = phone.replace("@lid","").replace("@c.us","").replace("@s.whatsapp.net","").strip()
+        return len(digits) > 13 or "@lid" in phone
+
+    # 1. Buscar TODOS os contatos desta instância e filtrar LIDs por tamanho
     def _get_lid_contacts():
-        convs = supabase.table("conversations").select("id,contact_id,contacts(id,phone,name)").eq("tenant_id", tenant_id).eq("instance_name", instance).execute().data or []
-        lid_convs = [c for c in convs if "@lid" in (c.get("contacts") or {}).get("phone","")]
+        convs = supabase.table("conversations").select(
+            "id,contact_id,contacts(id,phone,name)"
+        ).eq("tenant_id", tenant_id).eq("instance_name", instance).execute().data or []
+        lid_convs = [c for c in convs if _is_lid((c.get("contacts") or {}).get("phone",""))]
         return lid_convs
 
     lid_convs = await run_sync(_get_lid_contacts)
+    stats["lids_found"] = len(lid_convs)
+    print(f"[RESOLVE-LIDS] inst={instance} lids_encontrados={len(lid_convs)}")
 
-    # 2. Tentar resolver via WAHA contacts store
+    # 2. Tentar resolver via WAHA contacts store — testa 3 formatos de chatId
     async with httpx.AsyncClient(timeout=30) as client:
         for conv in lid_convs:
             contact = conv.get("contacts") or {}
             lid_phone = contact.get("phone","")
-            lid_digits = lid_phone.replace("@lid","").replace("@c.us","").strip()
-            if not lid_digits: continue
+            lid_digits = lid_phone.replace("@lid","").replace("@c.us","").replace("@s.whatsapp.net","").strip()
+            if not lid_digits:
+                continue
 
-            try:
-                # Tentar buscar o contato pelo LID no WAHA store
-                r = await client.get(f"{WAHA_URL}/api/{instance}/contacts/{lid_digits}@lid", headers=waha_headers(), timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    real_phone = data.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
-                    name = data.get("name") or data.get("pushName") or contact.get("name","")
-                    if real_phone and "@lid" not in real_phone and real_phone != lid_digits:
-                        # Atualizar contato com número real
-                        def _update(cid=contact["id"], phone=real_phone, n=name):
-                            supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
-                        await run_sync(_update)
-                        stats["lids_resolved"] += 1
-            except: pass
+            resolved = False
+            # Tenta os 3 formatos que o WAHA aceita para LID
+            candidates = [
+                f"{lid_digits}@lid",
+                f"{lid_digits}@c.us",
+                lid_digits,
+            ]
+
+            for chat_id in candidates:
+                try:
+                    r = await client.get(
+                        f"{WAHA_URL}/api/{instance}/contacts/check-exists",
+                        params={"phone": chat_id},
+                        headers=waha_headers(), timeout=10
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        real_phone = (data.get("id") or data.get("jid") or "").replace("@c.us","").replace("@s.whatsapp.net","").strip()
+                        name = data.get("name") or data.get("pushName") or contact.get("name","")
+                        if real_phone and len(real_phone) <= 13 and real_phone.isdigit():
+                            def _update(cid=contact["id"], phone=real_phone, n=name):
+                                supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
+                            await run_sync(_update)
+                            stats["lids_resolved"] += 1
+                            stats["detail"].append({"lid": lid_digits, "resolved_to": real_phone, "name": name})
+                            print(f"[RESOLVE-LIDS] ✅ {lid_digits} → {real_phone} ({name})")
+                            resolved = True
+                            break
+                except Exception as e:
+                    pass
+
+                # Tenta também endpoint direto /contacts/{chatId}
+                if not resolved:
+                    try:
+                        r2 = await client.get(
+                            f"{WAHA_URL}/api/{instance}/contacts/{chat_id}",
+                            headers=waha_headers(), timeout=10
+                        )
+                        if r2.status_code == 200:
+                            data2 = r2.json()
+                            real_phone = (data2.get("id") or "").replace("@c.us","").replace("@s.whatsapp.net","").strip()
+                            name = data2.get("name") or data2.get("pushName") or contact.get("name","")
+                            if real_phone and len(real_phone) <= 13 and real_phone.isdigit():
+                                def _update2(cid=contact["id"], phone=real_phone, n=name):
+                                    supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
+                                await run_sync(_update2)
+                                stats["lids_resolved"] += 1
+                                stats["detail"].append({"lid": lid_digits, "resolved_to": real_phone, "name": name})
+                                print(f"[RESOLVE-LIDS] ✅ {lid_digits} → {real_phone} ({name}) [via /contacts/]")
+                                resolved = True
+                                break
+                    except Exception as e:
+                        pass
+
+            if not resolved:
+                stats["detail"].append({"lid": lid_digits, "resolved_to": None, "name": contact.get("name","")})
+                print(f"[RESOLVE-LIDS] ❌ Não resolveu: {lid_digits} ({contact.get('name','')})")
 
     # 3. Mesclar conversas duplicadas (mesmo contact_id + instance_name)
     def _find_duplicates():
-        convs = supabase.table("conversations").select("id,contact_id,last_message_at,created_at").eq("tenant_id", tenant_id).eq("instance_name", instance).order("last_message_at", desc=True).execute().data or []
+        convs = supabase.table("conversations").select(
+            "id,contact_id,last_message_at,created_at"
+        ).eq("tenant_id", tenant_id).eq("instance_name", instance).order("last_message_at", desc=True).execute().data or []
         seen = {}
         dups = []
         for c in convs:
@@ -4200,18 +4257,18 @@ async def resolve_lids(body: dict):
     for keep_id, merge_id in duplicates:
         try:
             def _merge(kid=keep_id, mid=merge_id):
-                # Mover mensagens da conversa duplicada para a principal
                 supabase.table("messages").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
-                # Mover tarefas
                 try: supabase.table("tasks").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
                 except: pass
-                # Deletar a duplicata
                 supabase.table("conversations").delete().eq("id", mid).execute()
             await run_sync(_merge)
             stats["duplicates_merged"] += 1
+            print(f"[RESOLVE-LIDS] 🔀 Merge: {merge_id[:8]} → {keep_id[:8]}")
         except Exception as e:
             stats["errors"] += 1
+            print(f"[RESOLVE-LIDS] Erro merge: {e}")
 
+    print(f"[RESOLVE-LIDS] Concluído: {stats}")
     return {"ok": True, "stats": stats}
 
 
