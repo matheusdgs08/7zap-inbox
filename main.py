@@ -2282,34 +2282,47 @@ REGRAS IMPORTANTES:
 
         print(f"[AUTOPILOT] IA respondeu ({len(pending_inbound)} msgs acumuladas): {reply_text[:80]}")
 
-        # ── Fase 6: salva e envia ─────────────────────────────────────────────
-        supabase.table("messages").insert({
-            "conversation_id": conv_id,
-            "tenant_id": tenant_id,
-            "direction": "outbound",
-            "content": reply_text,
-            "type": "text",
-        }).execute()
-        supabase.table("conversations").update({
-            "last_message_at": _dt.datetime.utcnow().isoformat(),
-            "last_message_preview": "✓ " + reply_text[:78],
-        }).eq("id", conv_id).execute()
-
+        # ── Fase 6: envia via WAHA primeiro, salva no banco só se OK ────────────
         phone = (conv.get("contacts") or {}).get("phone", "")
+        sent_ok = False
         if phone and instance_name:
             digits_only = "".join(c for c in str(phone) if c.isdigit())
             is_lid = len(digits_only) > 13 and not digits_only.startswith("55")
             if is_lid:
-                print(f"[AUTOPILOT] LID detectado — tentando @lid para {phone}")
+                print(f"[AUTOPILOT] LID detectado — tentando @lid para {digits_only}")
                 try:
                     async with httpx.AsyncClient(timeout=15) as _c:
                         _r = await _c.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(),
                             json={"session": instance_name, "chatId": f"{digits_only}@lid", "text": reply_text})
                         print(f"[AUTOPILOT] LID send status={_r.status_code}")
+                        sent_ok = _r.status_code in (200, 201)
                 except Exception as _se:
                     print(f"[AUTOPILOT] LID send erro: {_se}")
             else:
-                await waha_send_msg(phone, reply_text, instance_name)
+                try:
+                    await waha_send_msg(phone, reply_text, instance_name)
+                    sent_ok = True
+                except Exception as _se:
+                    print(f"[AUTOPILOT] send erro: {_se}")
+        else:
+            print(f"[AUTOPILOT] Sem phone ou instance_name — não enviou")
+
+        # Salva no banco SOMENTE se enviou com sucesso (evita outbound fantasma que bloqueia próximas tentativas)
+        if sent_ok:
+            supabase.table("messages").insert({
+                "conversation_id": conv_id,
+                "tenant_id": tenant_id,
+                "direction": "outbound",
+                "content": reply_text,
+                "type": "text",
+            }).execute()
+            supabase.table("conversations").update({
+                "last_message_at": _dt.datetime.utcnow().isoformat(),
+                "last_message_preview": "✓ " + reply_text[:78],
+            }).eq("id", conv_id).execute()
+            print(f"[AUTOPILOT] ✅ Salvo no banco após envio confirmado")
+        else:
+            print(f"[AUTOPILOT] ❌ Envio falhou — NÃO salvo no banco (próxima tentativa vai funcionar)")
 
     except Exception as _e:
         print(f"[AUTOPILOT] Erro: {_e}")
