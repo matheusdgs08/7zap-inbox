@@ -1086,7 +1086,11 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
 
             # ── AUTO-PILOT: debounce — acumula mensagens na janela antes de responder ──
             if not is_from_me and conv_id and tid:
-                _autopilot_debounce_trigger(conv_id, tid, instance_name)
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(_autopilot_debounce_trigger_async(conv_id, tid, instance_name))
+                except Exception as ae:
+                    print(f"[AUTOPILOT] Erro ao criar task: {ae}")
 
         return {"ok": True}
     except Exception as e:
@@ -1673,6 +1677,25 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
         else:
             bg.add_task(waha_send_msg, phone_raw, body.text, session)
     return {"message": msg}
+
+async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instance_name: str):
+    """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
+    import time as _time
+    r = _get_redis()
+    window = random.randint(120, 240)
+    deadline = _time.time() + window
+    deadline_key = f"7crm:ap_deadline:{conv_id}"
+    lock_key = f"7crm:ap_lock:{conv_id}"
+
+    if r:
+        r.setex(deadline_key, 600, str(deadline))
+        lock_exists = r.exists(lock_key)
+        if lock_exists:
+            print(f"[AUTOPILOT] Debounce: prazo atualizado +{window}s para conv={conv_id[:8]} (watcher já ativo)")
+            return
+    print(f"[AUTOPILOT] Iniciando watcher para conv={conv_id[:8]} instância={instance_name} janela={window}s")
+    asyncio.create_task(_auto_pilot_watcher(conv_id, tenant_id, instance_name))
+
 
 def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str):
     """
