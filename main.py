@@ -5522,10 +5522,7 @@ Você é um assistente de atendimento via WhatsApp. Responda de forma natural, d
         history_str = "\n".join(history_lines)
         messages_for_ai = [{"role": "user", "content": f"Histórico:\n{history_str}\n\nMensagens pendentes do cliente:\n{pending_text}\n\nResponda agora."}]
 
-        import anthropic as _ant
-        _ant_client = _ant.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY",""))
-        response = await _ant_client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=500, system=system_prompt, messages=messages_for_ai)
-        reply_text = response.content[0].text.strip() if response.content else ""
+        reply_text = await call_ai(system_prompt, messages_for_ai[0]["content"], max_tokens=500)
         if not reply_text:
             return {"ok": False, "reason": "IA retornou resposta vazia"}
 
