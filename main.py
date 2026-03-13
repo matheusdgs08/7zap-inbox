@@ -1084,9 +1084,9 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             for k in keys_to_del:
                 _cache.pop(k, None)
 
-            # ── AUTO-PILOT: responde automaticamente se modo ativo e mensagem inbound ──
+            # ── AUTO-PILOT: debounce — acumula mensagens na janela antes de responder ──
             if not is_from_me and conv_id and tid:
-                asyncio.create_task(_auto_pilot_reply(conv_id, tid, instance_name))
+                _autopilot_debounce_trigger(conv_id, tid, instance_name)
 
         return {"ok": True}
     except Exception as e:
@@ -1674,42 +1674,84 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
             bg.add_task(waha_send_msg, phone_raw, body.text, session)
     return {"message": msg}
 
-async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
-    """Auto-pilot: verifica se deve responder automaticamente e envia via WAHA."""
-    try:
-        import datetime as _dt
-        print(f"[AUTOPILOT] START conv={conv_id[:8]} instance={instance_name}")
+def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str):
+    """
+    Debounce trigger: cada mensagem nova empurra o prazo de resposta para frente.
+    Usa Redis para coordenar:
+      ap_deadline:{conv_id}  — timestamp Unix (float) de quando responder
+      ap_lock:{conv_id}      — lock: só 1 watcher roda por conversa
+    Se o watcher já está rodando (lock ativo), apenas atualiza o deadline.
+    Se não está, cria uma nova task watcher.
+    """
+    import time as _time
+    r = _get_redis()
+    # Janela de debounce: 2-4 min aleatório (re-randomizado a cada mensagem nova)
+    window = random.randint(120, 240)
+    deadline = _time.time() + window
+    deadline_key = f"7crm:ap_deadline:{conv_id}"
+    lock_key = f"7crm:ap_lock:{conv_id}"
 
-        # 0. Lock Redis — apenas UMA task pode rodar por conversa por vez
-        # Se outra task já está processando esta conversa, aborta silenciosamente
-        lock_key = f"7crm:ap_lock:{conv_id}"
-        r = _get_redis()
-        if r:
-            # SET NX EX = set only if not exists, com TTL de 8 minutos
-            acquired = r.set(lock_key, "1", nx=True, ex=480)
-            if not acquired:
-                print(f"[AUTOPILOT] Lock já ativo para conv={conv_id[:8]} — outra task em andamento, abortando")
-                return
-        
-        # 1. Busca config da instância e dados da conversa
+    if r:
+        # Sempre atualiza o deadline (empurra a janela pra frente)
+        r.setex(deadline_key, 600, str(deadline))  # TTL 10min
+        # Só cria nova task se não há watcher ativo
+        lock_exists = r.exists(lock_key)
+        if lock_exists:
+            print(f"[AUTOPILOT] Debounce: prazo atualizado +{window}s para conv={conv_id[:8]} (watcher já ativo)")
+            return
+    # Cria watcher (sem Redis: dispara direto com delay fixo)
+    asyncio.create_task(_auto_pilot_watcher(conv_id, tenant_id, instance_name))
+
+
+async def _auto_pilot_watcher(conv_id: str, tenant_id: str, instance_name: str):
+    """
+    Watcher: aguarda a janela de debounce fechar, acumula todas as mensagens
+    recebidas nesse período e envia UMA resposta só para todas elas.
+    """
+    import datetime as _dt, time as _time
+    lock_key = f"7crm:ap_lock:{conv_id}"
+    deadline_key = f"7crm:ap_deadline:{conv_id}"
+    r = _get_redis()
+
+    # Adquire lock (sem Redis: prossegue direto)
+    if r:
+        acquired = r.set(lock_key, "1", nx=True, ex=600)
+        if not acquired:
+            print(f"[AUTOPILOT] Watcher: lock já ativo para conv={conv_id[:8]}, abortando")
+            return
+    print(f"[AUTOPILOT] Watcher iniciado para conv={conv_id[:8]}")
+
+    try:
+        # ── Fase 1: aguarda a janela fechar (polling a cada 10s) ──────────────
+        while True:
+            await asyncio.sleep(10)
+            if r:
+                raw = r.get(deadline_key)
+                if raw:
+                    deadline = float(raw.decode() if isinstance(raw, bytes) else raw)
+                    remaining = deadline - _time.time()
+                    if remaining > 0:
+                        print(f"[AUTOPILOT] conv={conv_id[:8]} aguardando {remaining:.0f}s restantes (novas msgs podem ter chegado)")
+                        continue  # deadline foi empurrado por nova mensagem — espera mais
+                # Deadline passou (ou chave expirou) → hora de responder
+            break
+
+        # ── Fase 2: verifica condições ───────────────────────────────────────
+        # Pausa por atendente?
+        if autopilot_is_paused(conv_id):
+            print(f"[AUTOPILOT] Pausa de atendente ativa — conv={conv_id[:8]}, abortando")
+            return
+
         conv = supabase.table("conversations").select(
             "id,status,copilot_auto_mode,contacts(phone),tenants(plan,ai_credits,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end)"
         ).eq("id", conv_id).single().execute().data
         if not conv:
-            if r: r.delete(lock_key)
             return
 
-        # 2. Verifica se auto-pilot está pausado NESTA conversa especificamente
         if conv.get("copilot_auto_mode") is False or conv.get("copilot_auto_mode") == "false":
-            print(f"[AUTOPILOT] Pausado nesta conversa {conv_id}")
+            print(f"[AUTOPILOT] Pausado nesta conversa {conv_id[:8]}")
             return
 
-        # 2b. Verifica pausa temporária (atendente respondeu manualmente nos últimos 30min)
-        if autopilot_is_paused(conv_id):
-            print(f"[AUTOPILOT] Pausa temporária ativa — atendente respondeu recentemente em conv={conv_id[:8]}")
-            return
-
-        # 3. Busca config da instância (prioridade sobre tenant)
         inst_cfg = {}
         if instance_name:
             _rows = supabase.table("gateway_instances").select(
@@ -1719,169 +1761,186 @@ async def _auto_pilot_reply(conv_id: str, tenant_id: str, instance_name: str):
                 inst_cfg = _rows[0]
 
         tenant_data = conv.get("tenants") or {}
-        # Modo APENAS da instância — NÃO herda do tenant para evitar ativar todas as instâncias
-        # Se a instância não tem config, padrão é "off"
         mode = inst_cfg.get("copilot_auto_mode") or "off"
         sched_start = inst_cfg.get("copilot_schedule_start") or "18:00"
         sched_end   = inst_cfg.get("copilot_schedule_end")   or "09:00"
-        # Prompt: instância primeiro, fallback para tenant
         company_prompt_override = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt")
 
-        # 4. Decide se deve responder baseado no modo
+        # Verifica modo
         should_reply = False
         if mode == "always":
             should_reply = True
         elif mode == "per_conv":
-            # per_conv: a IA só responde se explicitamente ativada nesta conversa (auto_mode=True)
-            # Como não pausado (checado acima), consideramos ativo por padrão
             should_reply = True
         elif mode == "schedule":
-            now = _dt.datetime.utcnow()
-            # Converte para horário de Brasília (UTC-3)
-            now_brt = now - _dt.timedelta(hours=3)
+            now_brt = _dt.datetime.utcnow() - _dt.timedelta(hours=3)
             sh, sm = map(int, sched_start.split(":"))
             eh, em = map(int, sched_end.split(":"))
             now_mins = now_brt.hour * 60 + now_brt.minute
             start_mins = sh * 60 + sm
             end_mins   = eh * 60 + em
-            if start_mins > end_mins:  # overnight
+            if start_mins > end_mins:
                 should_reply = now_mins >= start_mins or now_mins < end_mins
             else:
                 should_reply = start_mins <= now_mins < end_mins
 
-        print(f"[AUTOPILOT] conv={conv_id[:8]} instance={instance_name} mode={mode} inst_cfg_mode={inst_cfg.get('copilot_auto_mode')} should_reply={should_reply}")
+        print(f"[AUTOPILOT] conv={conv_id[:8]} mode={mode} should_reply={should_reply}")
         if not should_reply:
-            print(f"[AUTOPILOT] Modo={mode}, não vai responder agora (schedule fora do horário ou off)")
             return
 
-        # 5. Verifica plano (Starter não tem IA)
         plan = tenant_data.get("plan", "trial")
         if plan == "starter":
             print(f"[AUTOPILOT] Plano starter — sem auto-pilot")
             return
 
-        # 6. Consome crédito
+        # Verifica se já tem outbound recente (atendente pode ter respondido durante a espera)
+        recent = supabase.table("messages").select("id,direction,created_at") \
+            .eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+        if recent and recent[0].get("direction") == "outbound":
+            print(f"[AUTOPILOT] Atendente respondeu durante a janela — abortando conv={conv_id[:8]}")
+            return
+
+        # ── Fase 3: consome crédito ──────────────────────────────────────────
         ok, remaining, err = consume_credit(tenant_id, 1)
         if not ok:
             print(f"[AUTOPILOT] Sem créditos: {err}")
             return
 
-        # 7a. Delay humano: aguarda 2-4 minutos antes de responder
-        delay_secs = random.randint(120, 240)
-        print(f"[AUTOPILOT] Aguardando {delay_secs}s (delay humano) para conv={conv_id[:8]}")
-        await asyncio.sleep(delay_secs)
-
-        # Verifica se não chegou outra mensagem durante o delay (evita resposta duplicada)
-        recent_check = supabase.table("messages").select("id,direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
-        if recent_check and recent_check[0].get("direction") == "outbound":
-            print(f"[AUTOPILOT] Mensagem outbound detectada durante delay — abortando para não duplicar")
-            return
-
-        # 7b. Gera resposta com IA
+        # ── Fase 4: coleta TODAS as mensagens inbound acumuladas ─────────────
         all_msgs = supabase.table("messages").select(
-            "direction,content,is_internal_note,created_at"
+            "id,direction,content,type,is_internal_note,media_url,created_at"
         ).eq("conversation_id", conv_id).order("created_at").execute().data
 
+        # Identifica o bloco de mensagens inbound recentes (desde o último outbound)
+        last_outbound_idx = -1
+        for idx, m in enumerate(all_msgs):
+            if m.get("direction") == "outbound" and not m.get("is_internal_note"):
+                last_outbound_idx = idx
+        pending_inbound = [
+            m for m in all_msgs[last_outbound_idx + 1:]
+            if m.get("direction") == "inbound" and not m.get("is_internal_note")
+        ]
+        print(f"[AUTOPILOT] conv={conv_id[:8]}: {len(pending_inbound)} msgs inbound acumuladas na janela")
+
+        # Transcreve áudios pendentes
+        for amsg in pending_inbound[:3]:
+            if amsg.get("type") in ("audio", "ptt") and amsg.get("content", "").startswith("[Áudio"):
+                try:
+                    media_url = amsg.get("media_url")
+                    if media_url:
+                        async with httpx.AsyncClient(timeout=20) as _c:
+                            ar = await _c.get(media_url, headers=waha_headers())
+                            if ar.status_code == 200:
+                                import openai as _oai, io
+                                _oai_client = _oai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+                                if _oai_client.api_key:
+                                    transcript = await _oai_client.audio.transcriptions.create(
+                                        model="whisper-1",
+                                        file=("audio.ogg", io.BytesIO(ar.content), "audio/ogg"),
+                                        language="pt"
+                                    )
+                                    transcribed = transcript.text.strip()
+                                    if transcribed:
+                                        amsg["content"] = transcribed
+                                        supabase.table("messages").update({"content": transcribed}).eq("id", amsg["id"]).execute()
+                except Exception as _ae:
+                    print(f"[AUTOPILOT] Whisper erro: {_ae}")
+
+        # ── Fase 5: monta contexto e chama IA ────────────────────────────────
         history_str, recent_msgs, old_msgs = trim_context(all_msgs, max_msgs=15)
         existing_summary = supabase.table("conversations").select("ai_summary").eq("id", conv_id).single().execute().data or {}
         summary = await get_or_generate_summary(conv_id, old_msgs, existing_summary.get("ai_summary"))
 
-        # Transcreve áudios recentes que ainda não foram transcritos
-        audio_msgs_to_transcribe = [m for m in recent_msgs if m.get("type") in ("audio", "ptt") and m.get("direction") == "inbound" and m.get("content", "").startswith("[Áudio")]
-        for amsg in audio_msgs_to_transcribe[:3]:  # máximo 3 áudios por vez
-            try:
-                msg_id = amsg.get("id")
-                media_url = amsg.get("media_url")
-                if media_url:
-                    async with httpx.AsyncClient(timeout=20) as _c:
-                        ar = await _c.get(media_url, headers=waha_headers())
-                        if ar.status_code == 200:
-                            import openai as _oai
-                            _oai_client = _oai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
-                            if _oai_client.api_key:
-                                import io
-                                audio_bytes = ar.content
-                                transcript = await _oai_client.audio.transcriptions.create(
-                                    model="whisper-1",
-                                    file=("audio.ogg", io.BytesIO(audio_bytes), "audio/ogg"),
-                                    language="pt"
-                                )
-                                transcribed = transcript.text.strip()
-                                if transcribed:
-                                    # Atualiza conteúdo no histórico local para o contexto da IA
-                                    amsg["content"] = f"[Áudio transcrito: {transcribed}]"
-                                    print(f"[AUTOPILOT] Áudio transcrito: {transcribed[:80]}")
-            except Exception as _ae:
-                print(f"[AUTOPILOT] Erro transcrição áudio: {_ae}")
+        # Mensagens acumuladas → texto único para contexto final da IA
+        if pending_inbound:
+            accumulated_text = "\n".join(
+                f"- {m.get('content', '')}" for m in pending_inbound if m.get("content")
+            )
+        else:
+            accumulated_text = (all_msgs[-1].get("content") or "") if all_msgs else ""
 
-        # Reconstrói histórico com transcrições
-        history_lines = []
+        system_prompt = f"""Você é um assistente de atendimento via WhatsApp. Responda de forma natural, direta e humana.
+REGRAS IMPORTANTES:
+- Responda TODAS as perguntas e mensagens do cliente em UMA ÚNICA mensagem
+- Se o cliente enviou várias mensagens seguidas, agrupe sua resposta
+- Seja conciso mas completo
+- Use linguagem informal e amigável (você, não tu)
+- NUNCA diga que é uma IA
+- NÃO use markdown, asteriscos ou formatação especial
+{f"CONTEXTO DA EMPRESA:\n{company_prompt_override}" if company_prompt_override else ""}
+{f"RESUMO DO HISTÓRICO:\n{summary}" if summary else ""}"""
+
+        messages_for_ai = []
         for m in recent_msgs:
-            role = "Cliente" if m.get("direction") == "inbound" else "Atendente"
-            c = m.get("content", "")
-            if c and not m.get("is_internal_note"):
-                history_lines.append(f"{role}: {c}")
-        history_str_final = "\n".join(history_lines) if history_lines else history_str
+            if m.get("is_internal_note"): continue
+            role = "assistant" if m.get("direction") == "outbound" else "user"
+            text = m.get("content", "")
+            if text: messages_for_ai.append({"role": role, "content": text})
 
-        company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or \
-            f"Você é atendente da empresa. Seja simpático e objetivo."
-        system = company_prompt + "\n\nResponda a mensagem do cliente de forma natural e breve. Se o cliente fez múltiplas perguntas, responda todas em uma única mensagem. Máximo 3 frases. Sem explicações."
+        # Garante que o último user message é o bloco acumulado
+        if pending_inbound and len(pending_inbound) > 1:
+            # Remove msgs inbound duplicadas do final e substitui pelo bloco acumulado
+            while messages_for_ai and messages_for_ai[-1]["role"] == "user":
+                messages_for_ai.pop()
+            messages_for_ai.append({"role": "user", "content": accumulated_text})
 
-        context_parts = []
-        if summary:
-            context_parts.append(f"[RESUMO]\n{summary}\n[FIM DO RESUMO]")
-        context_parts.append(f"[ÚLTIMAS MENSAGENS]\n{history_str_final}")
+        if not messages_for_ai:
+            return
 
-        reply_text = await call_ai(system, "\n\n".join(context_parts) + "\n\nResponda ao cliente:", max_tokens=300, prefer_openai=False)
-
-        if not reply_text or not reply_text.strip():
+        import anthropic as _ant
+        _ant_client = _ant.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+        response = await _ant_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system=system_prompt,
+            messages=messages_for_ai,
+        )
+        reply_text = response.content[0].text.strip() if response.content else ""
+        if not reply_text:
             print(f"[AUTOPILOT] IA retornou resposta vazia")
             return
 
-        # 8. Salva a mensagem no banco
-        msg_row = supabase.table("messages").insert({
+        print(f"[AUTOPILOT] IA respondeu ({len(pending_inbound)} msgs acumuladas): {reply_text[:80]}")
+
+        # ── Fase 6: salva e envia ─────────────────────────────────────────────
+        supabase.table("messages").insert({
             "conversation_id": conv_id,
             "tenant_id": tenant_id,
             "direction": "outbound",
-            "content": reply_text.strip(),
+            "content": reply_text,
             "type": "text",
-        }).execute().data
+        }).execute()
         supabase.table("conversations").update({
-            "last_message_at": datetime.utcnow().isoformat(),
-            "last_message_preview": "✓ " + reply_text.strip()[:78],
+            "last_message_at": _dt.datetime.utcnow().isoformat(),
+            "last_message_preview": "✓ " + reply_text[:78],
         }).eq("id", conv_id).execute()
 
-        # 9. Envia via WAHA
         phone = (conv.get("contacts") or {}).get("phone", "")
         if phone and instance_name:
-            # Detecta LID: número muito longo (>13 dígitos) = ID interno WhatsApp
-            # NOWEB sem store não consegue entregar para LIDs
             digits_only = "".join(c for c in str(phone) if c.isdigit())
             is_lid = len(digits_only) > 13 and not digits_only.startswith("55")
             if is_lid:
-                print(f"[AUTOPILOT] AVISO: phone={phone} parece ser LID (NOWEB sem store). Mensagem salva no CRM mas pode não chegar. Use WEBJS ou habilite NOWEB store.")
-                # Tenta mesmo assim com @lid — pode funcionar em alguns casos
-                chat_id_lid = f"{digits_only}@lid"
+                print(f"[AUTOPILOT] LID detectado — tentando @lid para {phone}")
                 try:
                     async with httpx.AsyncClient(timeout=15) as _c:
                         _r = await _c.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(),
-                            json={"session": instance_name, "chatId": chat_id_lid, "text": reply_text.strip()})
-                        print(f"[AUTOPILOT] LID send status={_r.status_code} body={_r.text[:200]}")
+                            json={"session": instance_name, "chatId": f"{digits_only}@lid", "text": reply_text})
+                        print(f"[AUTOPILOT] LID send status={_r.status_code}")
                 except Exception as _se:
                     print(f"[AUTOPILOT] LID send erro: {_se}")
             else:
-                r = await waha_send_msg(phone, reply_text.strip(), instance_name)
-                print(f"[AUTOPILOT] Enviado para {phone} via {instance_name}: {reply_text[:60]}")
-
-        # Libera lock após responder com sucesso
-        if r: r.delete(lock_key)
+                await waha_send_msg(phone, reply_text, instance_name)
 
     except Exception as _e:
         print(f"[AUTOPILOT] Erro: {_e}")
-        # Garante liberação do lock mesmo em caso de erro
+        import traceback; traceback.print_exc()
+    finally:
+        # Sempre libera o lock e limpa o deadline
         try:
-            _r2 = _get_redis()
-            if _r2: _r2.delete(f"7crm:ap_lock:{conv_id}")
+            _rf = _get_redis()
+            if _rf:
+                _rf.delete(lock_key)
+                _rf.delete(deadline_key)
         except: pass
 
 
