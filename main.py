@@ -2899,16 +2899,20 @@ async def suggest_broadcast_message(body: dict):
 
 @app.post("/broadcasts/preview-resume", dependencies=[Depends(verify_key)])
 async def preview_resume_message(body: dict):
-    """Gera preview da mensagem 'Retomar conversa' sem consumir créditos."""
+    """Gera preview da mensagem 'Retomar conversa' — consome 3 créditos."""
     if not ANTHROPIC_API_KEY: raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+    tenant_id = body.get("tenant_id")
+    ok_credit, credits_left, err = consume_credit(tenant_id, 3)
+    if not ok_credit:
+        raise HTTPException(status_code=402, detail=err or "Créditos insuficientes")
     msg = await generate_resume_message(
-        body.get("tenant_id"),
+        tenant_id,
         body.get("conversation_id"),
         body.get("contact_name") or "",
         body.get("contact_phone") or "",
         body.get("objective") or ""
     )
-    return {"preview": msg}
+    return {"preview": msg, "credits_left": credits_left}
 
 @app.post("/broadcasts", dependencies=[Depends(verify_key)])
 async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
