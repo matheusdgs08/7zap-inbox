@@ -1117,6 +1117,22 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                 except Exception:
                     pass
 
+            # Para mensagens fromMe (IA enviou): checar duplicata por conteúdo nos últimos 90s
+            # Evita duplicar quando o watcher já salvou e o WAHA devolve o fromMe webhook
+            if is_from_me and content:
+                try:
+                    import datetime as _dt2
+                    _cutoff = (_dt2.datetime.utcnow() - _dt2.timedelta(seconds=90)).isoformat()
+                    _dup_out = supabase.table("messages").select("id,waha_id").eq("conversation_id", conv_id).eq("direction", "outbound").eq("content", content).gte("created_at", _cutoff).limit(1).execute().data
+                    if _dup_out:
+                        # Já existe — apenas atualizar o waha_id se estiver faltando
+                        if waha_id and not _dup_out[0].get("waha_id"):
+                            supabase.table("messages").update({"waha_id": waha_id}).eq("id", _dup_out[0]["id"]).execute()
+                        print(f"[WEBHOOK] fromMe DUPLICATE por conteúdo — atualizado waha_id e ignorado")
+                        continue
+                except Exception:
+                    pass
+
             # Salva mensagem
             try:
                 # Determine stored type
