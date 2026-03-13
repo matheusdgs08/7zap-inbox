@@ -179,6 +179,8 @@ async def startup_event():
     asyncio.create_task(fix_existing_sessions_webhook())
     asyncio.create_task(watchguard_loop())
     asyncio.create_task(scheduled_messages_loop())
+    # Recovery: re-dispara autopilot para conversas inbound sem resposta que ficaram presas no restart
+    asyncio.create_task(_startup_autopilot_recovery())
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
@@ -1781,6 +1783,76 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks, use
             bg.add_task(waha_send_msg, phone_raw, body.text, session)
     return {"message": msg}
 
+async def _startup_autopilot_recovery():
+    """
+    Roda UMA VEZ após restart do Railway.
+    Varre todas as instâncias com autopilot ativo e re-dispara o debounce
+    para conversas que ficaram com inbound sem resposta durante o restart.
+    Janela: últimas 2 horas. Aguarda 90s para o app estabilizar antes de rodar.
+    """
+    await asyncio.sleep(90)
+    import datetime as _dt
+    print("[STARTUP_RECOVERY] Iniciando varredura de conversas presas...")
+    try:
+        instances = supabase.table("gateway_instances").select(
+            "instance_name,tenant_id,copilot_auto_mode,copilot_watchguard"
+        ).eq("copilot_watchguard", True).execute().data or []
+
+        recovered = 0
+        cutoff_recent = (_dt.datetime.utcnow() - _dt.timedelta(hours=2)).isoformat()
+
+        for inst in instances:
+            if inst.get("copilot_auto_mode") in ("off", None, ""):
+                continue
+            inst_name = inst["instance_name"]
+            tenant_id = inst["tenant_id"]
+
+            try:
+                tenant = supabase.table("tenants").select("plan,ai_credits,is_blocked").eq("id", tenant_id).single().execute().data
+                if not tenant or tenant.get("is_blocked") or tenant.get("plan") == "starter":
+                    continue
+                if (tenant.get("ai_credits") or 0) <= 0:
+                    continue
+
+                # Busca conversas abertas desta instância
+                convs = supabase.table("conversations").select(
+                    "id,copilot_auto_mode"
+                ).eq("instance_name", inst_name).eq("tenant_id", tenant_id).eq("status", "open").execute().data or []
+
+                for conv in convs:
+                    conv_id = conv["id"]
+                    if conv.get("copilot_auto_mode") is False or conv.get("copilot_auto_mode") == "false":
+                        continue
+                    if autopilot_is_paused(conv_id):
+                        continue
+                    r = _get_redis()
+                    if r and r.exists(f"7crm:ap_lock:{conv_id}"):
+                        continue
+                    if r and r.exists(f"7crm:wg_sent:{conv_id}"):
+                        continue
+
+                    # Última mensagem: inbound dentro das últimas 2h?
+                    last_msgs = supabase.table("messages").select("direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+                    if not last_msgs:
+                        continue
+                    last = last_msgs[0]
+                    if last.get("direction") != "inbound":
+                        continue
+                    if last.get("created_at", "") < cutoff_recent:
+                        continue  # mensagem antiga demais — watchguard normal vai pegar
+
+                    print(f"[STARTUP_RECOVERY] Re-disparando debounce → conv={conv_id[:8]} inst={inst_name}")
+                    asyncio.create_task(_autopilot_debounce_trigger_async(conv_id, tenant_id, inst_name))
+                    recovered += 1
+
+            except Exception as e:
+                print(f"[STARTUP_RECOVERY] Erro instância {inst_name}: {e}")
+
+        print(f"[STARTUP_RECOVERY] Concluído — {recovered} conversa(s) re-disparada(s)")
+    except Exception as e:
+        print(f"[STARTUP_RECOVERY] Erro geral: {e}")
+
+
 async def watchguard_loop():
     """
     🛡 Watch Guard — roda a cada 5 minutos.
@@ -1830,10 +1902,16 @@ async def _watchguard_scan():
             if (tenant.get("ai_credits") or 0) <= 0:
                 continue
 
-            # Busca conversas abertas desta instância onde last_message_at < cutoff (mais de 6min atrás)
-            convs = supabase.table("conversations").select(
+            # Busca conversas abertas desta instância onde:
+            # (a) last_message_at < cutoff (mais de 6min sem resposta), OU
+            # (b) last_message_at = null (timestamp ausente — watchguard checa pelo conteúdo)
+            convs_timed = supabase.table("conversations").select(
                 "id,status,copilot_auto_mode,last_message_at,unread_count"
-            ).eq("instance_name", inst_name).eq("tenant_id", tenant_id).eq("status", "open").lt("last_message_at", cutoff).execute().data
+            ).eq("instance_name", inst_name).eq("tenant_id", tenant_id).eq("status", "open").lt("last_message_at", cutoff).execute().data or []
+            convs_null = supabase.table("conversations").select(
+                "id,status,copilot_auto_mode,last_message_at,unread_count"
+            ).eq("instance_name", inst_name).eq("tenant_id", tenant_id).eq("status", "open").is_("last_message_at", "null").execute().data or []
+            convs = convs_timed + convs_null
 
             for conv in convs:
                 conv_id = conv["id"]
