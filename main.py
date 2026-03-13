@@ -2054,7 +2054,7 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
     r = _get_redis()
-    window = random.randint(45, 90)  # 45-90s — mais responsivo
+    window = random.randint(60, 90)  # 60-90s — aguarda cliente terminar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2254,9 +2254,11 @@ async def _auto_pilot_watcher(conv_id: str, tenant_id: str, instance_name: str):
         else:
             accumulated_text = (all_msgs[-1].get("content") or "") if all_msgs else ""
 
-        system_prompt = f"""Você é um assistente de atendimento via WhatsApp. Responda de forma natural, direta e humana.
-REGRAS IMPORTANTES:
-- Responda TODAS as perguntas e mensagens do cliente em UMA ÚNICA mensagem
+        system_prompt = f"""CONTINUE esta conversa do WhatsApp como o assistente. NÃO se apresente novamente se já se apresentou antes.
+REGRAS:
+- Leia o histórico completo abaixo e continue de onde parou
+- NUNCA repita a apresentação se já houve mensagens anteriores
+- Responda todas as perguntas em UMA ÚNICA mensagem
 - Se o cliente enviou várias mensagens seguidas, agrupe sua resposta
 - Seja conciso mas completo
 - Use linguagem informal e amigável (você, não tu)
@@ -2283,7 +2285,12 @@ REGRAS IMPORTANTES:
         if not messages_for_ai:
             return
 
-        user_content = messages_for_ai[0]["content"] if messages_for_ai else ""
+        # Passa histórico COMPLETO como contexto — não só a primeira mensagem
+        history_for_ai = []
+        for _m in messages_for_ai:
+            _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
+            history_for_ai.append(f"{_role}: {_m['content']}")
+        user_content = "\n".join(history_for_ai) + "\n\nResponda agora como Atendente (sem dizer seu nome se já se apresentou):"
         reply_text = await call_ai(system_prompt, user_content, max_tokens=500)
         if not reply_text:
             print(f"[AUTOPILOT] IA retornou resposta vazia")
