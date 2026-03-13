@@ -536,6 +536,36 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             raise HTTPException(status_code=401, detail="Sessão encerrada. Outro dispositivo fez login com esta conta.")
     return payload
 
+async def get_current_user_flex(
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
+    x_api_key: str = Header(default=""),
+    tenant_id: str = ""
+) -> dict:
+    """
+    Versão flexível: aceita Bearer JWT (seguro) ou x-api-key legado.
+    Usado em endpoints que o frontend chama com x-api-key + tenant_id query param.
+    """
+    # Tenta JWT primeiro
+    if credentials and credentials.credentials:
+        try:
+            payload = decode_jwt(credentials.credentials)
+            session_id = payload.get("session_id")
+            if session_id:
+                db_user = supabase.table("users").select("session_id,is_active").eq("id", payload["sub"]).single().execute().data
+                if not db_user or not db_user.get("is_active"):
+                    raise HTTPException(status_code=401, detail="Usuário inativo")
+                if db_user.get("session_id") != session_id:
+                    raise HTTPException(status_code=401, detail="Sessão encerrada.")
+            return payload
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    # Fallback: x-api-key legado — monta payload mínimo com tenant_id do query
+    if x_api_key == INBOX_API_KEY and tenant_id:
+        return {"tenant_id": tenant_id, "sub": None, "role": "agent", "name": "system"}
+    raise HTTPException(status_code=401, detail="Autenticação necessária")
+
 async def require_admin(user=Depends(get_current_user)):
     if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Apenas admins")
     return user
@@ -1492,7 +1522,7 @@ async def delete_conversation(conv_id: str):
     return {"ok": True}
 
 @app.get("/conversations/{conv_id}/messages")
-async def get_messages(conv_id: str, before: str = None, limit: int = 10, user: dict = Depends(get_current_user)):
+async def get_messages(conv_id: str, before: str = None, limit: int = 10, user: dict = Depends(get_current_user_flex)):
     # Validate: conversation must belong to the user's tenant
     conv_check = supabase.table("conversations").select("tenant_id").eq("id", conv_id).maybe_single().execute()
     if not conv_check.data or conv_check.data.get("tenant_id") != user["tenant_id"]:
@@ -1695,7 +1725,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
 
 
 @app.post("/conversations/{conv_id}/messages")
-async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks, user=Depends(get_current_user)):
+async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks, user=Depends(get_current_user_flex)):
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).single().execute().data
     if not conv: raise HTTPException(status_code=404, detail="Conversa não encontrada")
     msg = supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": conv.get("tenant_id"), "direction": "outbound", "content": body.text, "type": "text", "sent_by": body.sent_by, "is_internal_note": body.is_internal_note}).execute().data[0]
@@ -2205,7 +2235,7 @@ async def waha_send_msg(phone: str, text: str, session: str = "default"):
         print(f"[WAHA_SEND] ERRO: {_e}")
 
 @app.post("/conversations/{conv_id}/media")
-async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None), user=Depends(get_current_user)):
+async def send_media(conv_id: str, bg: BackgroundTasks, file: UploadFile = File(...), caption: str = Form(""), sent_by: str = Form(None), user=Depends(get_current_user_flex)):
     """Envia imagem ou documento via WhatsApp"""
     conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).single().execute().data
     if not conv: raise HTTPException(status_code=404, detail="Conversa não encontrada")
@@ -2255,11 +2285,11 @@ async def waha_send_media(phone: str, b64: str, mimetype: str, filename: str, ca
         print(f"[waha_send_media] error: {e}")
 
 @app.put("/conversations/{conv_id}/assign")
-async def assign_conversation(conv_id: str, body: AssignConversation, user=Depends(get_current_user)):
+async def assign_conversation(conv_id: str, body: AssignConversation, user=Depends(get_current_user_flex)):
     return supabase.table("conversations").update({"assigned_to": body.user_id, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data[0]
 
 @app.put("/conversations/{conv_id}/kanban")
-async def update_kanban(conv_id: str, body: UpdateKanban, user=Depends(get_current_user)):
+async def update_kanban(conv_id: str, body: UpdateKanban, user=Depends(get_current_user_flex)):
     return supabase.table("conversations").update({"kanban_stage": body.stage, "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data[0]
 
 @app.post("/contacts/{contact_id}/block", dependencies=[Depends(verify_key)])
@@ -2347,7 +2377,7 @@ async def pending_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "pending", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
 @app.put("/conversations/{conv_id}/labels")
-async def update_conversation_labels(conv_id: str, body: UpdateLabels, user=Depends(get_current_user)):
+async def update_conversation_labels(conv_id: str, body: UpdateLabels, user=Depends(get_current_user_flex)):
     # Verifica que a conversa pertence ao tenant do usuário
     conv_check = supabase.table("conversations").select("id,contact_id").eq("id", conv_id).eq("tenant_id", user["tenant_id"]).execute().data
     if not conv_check: raise HTTPException(status_code=404, detail="Conversa não encontrada")
