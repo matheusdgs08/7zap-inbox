@@ -1815,6 +1815,11 @@ async def _watchguard_scan():
     for inst in instances:
         inst_name = inst["instance_name"]
         tenant_id = inst["tenant_id"]
+
+        # Respeita o modo da instância — watchguard não dispara se modo for off
+        if inst.get("copilot_auto_mode") in ("off", None, ""):
+            continue
+
         try:
             # Verifica créditos e plano do tenant
             tenant = supabase.table("tenants").select("plan,ai_credits,copilot_prompt,is_blocked").eq("id", tenant_id).single().execute().data
