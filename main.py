@@ -5461,8 +5461,9 @@ async def save_kanban_columns(body: dict):
 
 # ── /conversations/{id}/trigger-autopilot ─────────────────────────────────────
 @app.post("/conversations/{conv_id}/trigger-autopilot", dependencies=[Depends(verify_key)])
-async def trigger_autopilot(conv_id: str):
-    """Dispara o debounce do autopilot para uma conversa sem criar mensagem nova."""
+async def trigger_autopilot(conv_id: str, bg: BackgroundTasks):
+    """Dispara o autopilot para uma conversa sem criar mensagem nova.
+    Usa BackgroundTasks do FastAPI — mais confiável que asyncio.create_task."""
     try:
         conv = supabase.table("conversations").select(
             "id,status,instance_name,tenant_id,copilot_auto_mode"
@@ -5475,18 +5476,21 @@ async def trigger_autopilot(conv_id: str):
             return {"ok": False, "reason": "Autopilot desligado nesta conversa"}
         tenant_id = conv.get("tenant_id")
         instance_name = conv.get("instance_name") or ""
-        # Limpa lock/wg_sent/deadline antigos para garantir que vai rodar
+        # Limpa lock/wg_sent/deadline antigos
         r = _get_redis()
         if r:
             r.delete(f"7crm:ap_lock:{conv_id}")
             r.delete(f"7crm:ap_deadline:{conv_id}")
             r.delete(f"7crm:wg_sent:{conv_id}")
-        # Dispara watcher diretamente com delay mínimo (sem debounce)
-        async def _direct_trigger(cid=conv_id, tid=tenant_id, inst=instance_name):
-            await asyncio.sleep(3)
-            await _auto_pilot_watcher(cid, tid, inst)
-        asyncio.create_task(_direct_trigger())
-        return {"ok": True, "conv_id": conv_id, "message": "Autopilot disparado — IA responde em ~5-15s"}
+
+        async def _run_watcher():
+            try:
+                await _auto_pilot_watcher(conv_id, tenant_id, instance_name)
+            except Exception as e:
+                print(f"[TRIGGER_AUTOPILOT] Erro: {e}")
+
+        bg.add_task(_run_watcher)
+        return {"ok": True, "conv_id": conv_id, "message": "Autopilot disparado — IA responde em ~10-20s"}
     except HTTPException:
         raise
     except Exception as e:
