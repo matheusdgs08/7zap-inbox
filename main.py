@@ -5461,37 +5461,96 @@ async def save_kanban_columns(body: dict):
 
 # ── /conversations/{id}/trigger-autopilot ─────────────────────────────────────
 @app.post("/conversations/{conv_id}/trigger-autopilot", dependencies=[Depends(verify_key)])
-async def trigger_autopilot(conv_id: str, bg: BackgroundTasks):
-    """Dispara o autopilot para uma conversa sem criar mensagem nova.
-    Usa BackgroundTasks do FastAPI — mais confiável que asyncio.create_task."""
+async def trigger_autopilot(conv_id: str):
+    """Executa o autopilot diretamente — bypassa debounce e roda inline."""
+    import datetime as _dt
     try:
         conv = supabase.table("conversations").select(
-            "id,status,instance_name,tenant_id,copilot_auto_mode"
+            "id,status,instance_name,tenant_id,copilot_auto_mode,contacts(phone),tenants(plan,ai_credits,copilot_prompt,copilot_auto_mode)"
         ).eq("id", conv_id).single().execute().data
         if not conv:
             raise HTTPException(status_code=404, detail="Conversa não encontrada")
         if conv.get("status") != "open":
             return {"ok": False, "reason": "Conversa não está aberta"}
-        if conv.get("copilot_auto_mode") is False:
-            return {"ok": False, "reason": "Autopilot desligado nesta conversa"}
+
         tenant_id = conv.get("tenant_id")
         instance_name = conv.get("instance_name") or ""
-        # Limpa lock/wg_sent/deadline antigos
+        tenant_data = conv.get("tenants") or {}
+
+        # Limpa locks antigos
         r = _get_redis()
         if r:
             r.delete(f"7crm:ap_lock:{conv_id}")
             r.delete(f"7crm:ap_deadline:{conv_id}")
             r.delete(f"7crm:wg_sent:{conv_id}")
 
-        async def _run_watcher():
-            try:
-                await _auto_pilot_watcher(conv_id, tenant_id, instance_name)
-            except Exception as e:
-                print(f"[TRIGGER_AUTOPILOT] Erro: {e}")
+        # Checar créditos
+        if (tenant_data.get("ai_credits") or 0) <= 0:
+            return {"ok": False, "reason": "Sem créditos IA"}
 
-        bg.add_task(_run_watcher)
-        return {"ok": True, "conv_id": conv_id, "message": "Autopilot disparado — IA responde em ~10-20s"}
+        # Checar última msg — precisa ser inbound
+        msgs = supabase.table("messages").select("direction,content").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+        if not msgs or msgs[0].get("direction") == "outbound":
+            return {"ok": False, "reason": f"Última msg é outbound — nada a responder"}
+
+        # Buscar prompt da instância
+        inst_rows = supabase.table("gateway_instances").select("copilot_prompt,copilot_auto_mode").eq("instance_name", instance_name).limit(1).execute().data
+        inst_cfg = inst_rows[0] if inst_rows else {}
+        company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or ""
+
+        # Buscar histórico
+        all_msgs = supabase.table("messages").select("direction,content,type,is_internal_note,created_at").eq("conversation_id", conv_id).order("created_at").execute().data
+        last_outbound_idx = -1
+        for idx, m in enumerate(all_msgs):
+            if m.get("direction") == "outbound" and not m.get("is_internal_note"):
+                last_outbound_idx = idx
+        pending = [m for m in all_msgs[last_outbound_idx+1:] if m.get("direction") == "inbound" and not m.get("is_internal_note")]
+        if not pending:
+            return {"ok": False, "reason": "Sem mensagens inbound pendentes"}
+
+        history_lines = []
+        for m in all_msgs[-15:]:
+            if m.get("is_internal_note"): continue
+            role = "Atendente" if m.get("direction") == "outbound" else "Cliente"
+            history_lines.append(f"{role}: {m.get('content','')}")
+
+        pending_text = "\n".join(f"- {m.get('content','')}" for m in pending)
+
+        system_prompt = f"""{company_prompt}
+
+Você é um assistente de atendimento via WhatsApp. Responda de forma natural, direta e humana em UMA ÚNICA mensagem. Não use prefixos como "Atendente:" na resposta."""
+        history_str = "\n".join(history_lines)
+        messages_for_ai = [{"role": "user", "content": f"Histórico:\n{history_str}\n\nMensagens pendentes do cliente:\n{pending_text}\n\nResponda agora."}]
+
+        import anthropic as _ant
+        _ant_client = _ant.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY",""))
+        response = await _ant_client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=500, system=system_prompt, messages=messages_for_ai)
+        reply_text = response.content[0].text.strip() if response.content else ""
+        if not reply_text:
+            return {"ok": False, "reason": "IA retornou resposta vazia"}
+
+        # Enviar via WAHA
+        phone = (conv.get("contacts") or {}).get("phone","")
+        digits = "".join(c for c in str(phone) if c.isdigit())
+        is_lid = len(digits) > 13 and not digits.startswith("55")
+        chat_id = f"{digits}@lid" if is_lid else f"{digits}@s.whatsapp.net"
+
+        async with httpx.AsyncClient(timeout=15) as _c:
+            _r = await _c.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(),
+                json={"session": instance_name, "chatId": chat_id, "text": reply_text})
+            sent_ok = _r.status_code in (200, 201)
+            print(f"[TRIGGER_AUTOPILOT] WAHA status={_r.status_code} chat_id={chat_id}")
+
+        if sent_ok:
+            consume_credit(tenant_id, 1)
+            supabase.table("messages").insert({"conversation_id": conv_id, "tenant_id": tenant_id, "direction": "outbound", "content": reply_text, "type": "text", "ai_suggestion": True}).execute()
+            supabase.table("conversations").update({"last_message_at": _dt.datetime.utcnow().isoformat(), "last_message_preview": "✓ " + reply_text[:78]}).eq("id", conv_id).execute()
+            return {"ok": True, "sent": True, "reply": reply_text[:100]}
+        else:
+            return {"ok": False, "reason": f"WAHA falhou: {_r.status_code}"}
+
     except HTTPException:
         raise
     except Exception as e:
+        import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
