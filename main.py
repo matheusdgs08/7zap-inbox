@@ -808,7 +808,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
         media_filename = data.get("filename") or data.get("fileName") or ""
         if not content:
             if "image" in msg_type:    content = "[Imagem]"
-            elif "audio" in msg_type:  content = "[Áudio]"
+            elif "audio" in msg_type or msg_type == "ptt":  content = "[Áudio]"
             elif "video" in msg_type:  content = "[Vídeo]"
             elif "document" in msg_type:
                 content = f"[Documento: {media_filename}]" if media_filename else "[Documento]"
@@ -1025,7 +1025,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
                 # Determine stored type
                 stored_type = "text"
                 if "image" in msg_type:    stored_type = "image"
-                elif "audio" in msg_type:  stored_type = "audio"
+                elif "audio" in msg_type or msg_type == "ptt":  stored_type = "audio"
                 elif "video" in msg_type:  stored_type = "video"
                 elif "document" in msg_type: stored_type = "document"
                 msg_insert = {
