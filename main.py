@@ -2263,7 +2263,8 @@ REGRAS IMPORTANTES:
 - NUNCA diga que é uma IA
 - NÃO use markdown, asteriscos ou formatação especial
 {f"CONTEXTO DA EMPRESA:\n{company_prompt_override}" if company_prompt_override else ""}
-{f"RESUMO DO HISTÓRICO:\n{summary}" if summary else ""}"""
+{f"RESUMO DO HISTÓRICO:\n{summary}" if summary else ""}
+{("⚠️ INSTRUÇÃO CRÍTICA: Esta é uma CONTINUAÇÃO. O atendente JÁ se apresentou anteriormente. NÃO use o script de Primeiro Atendimento. NÃO diga seu nome novamente. Continue naturalmente a partir do histórico." if last_outbound_idx >= 0 else "")}"""
 
         messages_for_ai = []
         for m in recent_msgs:
@@ -5525,7 +5526,11 @@ async def trigger_autopilot(conv_id: str):
 
         pending_text = "\n".join(f"- {m.get('content','')}" for m in pending)
 
-        system_prompt = f"""{company_prompt}
+        # Instrução de continuação — evita IA repetir apresentação
+        has_prior_outbound = any(m.get("direction") == "outbound" for m in all_msgs[:last_outbound_idx+1])
+        continuation_note = "\n\n⚠️ INSTRUÇÃO CRÍTICA: Esta é uma CONTINUAÇÃO de conversa já em andamento. O atendente JÁ se apresentou. NÃO use o script de Primeiro Atendimento. NÃO diga seu nome novamente. Continue naturalmente." if has_prior_outbound else ""
+
+        system_prompt = f"""{company_prompt}{continuation_note}
 
 Você é um assistente de atendimento via WhatsApp. Responda de forma natural, direta e humana em UMA ÚNICA mensagem. Não use prefixos como "Atendente:" na resposta."""
         history_str = "\n".join(history_lines)
