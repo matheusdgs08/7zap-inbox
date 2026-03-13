@@ -549,23 +549,39 @@ def verify_key(x_api_key: str = Header(...)):
     if x_api_key != INBOX_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ── TENANT ENFORCEMENT ────────────────────────────────────
-# Endpoints que recebem tenant_id como query param DEVEM usar esta função
-# para garantir que o tenant_id do token bate com o parâmetro da requisição.
-# Isso impede que um usuário passe o tenant_id de outro e acesse dados alheios.
 async def enforce_tenant(
+    request: Request,
     tenant_id: str = "",
-    user: dict = Depends(get_current_user)
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
+    x_api_key: str = Header(default="")
 ) -> str:
     """
-    Retorna o tenant_id do JWT — ignora qualquer tenant_id passado na URL.
-    Também bloqueia tenants com is_blocked=True (trial expirado ou suspenso).
-    SuperAdmin (SUPER_ADMIN_TENANT) nunca é bloqueado.
+    Extrai tenant_id de forma segura:
+    - Se tiver Bearer JWT → usa tenant_id do token (ignora query param)
+    - Se tiver x-api-key válida → usa tenant_id do query param (modo legado)
+    Bloqueia tenants com is_blocked=True.
     """
-    tid = user["tenant_id"]
-    # SuperAdmin não é bloqueado
+    tid = None
+
+    if credentials and credentials.credentials:
+        try:
+            payload = decode_jwt(credentials.credentials)
+            tid = payload.get("tenant_id")
+        except Exception:
+            pass
+
+    if not tid:
+        # Fallback: x-api-key (modo legado — aceito para não quebrar)
+        if x_api_key == INBOX_API_KEY and tenant_id:
+            tid = tenant_id
+        else:
+            raise HTTPException(status_code=401, detail="Autenticação necessária")
+
+    # SuperAdmin nunca bloqueado
     if tid == SUPER_ADMIN_TENANT:
         return tid
-    # Verificar bloqueio — usa cache Redis se disponível
+
+    # Verificar bloqueio com cache Redis
     _cache_key = f"7crm:tenant_blocked:{tid}"
     _blocked = None
     try:
@@ -579,7 +595,6 @@ async def enforce_tenant(
         try:
             _t = supabase.table("tenants").select("is_blocked").eq("id", tid).single().execute().data
             _blocked = bool(_t and _t.get("is_blocked"))
-            # Cache por 5 minutos para não sobrecarregar o banco
             try:
                 if r: r.setex(_cache_key, 300, "1" if _blocked else "0")
             except Exception:
@@ -587,7 +602,7 @@ async def enforce_tenant(
         except Exception:
             _blocked = False
     if _blocked:
-        raise HTTPException(status_code=403, detail="Conta suspensa ou trial expirado. Acesse o painel para regularizar.")
+        raise HTTPException(status_code=403, detail="Conta suspensa. Acesse o painel para regularizar.")
     return tid
 
 # ── MEDIA PROXY ───────────────────────────────────────────
