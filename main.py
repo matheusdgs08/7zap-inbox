@@ -789,7 +789,7 @@ async def receive_message_legacy(payload: dict = None, x_api_key: str = Header(d
     return await receive_message(payload or {}, x_api_key)
 
 @app.post("/webhook/inbox")
-async def receive_message(payload: dict, x_api_key: str = Header(default="")):
+async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = Header(default="")):
     """Aceita formato WAHA: {event, session, payload: {from, fromMe, body, type}}"""
     # Verifica autenticidade do webhook (cabeçalho enviado pelo WAHA)
     if WEBHOOK_SECRET and x_api_key != WEBHOOK_SECRET:
@@ -1240,8 +1240,7 @@ async def receive_message(payload: dict, x_api_key: str = Header(default="")):
             # ── AUTO-PILOT: debounce — acumula mensagens na janela antes de responder ──
             if not is_from_me and conv_id and tid:
                 try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(_autopilot_debounce_trigger_async(conv_id, tid, instance_name))
+                    bg.add_task(_autopilot_debounce_trigger_async, conv_id, tid, instance_name)
                 except Exception as ae:
                     print(f"[AUTOPILOT] Erro ao criar task: {ae}")
 
