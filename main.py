@@ -260,6 +260,7 @@ security = HTTPBearer(auto_error=False)
 async def start_keepalive():
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(fix_existing_sessions_webhook())
+    asyncio.create_task(watchguard_loop())
 
 async def ensure_webhooks():
     """Auto-configure webhooks for all active WAHA sessions that are missing it."""
@@ -604,6 +605,7 @@ class UpdateCopilotPrompt(BaseModel):
     copilot_auto_mode: str = "off"
     copilot_schedule_start: str = "18:00"
     copilot_schedule_end: str = "09:00"
+    copilot_watchguard: bool = False
 
 class CreateBroadcast(BaseModel):
     tenant_id: str; name: str; message: str; interval_min: int = 60; interval_max: int = 120
@@ -1678,6 +1680,172 @@ async def send_message(conv_id: str, body: SendMessage, bg: BackgroundTasks):
             bg.add_task(waha_send_msg, phone_raw, body.text, session)
     return {"message": msg}
 
+async def watchguard_loop():
+    """
+    🛡 Watch Guard — roda a cada 5 minutos.
+    Para cada instância com copilot_watchguard=True, verifica conversas abertas
+    onde a última mensagem é do cliente há mais de 6 minutos e não há resposta da IA.
+    Se encontrar, dispara a IA para garantir que o cliente não fique sem resposta.
+    """
+    import datetime as _dt, time as _time
+    await asyncio.sleep(60)  # aguarda 1 min no startup para tudo estabilizar
+    print("[WATCHGUARD] Loop iniciado")
+    while True:
+        try:
+            await _watchguard_scan()
+        except Exception as e:
+            print(f"[WATCHGUARD] Erro no scan: {e}")
+        await asyncio.sleep(300)  # 5 minutos
+
+
+async def _watchguard_scan():
+    import datetime as _dt, time as _time
+    now_utc = _dt.datetime.utcnow()
+    cutoff = (now_utc - _dt.timedelta(minutes=6)).isoformat()
+
+    # Busca todas as instâncias com watchguard ativo
+    instances = supabase.table("gateway_instances").select(
+        "instance_name,tenant_id,copilot_prompt,copilot_auto_mode,copilot_watchguard"
+    ).eq("copilot_watchguard", True).execute().data
+
+    if not instances:
+        return
+
+    for inst in instances:
+        inst_name = inst["instance_name"]
+        tenant_id = inst["tenant_id"]
+        try:
+            # Verifica créditos e plano do tenant
+            tenant = supabase.table("tenants").select("plan,ai_credits,copilot_prompt,is_blocked").eq("id", tenant_id).single().execute().data
+            if not tenant or tenant.get("is_blocked"):
+                continue
+            if tenant.get("plan") == "starter":
+                continue
+            if (tenant.get("ai_credits") or 0) <= 0:
+                continue
+
+            # Busca conversas abertas desta instância onde last_message_at < cutoff (mais de 6min atrás)
+            convs = supabase.table("conversations").select(
+                "id,status,copilot_auto_mode,last_message_at,unread_count"
+            ).eq("instance_name", inst_name).eq("tenant_id", tenant_id).eq("status", "open").lt("last_message_at", cutoff).execute().data
+
+            for conv in convs:
+                conv_id = conv["id"]
+                # Não interfere se a conversa está pausada pelo atendente
+                if autopilot_is_paused(conv_id):
+                    continue
+                if conv.get("copilot_auto_mode") is False or conv.get("copilot_auto_mode") == "false":
+                    continue
+
+                # Verifica se o Redis tem um watcher ativo (debounce em andamento — não duplicar)
+                r = _get_redis()
+                if r and r.exists(f"7crm:ap_lock:{conv_id}"):
+                    continue
+
+                # Verifica se a última mensagem é inbound (cliente sem resposta)
+                last_msgs = supabase.table("messages").select("direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+                if not last_msgs:
+                    continue
+                last = last_msgs[0]
+                if last.get("direction") != "inbound":
+                    continue  # última msg já é outbound — cliente respondido
+
+                # Verifica se a chave de watchguard já foi usada recentemente (anti-spam: 1 resposta por hora por conversa)
+                wg_key = f"7crm:wg_sent:{conv_id}"
+                if r and r.exists(wg_key):
+                    continue
+
+                print(f"[WATCHGUARD] ⚠️ Cliente sem resposta → conv={conv_id[:8]} inst={inst_name}")
+
+                # Dispara IA diretamente (sem debounce — Watch Guard é o safety net final)
+                asyncio.create_task(_watchguard_reply(conv_id, tenant_id, inst_name, inst, tenant))
+
+        except Exception as e:
+            print(f"[WATCHGUARD] Erro instância {inst_name}: {e}")
+
+
+async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, inst_cfg: dict, tenant_data: dict):
+    """Dispara resposta da IA via Watch Guard. Mesma lógica do auto-pilot watcher."""
+    import time as _time
+    r = _get_redis()
+    lock_key = f"7crm:ap_lock:{conv_id}"
+    wg_key = f"7crm:wg_sent:{conv_id}"
+
+    # Adquire lock para não conflitar com debounce
+    if r:
+        acquired = r.set(lock_key, "wg", nx=True, ex=120)
+        if not acquired:
+            print(f"[WATCHGUARD] Lock já ativo para conv={conv_id[:8]}, abortando")
+            return
+
+    try:
+        ok, remaining, err = consume_credit(tenant_id, 1)
+        if not ok:
+            print(f"[WATCHGUARD] Sem créditos: {err}")
+            return
+
+        all_msgs = supabase.table("messages").select(
+            "id,direction,content,type,is_internal_note,media_url,created_at"
+        ).eq("conversation_id", conv_id).order("created_at").execute().data
+
+        # Bloco de msgs inbound sem resposta
+        last_outbound_idx = -1
+        for idx, m in enumerate(all_msgs):
+            if m.get("direction") == "outbound" and not m.get("is_internal_note"):
+                last_outbound_idx = idx
+        pending_inbound = [m for m in all_msgs[last_outbound_idx + 1:] if m.get("direction") == "inbound"]
+        if not pending_inbound:
+            return
+
+        history_lines = []
+        for m in all_msgs[-(40):]:
+            if m.get("is_internal_note"): continue
+            role = "Atendente" if m.get("direction") == "outbound" else "Cliente"
+            history_lines.append(f"{role}: {m.get('content','')}")
+        history_text = "\n".join(history_lines)
+
+        company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or ""
+        msgs_text = "\n".join([f"- {m.get('content','')}" for m in pending_inbound])
+
+        ai_messages = [
+            {"role": "user", "content": f"{company_prompt}\n\n---\nHistórico:\n{history_text}\n\n---\nMensagens do cliente sem resposta:\n{msgs_text}\n\nResponda agora de forma natural e direta."}
+        ]
+        resp = anthropic_client.messages.create(model="claude-opus-4-5", max_tokens=500, messages=ai_messages)
+        reply_text = resp.content[0].text.strip()
+
+        if not reply_text:
+            return
+
+        phone = pending_inbound[-1].get("content","")
+        conv_full = supabase.table("conversations").select("contacts(phone)").eq("id", conv_id).single().execute().data
+        contact_phone = (conv_full.get("contacts") or {}).get("phone","")
+        if not contact_phone:
+            return
+
+        waha_resp = requests.post(f"{WAHA_URL}/api/sendText", json={
+            "session": instance_name, "chatId": f"{contact_phone}@s.whatsapp.net", "text": reply_text
+        }, headers={"X-Api-Key": WAHA_KEY}, timeout=15)
+
+        if waha_resp.status_code == 201:
+            supabase.table("messages").insert({
+                "conversation_id": conv_id, "direction": "outbound", "content": reply_text,
+                "type": "text", "ai_suggestion": True
+            }).execute()
+            supabase.table("conversations").update({"last_message_at": "now()", "unread_count": 0}).eq("id", conv_id).execute()
+            # Anti-spam: marca que já respondeu nesta conversa (TTL 1h)
+            if r:
+                r.setex(wg_key, 3600, "1")
+            print(f"[WATCHGUARD] ✅ Resposta enviada → conv={conv_id[:8]}")
+        else:
+            print(f"[WATCHGUARD] ❌ Erro WAHA {waha_resp.status_code}: {waha_resp.text[:100]}")
+
+    except Exception as e:
+        print(f"[WATCHGUARD] Erro em _watchguard_reply conv={conv_id[:8]}: {e}")
+    finally:
+        if r:
+            r.delete(lock_key)
+
+
 async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instance_name: str):
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
@@ -2385,18 +2553,19 @@ async def update_copilot_prompt(body: UpdateCopilotPrompt):
         "copilot_auto_mode": body.copilot_auto_mode,
         "copilot_schedule_start": body.copilot_schedule_start,
         "copilot_schedule_end": body.copilot_schedule_end,
+        "copilot_watchguard": body.copilot_watchguard,
     }
     if body.copilot_prompt is not None:
         update_data["copilot_prompt"] = body.copilot_prompt
     res = supabase.table("gateway_instances").update(update_data).eq("instance_name", body.instance_name).eq("tenant_id", body.tenant_id).execute()
-    print(f"[CONFIG_IA] Salvo instance={body.instance_name} mode={body.copilot_auto_mode}")
+    print(f"[CONFIG_IA] Salvo instance={body.instance_name} mode={body.copilot_auto_mode} watchguard={body.copilot_watchguard}")
     return {"ok": True, "saved_to": "instance", "instance": body.instance_name}
 
 @app.get("/whatsapp/instance-config", dependencies=[Depends(verify_key)])
 async def get_instance_config(tenant_id: str, instance_name: str):
     """Retorna config de IA de uma instância específica."""
     row = supabase.table("gateway_instances").select(
-        "instance_name,label,phone,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end"
+        "instance_name,label,phone,copilot_prompt,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,copilot_watchguard"
     ).eq("tenant_id", tenant_id).eq("instance_name", instance_name).limit(1).execute().data
     if not row:
         raise HTTPException(404, "Instância não encontrada")
