@@ -2897,6 +2897,19 @@ async def suggest_broadcast_message(body: dict):
     suggestion = await call_ai(system, f"Crie uma mensagem de disparo para WhatsApp com objetivo: {body.get('objective', '')}\n\nRetorne apenas a mensagem, sem explicações.", max_tokens=400)
     return {"suggestion": suggestion}
 
+@app.post("/broadcasts/preview-resume", dependencies=[Depends(verify_key)])
+async def preview_resume_message(body: dict):
+    """Gera preview da mensagem 'Retomar conversa' sem consumir créditos."""
+    if not ANTHROPIC_API_KEY: raise HTTPException(status_code=503, detail="Anthropic API key não configurada")
+    msg = await generate_resume_message(
+        body.get("tenant_id"),
+        body.get("conversation_id"),
+        body.get("contact_name") or "",
+        body.get("contact_phone") or "",
+        body.get("objective") or ""
+    )
+    return {"preview": msg}
+
 @app.post("/broadcasts", dependencies=[Depends(verify_key)])
 async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
     bcast = supabase.table("broadcasts").insert({"tenant_id": body.tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0, "ai_personalize": body.ai_personalize, "resume_conversation": body.resume_conversation, "instance_name": body.instance_name}).execute().data[0]
