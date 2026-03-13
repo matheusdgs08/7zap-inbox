@@ -2179,10 +2179,10 @@ async def _auto_pilot_watcher(conv_id: str, tenant_id: str, instance_name: str):
             print(f"[AUTOPILOT] Atendente respondeu durante a janela — abortando conv={conv_id[:8]}")
             return
 
-        # ── Fase 3: consome crédito ──────────────────────────────────────────
-        ok, remaining, err = consume_credit(tenant_id, 1)
-        if not ok:
-            print(f"[AUTOPILOT] Sem créditos: {err}")
+        # ── Fase 3: verifica créditos (consome só após envio bem-sucedido) ────
+        from_creds = supabase.table("tenants").select("ai_credits").eq("id", tenant_id).single().execute().data
+        if not from_creds or (from_creds.get("ai_credits") or 0) <= 0:
+            print(f"[AUTOPILOT] Sem créditos disponíveis")
             return
 
         # ── Fase 4: coleta TODAS as mensagens inbound acumuladas ─────────────
@@ -2306,8 +2306,9 @@ REGRAS IMPORTANTES:
         else:
             print(f"[AUTOPILOT] Sem phone ou instance_name — não enviou")
 
-        # Salva no banco SOMENTE se enviou com sucesso (evita outbound fantasma que bloqueia próximas tentativas)
+        # Salva no banco e consome crédito SOMENTE se enviou com sucesso
         if sent_ok:
+            consume_credit(tenant_id, 1)
             supabase.table("messages").insert({
                 "conversation_id": conv_id,
                 "tenant_id": tenant_id,
