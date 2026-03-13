@@ -1522,11 +1522,36 @@ async def delete_conversation(conv_id: str):
     return {"ok": True}
 
 @app.get("/conversations/{conv_id}/messages")
-async def get_messages(conv_id: str, before: str = None, limit: int = 10, user: dict = Depends(get_current_user_flex)):
-    # Validate: conversation must belong to the user's tenant
+async def get_messages(
+    conv_id: str,
+    before: str = None,
+    limit: int = 10,
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
+    x_api_key: str = Header(default=""),
+    tenant_id: str = ""
+):
+    # Auth: aceita Bearer JWT ou x-api-key legado
+    user_tenant_id = None
+    if credentials and credentials.credentials:
+        try:
+            payload = decode_jwt(credentials.credentials)
+            user_tenant_id = payload.get("tenant_id")
+        except Exception:
+            pass
+    if not user_tenant_id:
+        if x_api_key != INBOX_API_KEY:
+            raise HTTPException(status_code=401, detail="Autenticação necessária")
+        # Com x-api-key: busca tenant via conv_id (sem filtro de tenant, já que a chave é do sistema)
+        user_tenant_id = None  # vai checar abaixo
+
+    # Validate: conversation exists (e pertence ao tenant se JWT)
     conv_check = supabase.table("conversations").select("tenant_id").eq("id", conv_id).maybe_single().execute()
-    if not conv_check.data or conv_check.data.get("tenant_id") != user["tenant_id"]:
+    if not conv_check.data:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+    conv_tenant = conv_check.data.get("tenant_id")
+    if user_tenant_id and conv_tenant != user_tenant_id:
         raise HTTPException(status_code=403, detail="Acesso negado")
+
     limit = min(limit, 50)
     cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
