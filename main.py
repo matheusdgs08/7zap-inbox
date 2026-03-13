@@ -548,6 +548,17 @@ async def require_super_admin(user=Depends(get_current_user)):
 def verify_key(x_api_key: str = Header(...)):
     if x_api_key != INBOX_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
 
+# ── TENANT ENFORCEMENT ────────────────────────────────────
+# Endpoints que recebem tenant_id como query param DEVEM usar esta função
+# para garantir que o tenant_id do token bate com o parâmetro da requisição.
+# Isso impede que um usuário passe o tenant_id de outro e acesse dados alheios.
+async def enforce_tenant(
+    tenant_id: str = "",
+    user: dict = Depends(get_current_user)
+) -> str:
+    """Retorna o tenant_id do JWT — ignora qualquer tenant_id passado na URL."""
+    return user["tenant_id"]
+
 # ── MEDIA PROXY ───────────────────────────────────────────
 @app.get("/media/proxy", dependencies=[Depends(get_current_user)])
 async def media_proxy(url: str):
@@ -1419,8 +1430,8 @@ async def debug_webhook_test(payload: dict, x_api_key: str = Header(default=""))
     except Exception as e:
         return {"ok": False, "error": str(e), "traceback": tb_module.format_exc()}
 
-@app.get("/conversations", dependencies=[Depends(verify_key)])
-async def list_conversations(tenant_id: str, status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None, is_group: Optional[bool] = None):
+@app.get("/conversations")
+async def list_conversations(tenant_id: str = Depends(enforce_tenant), status: Optional[str] = None, user_id: Optional[str] = None, before: Optional[str] = None, limit: int = 50, instance_name: Optional[str] = None, is_group: Optional[bool] = None):
     """Lista conversas com paginação por cursor (before = last_message_at do último item)."""
     limit = min(limit, 100)
     cache_key = f"convs:{tenant_id}:{status}:{user_id}:{instance_name or 'all'}:{before or 'first'}:{is_group}"
@@ -1504,8 +1515,12 @@ async def delete_conversation(conv_id: str):
     supabase.table("conversations").delete().eq("id", conv_id).execute()
     return {"ok": True}
 
-@app.get("/conversations/{conv_id}/messages", dependencies=[Depends(verify_key)])
-async def get_messages(conv_id: str, before: str = None, limit: int = 10):
+@app.get("/conversations/{conv_id}/messages")
+async def get_messages(conv_id: str, before: str = None, limit: int = 10, user: dict = Depends(get_current_user)):
+    # Validate: conversation must belong to the user's tenant
+    conv_check = supabase.table("conversations").select("tenant_id").eq("id", conv_id).maybe_single().execute()
+    if not conv_check.data or conv_check.data.get("tenant_id") != user["tenant_id"]:
+        raise HTTPException(status_code=403, detail="Acesso negado")
     limit = min(limit, 50)
     cache_key = f"msgs:{conv_id}:{before or 'latest'}"
     cached = cache_get(cache_key)
@@ -2349,7 +2364,7 @@ async def reopen_conversation(conv_id: str):
 async def pending_conversation(conv_id: str):
     return supabase.table("conversations").update({"status": "pending", "updated_at": datetime.utcnow().isoformat()}).eq("id", conv_id).execute().data[0]
 
-@app.put("/conversations/{conv_id}/labels", dependencies=[Depends(verify_key)])
+@app.put("/conversations/{conv_id}/labels")
 async def update_conversation_labels(conv_id: str, body: UpdateLabels):
     # Salva label_ids direto no array conversations.labels[]
     supabase.table("conversations").update({"labels": body.label_ids or []}).eq("id", conv_id).execute()
@@ -2371,12 +2386,12 @@ async def update_conversation_labels(conv_id: str, body: UpdateLabels):
 
 # ── CONTACTS ─────────────────────────────────────────────
 # ── LABELS CRUD ──────────────────────────────────────────
-@app.get("/labels", dependencies=[Depends(verify_key)])
-async def get_labels(tenant_id: str):
+@app.get("/labels")
+async def get_labels(tenant_id: str = Depends(enforce_tenant)):
     rows = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
     return {"labels": rows}
 
-@app.post("/labels", dependencies=[Depends(verify_key)])
+@app.post("/labels")
 async def create_label(body: dict):
     tenant_id = body.get("tenant_id")
     name = (body.get("name") or "").strip()
@@ -2410,8 +2425,8 @@ async def delete_label(label_id: str):
     return {"ok": True}
 
 
-@app.get("/contacts", dependencies=[Depends(verify_key)])
-async def list_contacts(tenant_id: str):
+@app.get("/contacts")
+async def list_contacts(tenant_id: str = Depends(enforce_tenant)):
     return {"contacts": supabase.table("contacts").select("*").eq("tenant_id", tenant_id).order("name").execute().data}
 
 @app.put("/contacts/{contact_id}", dependencies=[Depends(verify_key)])
@@ -2473,20 +2488,20 @@ async def get_profile_picture(phone: str, instance: str = "default"):
     return {"url": None}
 
 # ── TASKS ────────────────────────────────────────────────
-@app.get("/tasks/completed", dependencies=[Depends(verify_key)])
-async def list_completed_tasks(tenant_id: str, days: int = 7):
+@app.get("/tasks/completed")
+async def list_completed_tasks(tenant_id: str = Depends(enforce_tenant), days: int = 7):
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     res = supabase.table("tasks").select("*, conversations(id,tenant_id,contacts(name,phone)), users!assigned_to(name)").eq("done", True).gte("done_at", since).order("done_at", desc=True).execute()
     return {"tasks": [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]}
 
-@app.get("/tasks", dependencies=[Depends(verify_key)])
-async def list_tasks(tenant_id: str, conversation_id: Optional[str] = None):
+@app.get("/tasks")
+async def list_tasks(tenant_id: str = Depends(enforce_tenant), conversation_id: Optional[str] = None):
     q = supabase.table("tasks").select("*, conversations(id,tenant_id), users!assigned_to(name)").eq("done", False)
     if conversation_id: q = q.eq("conversation_id", conversation_id)
     res = q.order("created_at", desc=True).execute()
     return {"tasks": [t for t in (res.data or []) if (t.get("conversations") or {}).get("tenant_id") == tenant_id]}
 
-@app.post("/tasks", dependencies=[Depends(verify_key)])
+@app.post("/tasks")
 async def create_task(body: CreateTask):
     return {"task": supabase.table("tasks").insert({"conversation_id": body.conversation_id, "title": body.title, "description": body.description, "assigned_to": body.assigned_to, "due_at": body.due_at, "done": False}).execute().data[0]}
 
@@ -2504,16 +2519,16 @@ async def get_task_updates(task_id: str):
     return {"updates": supabase.table("task_updates").select("*").eq("task_id", task_id).order("created_at").execute().data}
 
 # ── USERS ────────────────────────────────────────────────
-@app.get("/users", dependencies=[Depends(verify_key)])
-async def list_users(tenant_id: str):
+@app.get("/users")
+async def list_users(tenant_id: str = Depends(enforce_tenant)):
     return {"users": supabase.table("users").select("id,name,email,role,avatar_color").eq("tenant_id", tenant_id).eq("is_active", True).execute().data}
 
 # ── QUICK REPLIES ────────────────────────────────────────
-@app.get("/quick-replies", dependencies=[Depends(verify_key)])
-async def list_quick_replies(tenant_id: str):
+@app.get("/quick-replies")
+async def list_quick_replies(tenant_id: str = Depends(enforce_tenant)):
     return {"quick_replies": supabase.table("quick_replies").select("*").eq("tenant_id", tenant_id).execute().data}
 
-@app.post("/quick-replies", dependencies=[Depends(verify_key)])
+@app.post("/quick-replies")
 async def create_quick_reply(body: CreateQuickReply, tenant_id: str):
     return supabase.table("quick_replies").insert({"tenant_id": tenant_id, "title": body.title, "content": body.content}).execute().data[0]
 
@@ -2572,8 +2587,8 @@ async def ai_suggest(conv_id: str, tenant_id: str = None):
     return {"suggestion": suggestion, "used_summary": bool(summary), "msgs_in_context": len(recent_msgs)}
 
 # ── TENANT ───────────────────────────────────────────────
-@app.get("/tenant", dependencies=[Depends(verify_key)])
-async def get_tenant(tenant_id: str):
+@app.get("/tenant")
+async def get_tenant(tenant_id: str = Depends(enforce_tenant)):
     tenant = supabase.table("tenants").select("id,name,plan,copilot_prompt,copilot_prompt_summary,copilot_auto_mode,copilot_schedule_start,copilot_schedule_end,ai_credits,ai_credits_reset_at,trial_ends_at").eq("id", tenant_id).single().execute().data
     if tenant:
         credits, plan, limit = get_tenant_credits(tenant_id)
@@ -2582,8 +2597,8 @@ async def get_tenant(tenant_id: str):
         tenant["ai_credits_pct"] = round((credits / limit * 100) if limit > 0 else 100)
     return tenant
 
-@app.get("/credits", dependencies=[Depends(verify_key)])
-async def get_credits(tenant_id: str):
+@app.get("/credits")
+async def get_credits(tenant_id: str = Depends(enforce_tenant)):
     credits, plan, limit = get_tenant_credits(tenant_id)
     return {"credits": credits, "limit": limit, "plan": plan,
             "pct": round(credits / limit * 100) if limit > 0 else 100,
@@ -2763,8 +2778,8 @@ async def whatsapp_instances():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/whatsapp/tenant-instances", dependencies=[Depends(verify_key)])
-async def whatsapp_tenant_instances(tenant_id: str):
+@app.get("/whatsapp/tenant-instances")
+async def whatsapp_tenant_instances(tenant_id: str = Depends(enforce_tenant)):
     """Lista instâncias do tenant com status real-time — requests paralelos"""
     # Check cache (30s TTL) to avoid hammering WAHA on every poll
     cache_key = f"instances:{tenant_id}"
@@ -2966,7 +2981,7 @@ async def preview_resume_message(body: dict):
     )
     return {"preview": msg, "credits_left": credits_left}
 
-@app.post("/broadcasts", dependencies=[Depends(verify_key)])
+@app.post("/broadcasts")
 async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
     bcast = supabase.table("broadcasts").insert({"tenant_id": body.tenant_id, "name": body.name, "message": body.message, "status": "scheduled" if body.scheduled_at else "pending", "scheduled_at": body.scheduled_at, "interval_min": max(body.interval_min, 60), "interval_max": max(body.interval_max, 90), "total_recipients": len(body.recipients), "sent_count": 0, "failed_count": 0, "ai_personalize": body.ai_personalize, "resume_conversation": body.resume_conversation, "instance_name": body.instance_name}).execute().data[0]
     if body.recipients:
@@ -2975,8 +2990,8 @@ async def create_broadcast(body: CreateBroadcast, bg: BackgroundTasks):
         bg.add_task(run_broadcast, bcast["id"], body.interval_min, body.interval_max)
     return {"broadcast": bcast}
 
-@app.get("/broadcasts", dependencies=[Depends(verify_key)])
-async def list_broadcasts(tenant_id: str):
+@app.get("/broadcasts")
+async def list_broadcasts(tenant_id: str = Depends(enforce_tenant)):
     return {"broadcasts": supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).execute().data}
 
 @app.put("/broadcasts/{broadcast_id}/cancel", dependencies=[Depends(verify_key)])
@@ -3107,12 +3122,12 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
     supabase.table("broadcasts").update({"status": "done", "finished_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
 
 # ── SCHEDULED MESSAGES ───────────────────────────────────
-@app.post("/scheduled-messages", dependencies=[Depends(verify_key)])
+@app.post("/scheduled-messages")
 async def create_scheduled_message(body: ScheduledMessageCreate):
     return {"scheduled_message": supabase.table("scheduled_messages").insert({"tenant_id": body.tenant_id, "conversation_id": body.conversation_id, "contact_name": body.contact_name, "contact_phone": body.contact_phone, "message": body.message, "scheduled_at": body.scheduled_at, "recurrence": body.recurrence, "status": "pending"}).execute().data[0]}
 
-@app.get("/scheduled-messages", dependencies=[Depends(verify_key)])
-async def list_scheduled_messages(tenant_id: str, status: Optional[str] = None):
+@app.get("/scheduled-messages")
+async def list_scheduled_messages(tenant_id: str = Depends(enforce_tenant), status: Optional[str] = None):
     q = supabase.table("scheduled_messages").select("*").eq("tenant_id", tenant_id)
     if status: q = q.eq("status", status)
     return {"scheduled_messages": q.order("scheduled_at").execute().data}
@@ -3123,8 +3138,8 @@ async def delete_scheduled_message(msg_id: str):
     return {"ok": True}
 
 # ── TRIAL & BILLING ───────────────────────────────────────
-@app.get("/tenant/trial-status", dependencies=[Depends(verify_key)])
-async def trial_status(tenant_id: str):
+@app.get("/tenant/trial-status")
+async def trial_status(tenant_id: str = Depends(enforce_tenant)):
     tenant = supabase.table("tenants").select("id, name, plan, trial_ends_at, trial_used, is_blocked").eq("id", tenant_id).single().execute().data
     now = datetime.utcnow()
     trial_ends_at = tenant.get("trial_ends_at")
@@ -3370,8 +3385,8 @@ PLAN_FEATURES = {
     "enterprise":{"agents": 999, "numbers": 999, "ai_credits": 99999, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
 }
 
-@app.get("/plan/features", dependencies=[Depends(verify_key)])
-async def get_plan_features(tenant_id: str):
+@app.get("/plan/features")
+async def get_plan_features(tenant_id: str = Depends(enforce_tenant)):
     tenant = supabase.table("tenants").select("plan").eq("id", tenant_id).single().execute().data
     plan = tenant.get("plan", "trial")
     return {"plan": plan, "features": PLAN_FEATURES.get(plan, PLAN_FEATURES["starter"])}
@@ -3978,8 +3993,8 @@ async def whatsapp_sync(body: dict):
 
     return {"ok": True, "stats": stats}
 
-@app.get("/whatsapp/sync-status", dependencies=[Depends(verify_key)])
-async def sync_status(tenant_id: str):
+@app.get("/whatsapp/sync-status")
+async def sync_status(tenant_id: str = Depends(enforce_tenant)):
     convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
     msgs = supabase.table("messages").select("id", count="exact").in_("conversation_id", [c["id"] for c in (supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data or [])]).execute()
     return {"conversations": convs.count, "messages": msgs.count}
@@ -4753,8 +4768,8 @@ async def social_login(body: dict):
 
 # ── RELATÓRIOS / ANALYTICS ────────────────────────────────
 
-@app.get("/reports/messages", dependencies=[Depends(verify_key)])
-async def report_messages(tenant_id: str, days: int = 30, instance_name: str = None):
+@app.get("/reports/messages")
+async def report_messages(tenant_id: str = Depends(enforce_tenant), days: int = 30, instance_name: str = None):
     """Mensagens por dia e por hora — heatmap"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     # Get conversations for this tenant (optionally filtered by instance)
@@ -4799,8 +4814,8 @@ async def report_messages(tenant_id: str, days: int = 30, instance_name: str = N
     return {"by_day": by_day_list, "by_hour": by_hour_list, "by_weekday": by_weekday_list,
             "total": len(msgs), "inbound": inbound, "outbound": outbound}
 
-@app.get("/reports/agents", dependencies=[Depends(verify_key)])
-async def report_agents(tenant_id: str, days: int = 30, instance_name: str = None):
+@app.get("/reports/agents")
+async def report_agents(tenant_id: str = Depends(enforce_tenant), days: int = 30, instance_name: str = None):
     """Performance por atendente"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     users = supabase.table("users").select("id,name,email,role,allowed_instances").eq("tenant_id", tenant_id).execute().data
@@ -4845,8 +4860,8 @@ async def report_agents(tenant_id: str, days: int = 30, instance_name: str = Non
     agents_list = sorted(agent_map.values(), key=lambda x: x["total_convs"], reverse=True)
     return {"agents": agents_list, "period_days": days}
 
-@app.get("/reports/broadcasts", dependencies=[Depends(verify_key)])
-async def report_broadcasts(tenant_id: str, instance_name: str = None):
+@app.get("/reports/broadcasts")
+async def report_broadcasts(tenant_id: str = Depends(enforce_tenant), instance_name: str = None):
     """Relatório de disparos — enviados, entregues e ROI (conversas geradas)"""
     q = supabase.table("broadcasts").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20)
     if instance_name:
@@ -4906,8 +4921,8 @@ async def report_broadcasts(tenant_id: str, instance_name: str = None):
         })
     return {"broadcasts": result}
 
-@app.get("/reports/credits", dependencies=[Depends(verify_key)])
-async def report_credits(tenant_id: str, days: int = 30):
+@app.get("/reports/credits")
+async def report_credits(tenant_id: str = Depends(enforce_tenant), days: int = 30):
     """Consumo de créditos de IA por período"""
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     # Get AI suggestions used (messages with ai_suggestion set)
@@ -4951,8 +4966,8 @@ async def report_credits(tenant_id: str, days: int = 30):
         "period_days": days
     }
 
-@app.get("/reports/financial-forecast", dependencies=[Depends(verify_key)])
-async def report_financial_forecast(tenant_id: str):
+@app.get("/reports/financial-forecast")
+async def report_financial_forecast(tenant_id: str = Depends(enforce_tenant)):
     """Previsão financeira — próximo mês"""
     # Require super admin
     if tenant_id != os.environ.get("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9"):
