@@ -2266,15 +2266,8 @@ REGRAS IMPORTANTES:
         if not messages_for_ai:
             return
 
-        import anthropic as _ant
-        _ant_client = _ant.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
-        response = await _ant_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            system=system_prompt,
-            messages=messages_for_ai,
-        )
-        reply_text = response.content[0].text.strip() if response.content else ""
+        user_content = messages_for_ai[0]["content"] if messages_for_ai else ""
+        reply_text = await call_ai(system_prompt, user_content, max_tokens=500)
         if not reply_text:
             print(f"[AUTOPILOT] IA retornou resposta vazia")
             return
