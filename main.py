@@ -165,6 +165,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(_startup_sync_names())
+    # Recovery: broadcasts presos em "sending" são cancelados automaticamente
+    # (acontece quando Railway redeployar com background tasks rodando)
+    try:
+        stuck = supabase.table("broadcasts").select("id,name").eq("status", "sending").execute().data or []
+        for b in stuck:
+            supabase.table("broadcasts").update({"status": "cancelled", "finished_at": datetime.utcnow().isoformat()}).eq("id", b["id"]).execute()
+            print(f"[STARTUP] Broadcast preso cancelado: {b['name']} ({b['id']})")
+    except Exception as e:
+        print(f"[STARTUP] Erro ao cancelar broadcasts presos: {e}")
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
@@ -3006,7 +3015,8 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
     instance_name = bcast.get("instance_name") or "default"
     sent = 0; failed = 0
     for rec in recipients:
-        if sent % 5 == 0:
+        try:
+          if sent % 5 == 0:
             bcast_status = supabase.table("broadcasts").select("status").eq("id", broadcast_id).single().execute().data
             if bcast_status and bcast_status["status"] == "cancelled": break
 
@@ -3050,8 +3060,11 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
         supabase.table("broadcast_recipients").update({"status": "sent" if ok else "failed", "sent_at": datetime.utcnow().isoformat() if ok else None, "sent_message": msg}).eq("id", rec["id"]).execute()
         if ok: sent += 1
         else: failed += 1
-        supabase.table("broadcasts").update({"sent_count": sent, "failed_count": failed}).eq("id", broadcast_id).execute()
-        await asyncio.sleep(random.randint(interval_min, interval_max))
+          supabase.table("broadcasts").update({"sent_count": sent, "failed_count": failed}).eq("id", broadcast_id).execute()
+          await asyncio.sleep(random.randint(interval_min, interval_max))
+        except Exception as _loop_err:
+          print(f"[BROADCAST] Erro no loop recipient {rec.get('id')}: {_loop_err}")
+          failed += 1
     supabase.table("broadcasts").update({"status": "done", "finished_at": datetime.utcnow().isoformat()}).eq("id", broadcast_id).execute()
 
 # ── SCHEDULED MESSAGES ───────────────────────────────────
