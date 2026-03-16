@@ -2297,13 +2297,23 @@ REGRAS:
         if not messages_for_ai:
             return
 
-        # Passa histórico COMPLETO como contexto — não só a primeira mensagem
-        history_for_ai = []
-        for _m in messages_for_ai:
-            _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
-            history_for_ai.append(f"{_role}: {_m['content']}")
-        user_content = "\n".join(history_for_ai) + "\n\nResponda agora como Atendente (sem dizer seu nome se já se apresentou):"
-        reply_text = await call_ai(system_prompt, user_content, max_tokens=500)
+        # Passa histórico como multi-turn (user/assistant) para a IA entender o contexto
+        if OPENAI_API_KEY:
+            # OpenAI aceita multi-turn nativo
+            import openai as _oai
+            _oai_client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+            _oai_msgs = [{"role": "system", "content": system_prompt}] + messages_for_ai
+            _r = await _oai_client.chat.completions.create(
+                model="gpt-4o-mini", max_tokens=500, messages=_oai_msgs)
+            reply_text = _r.choices[0].message.content.strip()
+        else:
+            # Fallback Claude — formata multi-turn como texto
+            history_for_ai = []
+            for _m in messages_for_ai:
+                _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
+                history_for_ai.append(f"{_role}: {_m['content']}")
+            user_content = "\n".join(history_for_ai) + "\n\nResponda agora como Atendente:"
+            reply_text = await call_ai(system_prompt, user_content, max_tokens=500)
         if not reply_text:
             print(f"[AUTOPILOT] IA retornou resposta vazia")
             return
