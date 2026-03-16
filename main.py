@@ -4488,7 +4488,7 @@ async def resolve_lids(body: dict):
     stats["lids_found"] = len(lid_convs)
     print(f"[RESOLVE-LIDS] inst={instance} lids_encontrados={len(lid_convs)}")
 
-    # 2. Tentar resolver via WAHA contacts store — testa 3 formatos de chatId
+    # 2. Resolver via WAHA contacts store — usa /api/contacts?session=X&contactId=LID
     async with httpx.AsyncClient(timeout=30) as client:
         for conv in lid_convs:
             contact = conv.get("contacts") or {}
@@ -4498,58 +4498,31 @@ async def resolve_lids(body: dict):
                 continue
 
             resolved = False
-            # Tenta os 3 formatos que o WAHA aceita para LID
-            candidates = [
-                f"{lid_digits}@lid",
-                f"{lid_digits}@c.us",
-                lid_digits,
-            ]
-
-            for chat_id in candidates:
-                try:
-                    r = await client.get(
-                        f"{WAHA_URL}/api/{instance}/contacts/check-exists",
-                        params={"phone": chat_id},
-                        headers=waha_headers(), timeout=10
-                    )
-                    if r.status_code == 200:
-                        data = r.json()
-                        real_phone = (data.get("id") or data.get("jid") or "").replace("@c.us","").replace("@s.whatsapp.net","").strip()
-                        name = data.get("name") or data.get("pushName") or contact.get("name","")
-                        if real_phone and len(real_phone) <= 13 and real_phone.isdigit():
-                            def _update(cid=contact["id"], phone=real_phone, n=name):
-                                supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
-                            await run_sync(_update)
-                            stats["lids_resolved"] += 1
-                            stats["detail"].append({"lid": lid_digits, "resolved_to": real_phone, "name": name})
-                            print(f"[RESOLVE-LIDS] ✅ {lid_digits} → {real_phone} ({name})")
-                            resolved = True
-                            break
-                except Exception as e:
-                    pass
-
-                # Tenta também endpoint direto /contacts/{chatId}
-                if not resolved:
-                    try:
-                        r2 = await client.get(
-                            f"{WAHA_URL}/api/{instance}/contacts/{chat_id}",
-                            headers=waha_headers(), timeout=10
-                        )
-                        if r2.status_code == 200:
-                            data2 = r2.json()
-                            real_phone = (data2.get("id") or "").replace("@c.us","").replace("@s.whatsapp.net","").strip()
-                            name = data2.get("name") or data2.get("pushName") or contact.get("name","")
-                            if real_phone and len(real_phone) <= 13 and real_phone.isdigit():
-                                def _update2(cid=contact["id"], phone=real_phone, n=name):
-                                    supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
-                                await run_sync(_update2)
-                                stats["lids_resolved"] += 1
-                                stats["detail"].append({"lid": lid_digits, "resolved_to": real_phone, "name": name})
-                                print(f"[RESOLVE-LIDS] ✅ {lid_digits} → {real_phone} ({name}) [via /contacts/]")
-                                resolved = True
-                                break
-                    except Exception as e:
-                        pass
+            try:
+                # Endpoint correto: GET /api/contacts?session=X&contactId=DIGITS@lid
+                r = await client.get(
+                    f"{WAHA_URL}/api/contacts",
+                    params={"session": instance, "contactId": f"{lid_digits}@lid"},
+                    headers=waha_headers(), timeout=10
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    # WAHA retorna phoneNumber como "55xxxxxxxxxxx@s.whatsapp.net"
+                    raw = (data.get("phoneNumber") or data.get("id") or data.get("jid") or "")
+                    real_phone = raw.replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","").strip()
+                    name = data.get("name") or data.get("pushName") or data.get("verifiedName") or contact.get("name","")
+                    if real_phone and real_phone.isdigit() and len(real_phone) >= 10:
+                        def _update(cid=contact["id"], phone=real_phone, n=name):
+                            supabase.table("contacts").update({"phone": phone, "name": n}).eq("id", cid).execute()
+                        await run_sync(_update)
+                        stats["lids_resolved"] += 1
+                        stats["detail"].append({"lid": lid_digits, "resolved_to": real_phone, "name": name})
+                        print(f"[RESOLVE-LIDS] ✅ {lid_digits} → {real_phone} ({name})")
+                        resolved = True
+                else:
+                    print(f"[RESOLVE-LIDS] ❌ {lid_digits} status={r.status_code} {r.text[:100]}")
+            except Exception as e:
+                print(f"[RESOLVE-LIDS] erro {lid_digits}: {e}")
 
             if not resolved:
                 stats["detail"].append({"lid": lid_digits, "resolved_to": None, "name": contact.get("name","")})
