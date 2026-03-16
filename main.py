@@ -217,26 +217,41 @@ async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: 
     raise Exception("Nenhuma API de IA configurada (OPENAI_API_KEY ou ANTHROPIC_API_KEY)")
 
 async def get_or_create_openai_thread(conv_id: str, assistant_id: str) -> str:
-    """Retorna o thread_id OpenAI existente ou cria um novo para a conversa."""
+    """
+    Retorna o thread_id OpenAI existente ou cria um novo.
+    Thread associado ao CONTATO (phone) — persiste mesmo se a conversa for recriada.
+    """
     import openai as _oai
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY não configurada")
     client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    # Buscar thread_id existente no banco
-    def _get():
-        return supabase.table("conversations").select("openai_thread_id").eq("id", conv_id).single().execute().data
-    row = await run_sync(_get)
-    thread_id = (row or {}).get("openai_thread_id")
+    # 1. Buscar contact_id da conversa
+    def _get_conv():
+        return supabase.table("conversations").select("contact_id").eq("id", conv_id).single().execute().data
+    conv_row = await run_sync(_get_conv)
+    contact_id = (conv_row or {}).get("contact_id")
+
+    if not contact_id:
+        raise Exception(f"Conversa {conv_id[:8]} sem contact_id")
+
+    # 2. Buscar thread_id no contato (associado ao número de telefone)
+    def _get_thread():
+        return supabase.table("contacts").select("openai_thread_id").eq("id", contact_id).single().execute().data
+    contact_row = await run_sync(_get_thread)
+    thread_id = (contact_row or {}).get("openai_thread_id")
 
     if not thread_id:
-        # Criar novo thread
+        # Criar novo thread e salvar no contato
         thread = await client.beta.threads.create()
         thread_id = thread.id
-        def _save(tid=thread_id):
-            supabase.table("conversations").update({"openai_thread_id": tid}).eq("id", conv_id).execute()
+        def _save(tid=thread_id, cid=contact_id):
+            supabase.table("contacts").update({"openai_thread_id": tid}).eq("id", cid).execute()
         await run_sync(_save)
-        print(f"[THREAD] Novo thread criado: {thread_id} para conv={conv_id[:8]}")
+        print(f"[THREAD] Novo thread criado: {thread_id} para contact={contact_id[:8]}")
+    else:
+        print(f"[THREAD] Thread existente: {thread_id[:16]} para contact={contact_id[:8]}")
+
     return thread_id
 
 
