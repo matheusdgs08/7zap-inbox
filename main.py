@@ -196,8 +196,8 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 MONITOR_PHONE     = os.getenv("MONITOR_PHONE", "")  # ex: 5511940774447 — recebe alertas do sistema
 
 # ── AI HELPER — usa OpenAI GPT-4o Mini (mais barato) com fallback pro Claude ──
-async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = False, timeout: int = 30) -> str:
-    """Usa Claude Haiku por padrão. GPT-4o Mini só se prefer_openai=True explícito."""
+async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: bool = True, timeout: int = 30) -> str:
+    """Usa GPT-4o Mini por padrão. Fallback Claude Haiku se não tiver OpenAI key."""
     if prefer_openai and OPENAI_API_KEY:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post("https://api.openai.com/v1/chat/completions",
