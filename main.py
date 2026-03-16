@@ -177,7 +177,7 @@ async def startup_event():
     # Background loops
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(fix_existing_sessions_webhook())
-    asyncio.create_task(watchguard_loop())
+    # asyncio.create_task(watchguard_loop())  # DESATIVADO — causa duplicatas com o debounce
     asyncio.create_task(scheduled_messages_loop())
     # Recovery: re-dispara autopilot para conversas inbound sem resposta que ficaram presas no restart
     asyncio.create_task(_startup_autopilot_recovery())
