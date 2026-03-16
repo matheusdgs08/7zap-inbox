@@ -1995,7 +1995,20 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
                 last_outbound_idx = idx
         pending_inbound = [m for m in all_msgs[last_outbound_idx + 1:] if m.get("direction") == "inbound"]
         if not pending_inbound:
+            print(f"[WATCHGUARD] Sem msgs pendentes para conv={conv_id[:8]} — abortando")
             return
+        # Verificar se o último outbound foi há menos de 3 min (anti-duplo)
+        if last_outbound_idx >= 0:
+            import datetime as _dt
+            last_out_time = all_msgs[last_outbound_idx].get("created_at","")
+            if last_out_time:
+                try:
+                    last_out_dt = _dt.datetime.fromisoformat(last_out_time.replace("Z","+00:00"))
+                    secs_since = (_dt.datetime.now(_dt.timezone.utc) - last_out_dt).total_seconds()
+                    if secs_since < 180:
+                        print(f"[WATCHGUARD] Outbound recente ({secs_since:.0f}s) — abortando para evitar duplo")
+                        return
+                except: pass
 
         history_lines = []
         for m in all_msgs[-(40):]:
@@ -2007,11 +2020,10 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
         company_prompt = inst_cfg.get("copilot_prompt") or tenant_data.get("copilot_prompt") or ""
         msgs_text = "\n".join([f"- {m.get('content','')}" for m in pending_inbound])
 
-        ai_messages = [
-            {"role": "user", "content": f"{company_prompt}\n\n---\nHistórico:\n{history_text}\n\n---\nMensagens do cliente sem resposta:\n{msgs_text}\n\nResponda agora de forma natural e direta."}
-        ]
-        resp = anthropic_client.messages.create(model="claude-opus-4-5", max_tokens=500, messages=ai_messages)
-        reply_text = resp.content[0].text.strip()
+        system_wg = company_prompt or "Você é um atendente. Responda de forma natural e direta."
+        user_wg = f"Histórico:\n{history_text}\n\n---\nMensagens do cliente sem resposta:\n{msgs_text}\n\nResponda agora de forma natural e direta."
+        reply_text = await call_ai(system_wg, user_wg, max_tokens=500)
+        reply_text = reply_text.strip()
 
         if not reply_text:
             return
