@@ -2541,8 +2541,20 @@ async def update_conversation_labels(conv_id: str, body: UpdateLabels, user=Depe
 # ── CONTACTS ─────────────────────────────────────────────
 # ── LABELS CRUD ──────────────────────────────────────────
 @app.get("/labels")
-async def get_labels(tenant_id: str = Depends(enforce_tenant)):
-    rows = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
+async def get_labels(tenant_id: str = Depends(enforce_tenant), instance_name: str = None):
+    q = supabase.table("labels").select("*").eq("tenant_id", tenant_id)
+    if instance_name:
+        # Labels desta instância + labels sem instância (globais legados)
+        from postgrest.exceptions import APIError as _PGError
+        try:
+            rows_inst = supabase.table("labels").select("*").eq("tenant_id", tenant_id).eq("instance_name", instance_name).execute().data or []
+            rows_global = supabase.table("labels").select("*").eq("tenant_id", tenant_id).is_("instance_name", "null").execute().data or []
+            rows = rows_inst + rows_global
+            rows.sort(key=lambda x: x.get("name",""))
+        except Exception:
+            rows = supabase.table("labels").select("*").eq("tenant_id", tenant_id).order("name").execute().data
+    else:
+        rows = q.order("name").execute().data
     return {"labels": rows}
 
 @app.post("/labels")
@@ -2550,8 +2562,12 @@ async def create_label(body: dict, user=Depends(get_current_user)):
     tenant_id = user["tenant_id"]  # sempre do JWT — nunca do body
     name = (body.get("name") or "").strip()
     color = body.get("color", "#00a884")
+    instance_name = body.get("instance_name") or None
     if not name: raise HTTPException(400, "Nome obrigatório")
-    row = supabase.table("labels").insert({"tenant_id": tenant_id, "name": name, "color": color}).execute().data[0]
+    insert_data = {"tenant_id": tenant_id, "name": name, "color": color}
+    if instance_name:
+        insert_data["instance_name"] = instance_name
+    row = supabase.table("labels").insert(insert_data).execute().data[0]
     return {"label": row}
 
 @app.put("/labels/{label_id}", dependencies=[Depends(verify_key)])
@@ -5454,15 +5470,16 @@ async def get_conv_auto_mode(conv_id: str):
     }
 
 
-# ── /tenant/kanban-columns — shared kanban column config ─────────────────────
+# ── /tenant/kanban-columns — por instância ────────────────────────────────────
 @app.put("/tenant/kanban-columns", dependencies=[Depends(verify_key)])
 async def save_kanban_columns(body: dict):
-    """Save kanban columns shared for entire tenant (all users see the same columns)."""
+    """Salva colunas Kanban por instância (gateway_instances.kanban_columns).
+    Fallback: salva no tenant se instance_name não fornecido."""
     tenant_id = body.get("tenant_id")
     columns = body.get("columns")
+    instance_name = body.get("instance_name")
     if not tenant_id or not isinstance(columns, list):
         raise HTTPException(status_code=400, detail="tenant_id and columns required")
-    # Validate columns structure
     validated = []
     for col in columns:
         if isinstance(col, dict) and col.get("id") and col.get("label"):
@@ -5470,10 +5487,57 @@ async def save_kanban_columns(body: dict):
     if not validated:
         raise HTTPException(status_code=400, detail="At least one valid column required")
     try:
-        supabase.table("tenants").update({"kanban_columns": validated}).eq("id", tenant_id).execute()
-        return {"ok": True, "columns": validated}
+        if instance_name:
+            supabase.table("gateway_instances").update({"kanban_columns": validated}).eq("instance_name", instance_name).eq("tenant_id", tenant_id).execute()
+        else:
+            supabase.table("tenants").update({"kanban_columns": validated}).eq("id", tenant_id).execute()
+        return {"ok": True, "columns": validated, "instance": instance_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tenant/kanban-columns", dependencies=[Depends(verify_key)])
+async def get_kanban_columns(tenant_id: str, instance_name: str = None):
+    """Retorna colunas Kanban da instância. Fallback para tenant se não houver."""
+    default_cols = [
+        {"id": "new", "label": "Nova", "color": "#00a884"},
+        {"id": "in_progress", "label": "Em Atendimento", "color": "#7c4dff"},
+        {"id": "waiting", "label": "Aguardando", "color": "#ff6d00"},
+        {"id": "resolved", "label": "Resolvida", "color": "#667781"},
+    ]
+    try:
+        if instance_name:
+            row = supabase.table("gateway_instances").select("kanban_columns").eq("instance_name", instance_name).eq("tenant_id", tenant_id).limit(1).execute().data
+            if row and row[0].get("kanban_columns"):
+                return {"columns": row[0]["kanban_columns"]}
+        # Fallback: tenant-level
+        t = supabase.table("tenants").select("kanban_columns").eq("id", tenant_id).single().execute().data
+        if t and t.get("kanban_columns"):
+            return {"columns": t["kanban_columns"]}
+        return {"columns": default_cols}
+    except Exception as e:
+        return {"columns": default_cols}
+
+
+# ── /tenant/kanban-columns GET ────────────────────────────────────────────────
+@app.get("/tenant/kanban-columns", dependencies=[Depends(verify_key)])
+async def get_kanban_columns(tenant_id: str, instance_name: str = None):
+    default_cols = [
+        {"id": "new", "label": "Nova", "color": "#00a884"},
+        {"id": "in_progress", "label": "Em Atendimento", "color": "#7c4dff"},
+        {"id": "waiting", "label": "Aguardando", "color": "#ff6d00"},
+        {"id": "resolved", "label": "Resolvida", "color": "#667781"},
+    ]
+    try:
+        if instance_name:
+            row = supabase.table("gateway_instances").select("kanban_columns").eq("instance_name", instance_name).eq("tenant_id", tenant_id).limit(1).execute().data
+            if row and row[0].get("kanban_columns"):
+                return {"columns": row[0]["kanban_columns"]}
+        t = supabase.table("tenants").select("kanban_columns").eq("id", tenant_id).single().execute().data
+        if t and t.get("kanban_columns"):
+            return {"columns": t["kanban_columns"]}
+        return {"columns": default_cols}
+    except:
+        return {"columns": default_cols}
 
 
 # ── /conversations/{id}/trigger-autopilot ─────────────────────────────────────
