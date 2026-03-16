@@ -216,6 +216,93 @@ async def call_ai(system: str, user: str, max_tokens: int = 300, prefer_openai: 
             return r.json()["content"][0]["text"]
     raise Exception("Nenhuma API de IA configurada (OPENAI_API_KEY ou ANTHROPIC_API_KEY)")
 
+async def get_or_create_openai_thread(conv_id: str, assistant_id: str) -> str:
+    """Retorna o thread_id OpenAI existente ou cria um novo para a conversa."""
+    import openai as _oai
+    if not OPENAI_API_KEY:
+        raise Exception("OPENAI_API_KEY não configurada")
+    client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    # Buscar thread_id existente no banco
+    def _get():
+        return supabase.table("conversations").select("openai_thread_id").eq("id", conv_id).single().execute().data
+    row = await run_sync(_get)
+    thread_id = (row or {}).get("openai_thread_id")
+
+    if not thread_id:
+        # Criar novo thread
+        thread = await client.beta.threads.create()
+        thread_id = thread.id
+        def _save(tid=thread_id):
+            supabase.table("conversations").update({"openai_thread_id": tid}).eq("id", conv_id).execute()
+        await run_sync(_save)
+        print(f"[THREAD] Novo thread criado: {thread_id} para conv={conv_id[:8]}")
+    return thread_id
+
+
+async def get_or_create_openai_assistant(tenant_id: str, company_prompt: str) -> str:
+    """Retorna o assistant_id OpenAI do tenant ou cria um novo."""
+    import openai as _oai
+    if not OPENAI_API_KEY:
+        raise Exception("OPENAI_API_KEY não configurada")
+    client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    # Buscar assistant_id no banco
+    def _get():
+        return supabase.table("tenants").select("openai_assistant_id").eq("id", tenant_id).single().execute().data
+    row = await run_sync(_get)
+    assistant_id = (row or {}).get("openai_assistant_id")
+
+    if not assistant_id:
+        # Criar novo assistant com o prompt da empresa
+        assistant = await client.beta.assistants.create(
+            name=f"Assistente 7CRM - {tenant_id[:8]}",
+            instructions=company_prompt or "Você é um atendente de WhatsApp. Seja cordial, objetivo e nunca diga que é uma IA.",
+            model="gpt-4o-mini"
+        )
+        assistant_id = assistant.id
+        def _save(aid=assistant_id):
+            supabase.table("tenants").update({"openai_assistant_id": aid}).eq("id", tenant_id).execute()
+        await run_sync(_save)
+        print(f"[THREAD] Novo assistant criado: {assistant_id} para tenant={tenant_id[:8]}")
+    return assistant_id
+
+
+async def run_with_thread(conv_id: str, tenant_id: str, company_prompt: str, user_message: str) -> str:
+    """
+    Envia mensagem para o thread OpenAI da conversa e retorna a resposta.
+    O contexto é mantido automaticamente pelo OpenAI via thread_id.
+    """
+    import openai as _oai
+    client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    assistant_id = await get_or_create_openai_assistant(tenant_id, company_prompt)
+    thread_id = await get_or_create_openai_thread(conv_id, assistant_id)
+
+    # Adicionar mensagem do usuário ao thread
+    await client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_message
+    )
+
+    # Rodar o assistant
+    run = await client.beta.threads.runs.create_and_poll(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        timeout=30
+    )
+
+    if run.status != "completed":
+        raise Exception(f"Run status: {run.status}")
+
+    # Pegar a última resposta
+    messages = await client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1)
+    reply = messages.data[0].content[0].text.value.strip()
+    print(f"[THREAD] Resposta via thread {thread_id[:12]}: {reply[:80]}")
+    return reply
+
+
 def trim_context(msgs: list, max_msgs: int = 15) -> tuple[str, list, list]:
     """
     Divide mensagens em recentes (últimas N) e antigas (restante).
@@ -2297,17 +2384,20 @@ REGRAS:
         if not messages_for_ai:
             return
 
-        # Passa histórico como multi-turn (user/assistant) para a IA entender o contexto
-        if OPENAI_API_KEY:
-            # OpenAI aceita multi-turn nativo
-            import openai as _oai
-            _oai_client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-            _oai_msgs = [{"role": "system", "content": system_prompt}] + messages_for_ai
-            _r = await _oai_client.chat.completions.create(
-                model="gpt-4o-mini", max_tokens=500, messages=_oai_msgs)
-            reply_text = _r.choices[0].message.content.strip()
+        # Usa OpenAI Threads — contexto persistente por conversa
+        user_message_text = accumulated_text or (all_msgs[-1].get("content","") if all_msgs else "")
+        if OPENAI_API_KEY and user_message_text:
+            try:
+                reply_text = await run_with_thread(conv_id, tenant_id, company_prompt_override or "", user_message_text)
+            except Exception as _te:
+                print(f"[AUTOPILOT] Thread falhou ({_te}), usando call_ai fallback")
+                history_for_ai = []
+                for _m in messages_for_ai:
+                    _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
+                    history_for_ai.append(f"{_role}: {_m['content']}")
+                user_content = "\n".join(history_for_ai) + "\n\nResponda agora como Atendente:"
+                reply_text = await call_ai(system_prompt, user_content, max_tokens=500)
         else:
-            # Fallback Claude — formata multi-turn como texto
             history_for_ai = []
             for _m in messages_for_ai:
                 _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
