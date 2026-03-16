@@ -1043,57 +1043,49 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
     # Captura session/instance_name do webhook
     instance_name = payload.get("session") or payload.get("instance") or payload.get("instanceName") or ""
 
-    # Resolve LID to real phone number via WAHA if needed
+    # Resolve LID to real phone number via WAHA — endpoint correto: /api/contacts?session=X&contactId=Y
     if "@lid" in phone and instance_name:
         lid_raw = phone
         try:
             async with httpx.AsyncClient(timeout=6) as _c:
-                # Try 1: WAHA v2 path style GET /api/{session}/contacts?contactId=LID
-                _r = await _c.get(f"{WAHA_URL}/api/{instance_name}/contacts",
-                                  headers=waha_headers(), params={"contactId": phone})
-                print(f"[LID_RESOLVE] try1 status={_r.status_code} body={_r.text[:200]}")
+                _r = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
+                                   params={"session": instance_name, "contactId": phone})
                 _resolved = None
-                if _r.status_code == 200:
-                    _d = _r.json()
-                    if isinstance(_d, list): _d = _d[0] if _d else {}
-                    _rid = _d.get("id", {})
-                    _candidate = (_d.get("number") or _d.get("phone") or
-                                  (_rid.get("user","") if isinstance(_rid,dict) else str(_rid)))
-                    _candidate = str(_candidate).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
-                    if _candidate and _candidate.replace("+","").isdigit(): _resolved = _candidate
-
-                if not _resolved:
-                    # Try 2: original style GET /api/contacts?session=X&contactId=Y
-                    _r2 = await _c.get(f"{WAHA_URL}/api/contacts", headers=waha_headers(),
-                                       params={"session": instance_name, "contactId": phone})
-                    print(f"[LID_RESOLVE] try2 status={_r2.status_code} body={_r2.text[:200]}")
-                    if _r2.status_code == 200:
-                        _d2 = _r2.json()
-                        if isinstance(_d2, list): _d2 = _d2[0] if _d2 else {}
-                        _rid2 = _d2.get("id", {})
-                        _candidate2 = (_d2.get("number") or _d2.get("phone") or
-                                       (_rid2.get("user","") if isinstance(_rid2,dict) else str(_rid2)))
-                        _candidate2 = str(_candidate2).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","")
-                        if _candidate2 and _candidate2.replace("+","").isdigit(): _resolved = _candidate2
-
-                # Also capture verifiedName/pushname for contact naming
                 _lid_name = None
-                for _dd in [locals().get("_d2"), locals().get("_d")]:
-                    if isinstance(_dd, dict):
-                        _lid_name = _dd.get("verifiedName") or _dd.get("pushname") or _dd.get("name")
-                        if _lid_name: break
+                if _r.status_code == 200 and _r.text:
+                    _d = _r.json()
+                    # WAHA retorna phoneNumber como "55xxxxxxxxxxx@s.whatsapp.net"
+                    _raw_phone = (
+                        _d.get("phoneNumber") or
+                        _d.get("number") or
+                        _d.get("phone") or ""
+                    )
+                    _candidate = str(_raw_phone).replace("@c.us","").replace("@s.whatsapp.net","").replace("@lid","").strip()
+                    if _candidate and _candidate.isdigit() and len(_candidate) >= 10:
+                        _resolved = _candidate
+                    _lid_name = _d.get("verifiedName") or _d.get("pushname") or _d.get("name")
 
                 if _resolved:
-                    print(f"[LID_RESOLVE] {lid_raw} -> {_resolved} name={_lid_name}")
+                    print(f"[LID_RESOLVE] ✅ {lid_raw} → {_resolved} ({_lid_name})")
                     phone = _resolved
                     if _lid_name and not contact_name_override:
                         contact_name_override = _lid_name
+                    # Atualiza contato no banco imediatamente
+                    def _update_phone(p=_resolved, n=_lid_name, lid=lid_raw, tid=tenant_id):
+                        existing = supabase.table("contacts").select("id,name").eq("tenant_id", tid).eq("phone", lid).execute().data
+                        if existing:
+                            upd = {"phone": p}
+                            if n and not existing[0].get("name"):
+                                upd["name"] = n
+                            supabase.table("contacts").update(upd).eq("id", existing[0]["id"]).execute()
+                            print(f"[LID_RESOLVE] Banco atualizado: {lid} → {p}")
+                    asyncio.create_task(asyncio.to_thread(_update_phone))
                 else:
                     # Could not resolve LID — store ONLY digits, never @lid in DB
                     _lid_digits = lid_raw.replace("@lid","").replace("@c.us","").strip()
                     if _lid_digits.isdigit():
-                        phone = _lid_digits  # Clean digits only, no @lid suffix
-                        print(f"[LID_RESOLVE] unresolved, using digits: {phone} name={_lid_name}")
+                        phone = _lid_digits
+                        print(f"[LID_RESOLVE] unresolved, using digits: {phone}")
                         if _lid_name and not contact_name_override:
                             contact_name_override = _lid_name
                     else:
