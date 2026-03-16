@@ -2054,7 +2054,7 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
     r = _get_redis()
-    window = random.randint(120, 240)  # 2-4 min — tempo humanizado
+    window = random.randint(30, 60)  # 30-60s — aguarda cliente terminar de digitar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2081,7 +2081,7 @@ def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str
     import time as _time
     r = _get_redis()
     # Janela de debounce: 45-90s (aguarda cliente terminar de digitar)
-    window = random.randint(120, 240)  # 2-4 min — tempo humanizado
+    window = random.randint(30, 60)  # 30-60s — aguarda cliente terminar de digitar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2297,6 +2297,12 @@ REGRAS:
             return
 
         print(f"[AUTOPILOT] IA respondeu ({len(pending_inbound)} msgs acumuladas): {reply_text[:80]}")
+
+        # ── Delay humanizador: simula tempo de digitação antes de enviar ─────────
+        typing_delay = min(max(len(reply_text) * 0.05, 3), 15)  # 3s a 15s baseado no tamanho
+        typing_delay += random.uniform(0, 3)  # +0-3s aleatório extra
+        print(f"[AUTOPILOT] Simulando digitação por {typing_delay:.1f}s...")
+        await asyncio.sleep(typing_delay)
 
         # ── Fase 6: envia via WAHA primeiro, salva no banco só se OK ────────────
         phone = (conv.get("contacts") or {}).get("phone", "")
