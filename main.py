@@ -5702,10 +5702,26 @@ async def trigger_autopilot(conv_id: str):
         system_prompt = f"""{company_prompt}{continuation_note}
 
 Você é um assistente de atendimento via WhatsApp. Responda de forma natural, direta e humana em UMA ÚNICA mensagem. Não use prefixos como "Atendente:" na resposta."""
-        history_str = "\n".join(history_lines)
-        messages_for_ai = [{"role": "user", "content": f"Histórico:\n{history_str}\n\nMensagens pendentes do cliente:\n{pending_text}\n\nResponda agora."}]
 
-        reply_text = await call_ai(system_prompt, messages_for_ai[0]["content"], max_tokens=500)
+        # Usar OpenAI Threads para contexto persistente
+        contact_id = (conv.get("contacts") or {}).get("id") or ""
+        # Buscar contact_id via banco se não veio no join
+        if not contact_id:
+            _crows = supabase.table("conversations").select("contact_id").eq("id", conv_id).single().execute().data
+            contact_id = (_crows or {}).get("contact_id","")
+
+        if OPENAI_API_KEY and contact_id:
+            try:
+                assistant_id = await get_or_create_openai_assistant(tenant_id, company_prompt)
+                thread_id = await get_or_create_openai_thread(conv_id, assistant_id)
+                reply_text = await run_with_thread(conv_id, tenant_id, company_prompt, pending_text)
+            except Exception as _te:
+                print(f"[TRIGGER_AP] Thread falhou ({_te}), usando call_ai fallback")
+                history_str = "\n".join(history_lines)
+                reply_text = await call_ai(system_prompt, f"Histórico:\n{history_str}\n\nMensagens pendentes:\n{pending_text}\n\nResponda agora.", max_tokens=500)
+        else:
+            history_str = "\n".join(history_lines)
+            reply_text = await call_ai(system_prompt, f"Histórico:\n{history_str}\n\nMensagens pendentes:\n{pending_text}\n\nResponda agora.", max_tokens=500)
         if not reply_text:
             return {"ok": False, "reason": "IA retornou resposta vazia"}
 
