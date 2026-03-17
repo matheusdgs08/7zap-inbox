@@ -1958,7 +1958,7 @@ async def _startup_autopilot_recovery():
         ).neq("copilot_auto_mode", "off").not_.is_("copilot_auto_mode", "null").execute().data or []
 
         recovered = 0
-        cutoff_recent = (_dt.datetime.utcnow() - _dt.timedelta(hours=2)).isoformat()
+        cutoff_recent = (_dt.datetime.utcnow() - _dt.timedelta(minutes=10)).isoformat()
 
         for inst in instances:
             if inst.get("copilot_auto_mode") in ("off", None, ""):
