@@ -2397,7 +2397,9 @@ REGRAS:
             try:
                 reply_text = await run_with_thread(conv_id, tenant_id, company_prompt_override or "", user_message_text)
             except Exception as _te:
-                print(f"[AUTOPILOT] Thread falhou ({_te}), usando call_ai fallback")
+                import traceback
+                print(f"[AUTOPILOT] Thread falhou: {type(_te).__name__}: {_te}")
+                print(f"[AUTOPILOT] Traceback: {traceback.format_exc()[-500:]}")
                 history_for_ai = []
                 for _m in messages_for_ai:
                     _role = "Atendente" if _m["role"] == "assistant" else "Cliente"
