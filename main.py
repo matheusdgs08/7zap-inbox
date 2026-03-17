@@ -935,9 +935,9 @@ async def delete_user_admin(user_id: str, admin=Depends(require_admin)):
 
 # ── WEBHOOK — recebe mensagens do WAHA ───────────────────
 @app.post("/webhook/message")
-async def receive_message_legacy(payload: dict = None, x_api_key: str = Header(default="")):
+async def receive_message_legacy(payload: dict = None, bg: BackgroundTasks = None, x_api_key: str = Header(default="")):
     """Alias para /webhook/inbox — WAHA aponta para cá."""
-    return await receive_message(payload or {}, x_api_key)
+    return await receive_message(payload or {}, bg or BackgroundTasks(), x_api_key)
 
 @app.post("/webhook/inbox")
 async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = Header(default="")):
