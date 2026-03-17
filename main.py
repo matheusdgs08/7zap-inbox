@@ -1991,14 +1991,22 @@ async def _startup_autopilot_recovery():
                         continue
 
                     # Última mensagem: inbound dentro das últimas 2h?
-                    last_msgs = supabase.table("messages").select("direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(1).execute().data
+                    # Buscar as 2 últimas mensagens para verificar se já foi respondida
+                    last_msgs = supabase.table("messages").select("direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(2).execute().data
                     if not last_msgs:
                         continue
                     last = last_msgs[0]
-                    if last.get("direction") != "inbound":
+                    # Se a última mensagem já é outbound, a IA já respondeu — não re-disparar
+                    if last.get("direction") == "outbound":
                         continue
+                    # Se a última é inbound mas é antiga demais, ignorar
                     if last.get("created_at", "") < cutoff_recent:
-                        continue  # mensagem antiga demais — watchguard normal vai pegar
+                        continue
+                    # Verificar se existe outbound DEPOIS do último inbound (double-check)
+                    last_inbound_at = last.get("created_at", "")
+                    if len(last_msgs) > 1 and last_msgs[1].get("direction") == "outbound":
+                        # Penúltima já era outbound — não precisa re-disparar
+                        continue
 
                     print(f"[STARTUP_RECOVERY] Re-disparando debounce → conv={conv_id[:8]} inst={inst_name}")
                     asyncio.create_task(_autopilot_debounce_trigger_async(conv_id, tenant_id, inst_name))
