@@ -2217,7 +2217,7 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
     r = _get_redis()
-    window = random.randint(30, 60)  # 30-60s — aguarda cliente terminar de digitar
+    window = random.randint(120, 180)  # 120-180s — aguarda cliente terminar de digitar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2244,7 +2244,7 @@ def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str
     import time as _time
     r = _get_redis()
     # Janela de debounce: 45-90s (aguarda cliente terminar de digitar)
-    window = random.randint(30, 60)  # 30-60s — aguarda cliente terminar de digitar
+    window = random.randint(120, 180)  # 120-180s — aguarda cliente terminar de digitar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
