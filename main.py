@@ -456,34 +456,41 @@ async def ensure_webhooks():
         print(f"ensure_webhooks error: {e}")
 
 async def fix_existing_sessions_webhook():
-    """Corrige sessoes existentes que ainda usam /webhook/message → /webhook/inbox"""
-    return  # DISABLED: PUT to WAHA causes session restart loop
+    """Garante que TODAS as sessoes usam /webhook/inbox com eventos completos."""
     if not WAHA_URL:
         return
+    await asyncio.sleep(15)  # aguarda WAHA estabilizar
+    CORRECT_URL = f"{BACKEND_URL}/webhook/inbox"
+    EVENTS = ["session.status","message","message.any","message.reaction","message.ack",
+              "message.waiting","message.revoked","message.edited","group.join","group.leave",
+              "presence.update","call.received","call.accepted","call.rejected"]
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(f"{WAHA_URL}/api/sessions", headers=waha_headers())
             if r.status_code != 200:
                 return
-            sessions = r.json()
             fixed = 0
-            for s in sessions:
+            for s in r.json():
                 name = s.get("name", "")
+                if not name:
+                    continue
                 webhooks = s.get("config", {}).get("webhooks", [])
-                for wh in webhooks:
-                    if "/webhook/message" in wh.get("url", ""):
-                        # Corrigir para /webhook/inbox
-                        new_url = wh["url"].replace("/webhook/message", "/webhook/inbox")
-                        await client.put(f"{WAHA_URL}/api/sessions/{name}", headers=waha_headers(),
-                            json={"config": {"webhooks": [{
-                                "url": new_url,
-                                "events": ["message", "message.any", "session.status"],
-                                "customHeaders": wh.get("customHeaders", [])
-                            }]}})
-                        print(f"[STARTUP] Corrigido webhook de {name}: /webhook/message → /webhook/inbox")
-                        fixed += 1
+                current_url = webhooks[0].get("url", "") if webhooks else ""
+                current_events = webhooks[0].get("events", []) if webhooks else []
+                # Corrigir se URL errada ou sem eventos suficientes
+                if "/webhook/inbox" not in current_url or len(current_events) < 5:
+                    await client.patch(f"{WAHA_URL}/api/sessions/{name}", headers=waha_headers(),
+                        json={"config": {"webhooks": [{
+                            "url": CORRECT_URL,
+                            "events": EVENTS,
+                            "customHeaders": [{"name": "x-api-key", "value": INBOX_API_KEY}]
+                        }]}})
+                    print(f"[STARTUP] Webhook corrigido: {name} → /webhook/inbox")
+                    fixed += 1
             if fixed > 0:
-                print(f"[STARTUP] {fixed} sessoes corrigidas")
+                print(f"[STARTUP] {fixed} sessao(es) corrigida(s)")
+            else:
+                print(f"[STARTUP] Todos os webhooks OK")
     except Exception as e:
         print(f"[STARTUP] fix_existing_sessions_webhook error: {e}")
 
