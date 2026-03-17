@@ -255,43 +255,85 @@ async def get_or_create_openai_thread(conv_id: str, assistant_id: str) -> str:
     return thread_id
 
 
-async def get_or_create_openai_assistant(tenant_id: str, company_prompt: str) -> str:
-    """Retorna o assistant_id OpenAI do tenant ou cria um novo."""
+async def get_or_create_openai_assistant(tenant_id: str, company_prompt: str, instance_name: str = None) -> str:
+    """
+    Retorna o assistant_id OpenAI por INSTÂNCIA (cada instância tem seu próprio assistant com seu prompt).
+    Se o prompt mudou, atualiza o assistant existente.
+    """
     import openai as _oai
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY não configurada")
     client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    # Buscar assistant_id no banco
-    def _get():
-        return supabase.table("tenants").select("openai_assistant_id").eq("id", tenant_id).single().execute().data
-    row = await run_sync(_get)
-    assistant_id = (row or {}).get("openai_assistant_id")
+    prompt_to_use = company_prompt or "Você é um atendente de WhatsApp. Seja cordial, objetivo e nunca diga que é uma IA."
+    prompt_hash = str(hash(prompt_to_use))[:16]
 
-    if not assistant_id:
-        # Criar novo assistant com o prompt da empresa
+    if instance_name:
+        # Por instância — buscar em gateway_instances
+        def _get_inst():
+            return supabase.table("gateway_instances").select("openai_assistant_id,openai_prompt_hash").eq("tenant_id", tenant_id).eq("instance_name", instance_name).execute().data
+        rows = await run_sync(_get_inst)
+        row = rows[0] if rows else None
+        assistant_id = (row or {}).get("openai_assistant_id")
+        stored_hash = (row or {}).get("openai_prompt_hash")
+
+        if assistant_id and stored_hash == prompt_hash:
+            return assistant_id  # Prompt não mudou — usar assistant existente
+
+        if assistant_id and stored_hash != prompt_hash:
+            # Prompt mudou — atualizar assistant na OpenAI
+            try:
+                await client.beta.assistants.update(assistant_id, instructions=prompt_to_use)
+                def _upd_hash(iid=assistant_id, ph=prompt_hash, tid=tenant_id, inst=instance_name):
+                    supabase.table("gateway_instances").update({"openai_prompt_hash": ph}).eq("tenant_id", tid).eq("instance_name", inst).execute()
+                await run_sync(_upd_hash)
+                print(f"[THREAD] Assistant atualizado: {assistant_id} (prompt mudou) instância={instance_name}")
+                return assistant_id
+            except Exception as e:
+                print(f"[THREAD] Erro ao atualizar assistant: {e}")
+
+        # Criar novo assistant para esta instância
         assistant = await client.beta.assistants.create(
-            name=f"Assistente 7CRM - {tenant_id[:8]}",
-            instructions=company_prompt or "Você é um atendente de WhatsApp. Seja cordial, objetivo e nunca diga que é uma IA.",
+            name=f"7CRM - {instance_name}",
+            instructions=prompt_to_use,
             model="gpt-4o-mini"
         )
         assistant_id = assistant.id
-        def _save(aid=assistant_id):
-            supabase.table("tenants").update({"openai_assistant_id": aid}).eq("id", tenant_id).execute()
-        await run_sync(_save)
-        print(f"[THREAD] Novo assistant criado: {assistant_id} para tenant={tenant_id[:8]}")
-    return assistant_id
+        def _save_inst(aid=assistant_id, ph=prompt_hash, tid=tenant_id, inst=instance_name):
+            supabase.table("gateway_instances").update({"openai_assistant_id": aid, "openai_prompt_hash": ph}).eq("tenant_id", tid).eq("instance_name", inst).execute()
+        await run_sync(_save_inst)
+        print(f"[THREAD] Novo assistant criado: {assistant_id} para instância={instance_name}")
+        return assistant_id
+    else:
+        # Fallback por tenant
+        def _get():
+            return supabase.table("tenants").select("openai_assistant_id").eq("id", tenant_id).single().execute().data
+        row = await run_sync(_get)
+        assistant_id = (row or {}).get("openai_assistant_id")
+        if not assistant_id:
+            assistant = await client.beta.assistants.create(
+                name=f"7CRM - {tenant_id[:8]}",
+                instructions=prompt_to_use,
+                model="gpt-4o-mini"
+            )
+            assistant_id = assistant.id
+            def _save(aid=assistant_id):
+                supabase.table("tenants").update({"openai_assistant_id": aid}).eq("id", tenant_id).execute()
+            await run_sync(_save)
+            print(f"[THREAD] Novo assistant criado: {assistant_id} para tenant={tenant_id[:8]}")
+        return assistant_id
 
 
-async def run_with_thread(conv_id: str, tenant_id: str, company_prompt: str, user_message: str) -> str:
+async def run_with_thread(conv_id: str, tenant_id: str, company_prompt: str, user_message: str, instance_name: str = None) -> str:
     """
     Envia mensagem para o thread OpenAI da conversa e retorna a resposta.
     O contexto é mantido automaticamente pelo OpenAI via thread_id.
+    Cada instância tem seu próprio assistant com seu prompt.
     """
     import openai as _oai
     client = _oai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    assistant_id = await get_or_create_openai_assistant(tenant_id, company_prompt)
+    assistant_id = await get_or_create_openai_assistant(tenant_id, company_prompt, instance_name=instance_name)
     thread_id = await get_or_create_openai_thread(conv_id, assistant_id)
 
     # Adicionar mensagem do usuário ao thread
@@ -2395,7 +2437,7 @@ REGRAS:
         user_message_text = accumulated_text or (all_msgs[-1].get("content","") if all_msgs else "")
         if OPENAI_API_KEY and user_message_text:
             try:
-                reply_text = await run_with_thread(conv_id, tenant_id, company_prompt_override or "", user_message_text)
+                reply_text = await run_with_thread(conv_id, tenant_id, company_prompt_override or "", user_message_text, instance_name=instance_name)
             except Exception as _te:
                 import traceback
                 print(f"[AUTOPILOT] Thread falhou: {type(_te).__name__}: {_te}")
