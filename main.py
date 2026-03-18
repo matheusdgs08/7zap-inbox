@@ -181,6 +181,8 @@ async def startup_event():
     asyncio.create_task(scheduled_messages_loop())
     # Recovery: re-dispara autopilot para conversas inbound sem resposta que ficaram presas no restart
     asyncio.create_task(_startup_autopilot_recovery())
+    # Follow-up: envia emoji contextual 30min após primeira mensagem sem resposta
+    asyncio.create_task(_followup_worker())
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY")
@@ -1244,6 +1246,12 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                 except Exception:
                     conv = supabase.table("conversations").insert({"contact_id": contact_id, "tenant_id": tid, "status": "open"}).execute().data[0]
                 conv_id = conv["id"]; uc = 1
+                # ── FOLLOW-UP: agenda emoji 30min para conversa nova ──
+                if not is_from_me:
+                    try:
+                        _followup_schedule(conv_id, tid, instance_name or "")
+                    except Exception as _fe:
+                        print(f"[FOLLOWUP] Erro ao agendar: {_fe}")
             # Also fix existing conversations that have wrong/null instance_name
             if instance_name and convs:
                 existing_inst = supabase.table("conversations").select("instance_name").eq("id", conv_id).single().execute().data
@@ -2212,6 +2220,121 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
         if r:
             r.delete(lock_key)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FOLLOW-UP EMOJI — envia emoji contextual 30min após primeira mensagem sem resposta
+# ─────────────────────────────────────────────────────────────────────────────
+FOLLOWUP_DELAY = 30 * 60  # 30 minutos
+
+def _followup_schedule(conv_id: str, tenant_id: str, instance_name: str):
+    """Agenda follow-up para conversa nova — só se Redis disponível."""
+    if not r: return
+    done_key = f"7crm:followup_done:{conv_id}"
+    if r.exists(done_key): return  # já enviou, nunca repete
+    pending_key = f"7crm:followup_pending:{conv_id}"
+    # Guarda tenant + instance para usar depois
+    import json as _json
+    r.setex(pending_key, FOLLOWUP_DELAY + 60, _json.dumps({"tenant_id": tenant_id, "instance_name": instance_name}))
+    print(f"[FOLLOWUP] Agendado para conv={conv_id[:8]} em {FOLLOWUP_DELAY//60}min")
+
+async def _followup_send(conv_id: str, tenant_id: str, instance_name: str):
+    """Checa se cliente não respondeu e envia emoji contextual."""
+    try:
+        if not r: return
+        done_key = f"7crm:followup_done:{conv_id}"
+        if r.exists(done_key): return  # já enviou
+
+        # Verificar se houve mensagem inbound após a última outbound
+        msgs = supabase.table("messages").select("direction,created_at").eq("conversation_id", conv_id).order("created_at", desc=True).limit(5).execute().data or []
+        if not msgs: return
+
+        # Se a última mensagem é inbound = cliente respondeu, não precisa follow-up
+        if msgs[0].get("direction") == "inbound":
+            print(f"[FOLLOWUP] Cliente respondeu, cancelando conv={conv_id[:8]}")
+            return
+
+        # Verificar se já passou os 30 min desde última outbound
+        from datetime import timezone
+        last_out = next((m for m in msgs if m.get("direction") == "outbound"), None)
+        if not last_out: return
+        last_out_ts = datetime.fromisoformat(last_out["created_at"].replace("Z", "+00:00"))
+        elapsed = (datetime.now(timezone.utc) - last_out_ts).total_seconds()
+        if elapsed < FOLLOWUP_DELAY - 30:  # margem de 30s
+            print(f"[FOLLOWUP] Ainda não passou 30min (elapsed={elapsed:.0f}s), conv={conv_id[:8]}")
+            return
+
+        # Buscar contexto da conversa para a IA escolher emoji
+        context_msgs = supabase.table("messages").select("direction,content,type").eq("conversation_id", conv_id).order("created_at").limit(10).execute().data or []
+        context_text = ""
+        for m in context_msgs:
+            if not m.get("content"): continue
+            role = "Cliente" if m.get("direction") == "inbound" else "Atendente"
+            context_text += f"{role}: {m['content'][:100]}\n"
+
+        # Pedir para IA escolher o melhor emoji
+        emoji = await call_ai(
+            system="Você é um assistente que escolhe o melhor emoji para um follow-up de WhatsApp. Responda APENAS com 1 emoji, nada mais.",
+            user=f"Com base nessa conversa de WhatsApp, qual é o melhor emoji para enviar como follow-up gentil (para mostrar presença sem ser invasivo)?\n\n{context_text}\n\nResponda apenas 1 emoji.",
+            max_tokens=10
+        )
+        emoji = emoji.strip()
+        # Garantir que é só um emoji (fallback)
+        if len(emoji) > 5:
+            emoji = "👋"
+
+        # Buscar telefone e session
+        conv = supabase.table("conversations").select("*, contacts(phone)").eq("id", conv_id).single().execute().data
+        if not conv: return
+        phone = (conv.get("contacts") or {}).get("phone", "")
+        session = conv.get("instance_name") or instance_name or "default"
+        if not phone: return
+
+        print(f"[FOLLOWUP] Enviando emoji '{emoji}' para conv={conv_id[:8]} session={session}")
+        await waha_send_msg(phone, emoji, session)
+
+        # Salvar no banco como mensagem outbound
+        supabase.table("messages").insert({
+            "conversation_id": conv_id,
+            "tenant_id": tenant_id,
+            "direction": "outbound",
+            "content": emoji,
+            "type": "text",
+            "sent_by": "followup_bot"
+        }).execute()
+        supabase.table("conversations").update({
+            "last_message_at": datetime.utcnow().isoformat(),
+            "last_message_preview": f"✓ {emoji}"
+        }).eq("id", conv_id).execute()
+
+        # Marcar como feito — nunca mais envia nessa conversa
+        r.set(done_key, "1")
+        print(f"[FOLLOWUP] ✅ Enviado com sucesso conv={conv_id[:8]}")
+
+    except Exception as e:
+        print(f"[FOLLOWUP] Erro: {e}")
+
+async def _followup_worker():
+    """Worker que roda a cada 60s verificando follow-ups pendentes para disparar."""
+    import json as _json
+    await asyncio.sleep(60)  # aguarda sistema inicializar
+    print("[FOLLOWUP] Worker iniciado")
+    while True:
+        try:
+            if r:
+                for key in r.scan_iter("7crm:followup_pending:*"):
+                    ttl = r.ttl(key)
+                    # TTL original = FOLLOWUP_DELAY + 60. Quando TTL <= 60s = passou os 30min
+                    if ttl != -1 and ttl <= 60:
+                        try:
+                            data = _json.loads(r.get(key) or "{}")
+                            conv_id = key.decode().replace("7crm:followup_pending:", "") if isinstance(key, bytes) else key.replace("7crm:followup_pending:", "")
+                            r.delete(key)  # remove pending
+                            await _followup_send(conv_id, data.get("tenant_id",""), data.get("instance_name",""))
+                        except Exception as e:
+                            print(f"[FOLLOWUP] Erro ao processar {key}: {e}")
+        except Exception as e:
+            print(f"[FOLLOWUP] Worker erro: {e}")
+        await asyncio.sleep(60)
 
 async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instance_name: str):
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
