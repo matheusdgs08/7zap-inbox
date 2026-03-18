@@ -3827,6 +3827,7 @@ PLAN_FEATURES = {
     "pro":       {"agents": 8,   "numbers": 2,   "ai_credits": 300,   "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
     "business":  {"agents": 20,  "numbers": 5,   "ai_credits": 1000,  "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": False},
     "enterprise":{"agents": 999, "numbers": 999, "ai_credits": 99999, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
+    "owner":     {"agents": 20,  "numbers": 10,  "ai_credits": 50000, "disparos": True,  "copilot": True,  "onboarding": True,  "white_label": True},
 }
 
 @app.get("/plan/features")
