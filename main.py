@@ -2380,7 +2380,7 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
     """Versão async do trigger — garante que asyncio.create_task funcione corretamente."""
     import time as _time
     r = _get_redis()
-    window = random.randint(120, 180)  # 120-180s — aguarda cliente terminar de digitar
+    window = random.randint(90, 180)  # 90-180s — aguarda cliente terminar de digitar
     deadline = _time.time() + window
     deadline_key = f"7crm:ap_deadline:{conv_id}"
     lock_key = f"7crm:ap_lock:{conv_id}"
@@ -2391,8 +2391,46 @@ async def _autopilot_debounce_trigger_async(conv_id: str, tenant_id: str, instan
         if lock_exists:
             print(f"[AUTOPILOT] Debounce: prazo atualizado +{window}s para conv={conv_id[:8]} (watcher já ativo)")
             return
-    print(f"[AUTOPILOT] Iniciando watcher para conv={conv_id[:8]} instância={instance_name} janela={window}s")
-    asyncio.create_task(_auto_pilot_watcher(conv_id, tenant_id, instance_name))
+        print(f"[AUTOPILOT] Iniciando watcher para conv={conv_id[:8]} instância={instance_name} janela={window}s")
+        asyncio.create_task(_auto_pilot_watcher(conv_id, tenant_id, instance_name))
+    else:
+        # Sem Redis: usa sleep direto como fallback de debounce
+        lock_key_mem = f"_ap_noredis_{conv_id}"
+        if getattr(_autopilot_debounce_trigger_async, lock_key_mem, False):
+            # Já tem watcher rodando para esta conversa (flag em memória)
+            setattr(_autopilot_debounce_trigger_async, lock_key_mem, deadline)
+            print(f"[AUTOPILOT] Sem Redis — deadline atualizado para conv={conv_id[:8]}")
+            return
+        setattr(_autopilot_debounce_trigger_async, lock_key_mem, deadline)
+        print(f"[AUTOPILOT] Sem Redis — watcher com sleep {window}s para conv={conv_id[:8]}")
+        asyncio.create_task(_auto_pilot_watcher_no_redis(conv_id, tenant_id, instance_name, lock_key_mem))
+
+
+async def _auto_pilot_watcher_no_redis(conv_id: str, tenant_id: str, instance_name: str, lock_key_mem: str):
+    """Watcher de fallback quando Redis não está disponível — usa sleep + flag em memória."""
+    import time as _time
+    try:
+        print(f"[AUTOPILOT/NoRedis] Watcher iniciado conv={conv_id[:8]}")
+        # Aguarda verificando se o deadline (em memória) ainda está no futuro
+        while True:
+            await asyncio.sleep(10)
+            deadline = getattr(_autopilot_debounce_trigger_async, lock_key_mem, 0)
+            if not deadline:
+                break
+            remaining = deadline - _time.time()
+            if remaining > 0:
+                print(f"[AUTOPILOT/NoRedis] conv={conv_id[:8]} aguardando {remaining:.0f}s")
+                continue
+            break
+        # Limpa flag
+        try: delattr(_autopilot_debounce_trigger_async, lock_key_mem)
+        except: pass
+        # Delega para o watcher principal
+        await _auto_pilot_watcher(conv_id, tenant_id, instance_name)
+    except Exception as e:
+        print(f"[AUTOPILOT/NoRedis] Erro: {e}")
+        try: delattr(_autopilot_debounce_trigger_async, lock_key_mem)
+        except: pass
 
 
 def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str):
@@ -2639,11 +2677,30 @@ REGRAS:
 
         print(f"[AUTOPILOT] IA respondeu ({len(pending_inbound)} msgs acumuladas): {reply_text[:80]}")
 
-        # ── Delay humanizador: simula tempo de digitação antes de enviar ─────────
+        # ── Delay humanizador: envia "digitando..." no WhatsApp antes de enviar ──
         typing_delay = min(max(len(reply_text) * 0.05, 3), 15)  # 3s a 15s baseado no tamanho
         typing_delay += random.uniform(0, 3)  # +0-3s aleatório extra
         print(f"[AUTOPILOT] Simulando digitação por {typing_delay:.1f}s...")
+        # Envia indicador de digitação real via WAHA
+        phone_for_typing = (conv.get("contacts") or {}).get("phone", "")
+        if phone_for_typing and instance_name:
+            digits_t = "".join(c for c in str(phone_for_typing) if c.isdigit())
+            chat_id_t = f"{digits_t}@c.us"
+            try:
+                async with httpx.AsyncClient(timeout=5) as _tc:
+                    await _tc.post(f"{WAHA_URL}/api/startTyping",
+                        headers=waha_headers(),
+                        json={"session": instance_name, "chatId": chat_id_t})
+            except: pass
         await asyncio.sleep(typing_delay)
+        # Para o indicador de digitação
+        if phone_for_typing and instance_name:
+            try:
+                async with httpx.AsyncClient(timeout=5) as _tc:
+                    await _tc.post(f"{WAHA_URL}/api/stopTyping",
+                        headers=waha_headers(),
+                        json={"session": instance_name, "chatId": chat_id_t})
+            except: pass
 
         # ── Fase 6: envia via WAHA primeiro, salva no banco só se OK ────────────
         phone = (conv.get("contacts") or {}).get("phone", "")
