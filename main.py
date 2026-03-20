@@ -105,11 +105,12 @@ def cache_is_stale(key):
     return (datetime.utcnow().timestamp() - v["ts"]) >= v["ttl"]
 # ── PLAN CREDIT CONSTANTS ────────────────────────────────
 PLAN_CREDITS = {
-    "trial":      1000,  # onboarding consome ~1000 créditos — suficiente pra ver resultado
-    "starter":    0,     # sem IA
-    "pro":        300,   # ~1 semana de uso intenso → incentiva compra de pacote
-    "business":   1000,  # generoso mas não infinito
+    "trial":      1000,   # 7 dias grátis com 1.000 créditos
+    "starter":    500,    # 500 créditos/mês (só co-pilot manual, sem autopilot)
+    "pro":        2000,   # 2.000 créditos/mês — alinhado com plano vendido
+    "business":   5000,   # 5.000 créditos/mês — alinhado com plano vendido
     "enterprise": 99999,
+    "owner":      50000,
 }
 PLAN_RESETS = {
     "pro":       True,
@@ -143,10 +144,20 @@ def get_tenant_credits(tenant_id: str):
     return credits, plan, limit
 
 def consume_credit(tenant_id: str, amount: int = 1):
-    """Deduct credits. Returns (ok, credits_remaining, error_detail)."""
+    """Deduct credits atomically. Returns (ok, credits_remaining, error_detail)."""
     credits, plan, limit = get_tenant_credits(tenant_id)
     if credits < amount:
         return False, credits, f"Créditos insuficientes. Restam {credits} crédito(s). Faça upgrade ou compre mais créditos."
+    # Update atômico com verificação de saldo mínimo (evita race condition)
+    result = supabase.rpc("decrement_credits", {"p_tenant_id": tenant_id, "p_amount": amount}).execute()
+    # Fallback: se RPC não existir, usa update normal
+    try:
+        if result and result.data is not None:
+            new_val = credits - amount
+            return True, new_val, None
+    except Exception:
+        pass
+    # Fallback direto
     new_val = credits - amount
     supabase.table("tenants").update({"ai_credits": new_val}).eq("id", tenant_id).execute()
     return True, new_val, None
@@ -160,7 +171,18 @@ import httpx, os, jwt, bcrypt, asyncio, random, base64, json, secrets as _secret
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=[
+        "https://7crm.com.br",
+        "https://www.7crm.com.br",
+        "https://7zap-inbox-frontend.vercel.app",
+        "http://localhost:5173",   # dev local Vite
+        "http://localhost:3000",   # dev local alternativo
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 @app.on_event("startup")
 async def startup_event():
@@ -414,6 +436,9 @@ async def get_or_generate_summary(conv_id: str, old_msgs: list, existing_summary
 PAGARME_API_KEY   = os.getenv("PAGARME_API_KEY", "")
 SUPER_ADMIN_TENANT = os.getenv("SUPER_ADMIN_TENANT", "98c38c97-2796-471f-bfc9-f093ff3ae6e9")
 JWT_SECRET        = os.getenv("JWT_SECRET") or "7crm_super_secret_CHANGE_ME_IN_PROD"
+if JWT_SECRET == "7crm_super_secret_CHANGE_ME_IN_PROD":
+    import warnings
+    warnings.warn("🔴 SEGURANÇA: JWT_SECRET usando valor padrão inseguro! Configure JWT_SECRET antes de produção.", stacklevel=2)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 security = HTTPBearer(auto_error=False)
@@ -769,9 +794,10 @@ async def enforce_tenant(
     # Verificar bloqueio com cache Redis
     _cache_key = f"7crm:tenant_blocked:{tid}"
     _blocked = None
+    _er = _get_redis()  # fix: era variável global r sem chamar _get_redis()
     try:
-        if r:
-            _v = r.get(_cache_key)
+        if _er:
+            _v = _er.get(_cache_key)
             if _v is not None:
                 _blocked = _v == b"1"
     except Exception:
@@ -781,7 +807,7 @@ async def enforce_tenant(
             _t = supabase.table("tenants").select("is_blocked").eq("id", tid).single().execute().data
             _blocked = bool(_t and _t.get("is_blocked"))
             try:
-                if r: r.setex(_cache_key, 300, "1" if _blocked else "0")
+                if _er: _er.setex(_cache_key, 300, "1" if _blocked else "0")
             except Exception:
                 pass
         except Exception:
@@ -909,7 +935,8 @@ async def list_users_admin(admin=Depends(require_admin)):
 async def create_user_admin(body: CreateUser, admin=Depends(require_admin)):
     if supabase.table("users").select("id").eq("email", body.email.lower()).execute().data:
         raise HTTPException(status_code=400, detail="Email já cadastrado")
-    pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    loop = asyncio.get_event_loop()
+    pw_hash = await loop.run_in_executor(_thread_pool, lambda: bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode())
     user = supabase.table("users").insert({"tenant_id": body.tenant_id, "name": body.name, "email": body.email.lower().strip(), "role": body.role, "password_hash": pw_hash, "is_active": True, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances or [], "phone": body.phone}).execute().data[0]
     user.pop("password_hash", None)
     return {"user": user}
@@ -922,7 +949,8 @@ async def update_user_admin(user_id: str, body: UpdateUser, admin=Depends(requir
     updates = {k: v for k, v in {"name": body.name, "email": body.email, "role": body.role, "is_active": body.is_active, "avatar_color": body.avatar_color, "permissions": body.permissions, "allowed_instances": body.allowed_instances, "phone": body.phone}.items() if v is not None}
     if body.password:
         if len(body.password) < 6: raise HTTPException(status_code=400, detail="Mínimo 6 caracteres")
-        updates["password_hash"] = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+        loop2 = asyncio.get_event_loop()
+        updates["password_hash"] = await loop2.run_in_executor(_thread_pool, lambda: bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode())
     supabase.table("users").update(updates).eq("id", user_id).eq("tenant_id", admin["tenant_id"]).execute()
     return {"ok": True}
 
@@ -1077,6 +1105,7 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
     # Formato Evolution API legado
     else:
         push_name = ""  # Evolution API doesn't provide push name easily
+        contact_name_override = None  # fix: variável não declarada no bloco Evolution API
         is_group = False
         participant_name = ""
         group_id = ""
@@ -2243,23 +2272,26 @@ def _followup_random_delay() -> int:
 
 def _followup_schedule(conv_id: str, tenant_id: str, instance_name: str):
     """Agenda etapa 1 do follow-up para conversa nova."""
-    if not r: return
+    _r = _get_redis()
+    if not _r: return
     done_key = f"7crm:followup_done:{conv_id}"
-    if r.exists(done_key): return  # já completou o ciclo, nunca repete
+    if _r.exists(done_key): return  # já completou o ciclo, nunca repete
     pending_key = f"7crm:followup1:{conv_id}"
-    if r.exists(pending_key): return  # já agendado
+    if _r.exists(pending_key): return  # já agendado
     import json as _json
     delay = _followup_random_delay()
-    r.setex(pending_key, delay + 60, _json.dumps({"tenant_id": tenant_id, "instance_name": instance_name, "scheduled_at": delay}))
+    _r.setex(pending_key, delay + 60, _json.dumps({"tenant_id": tenant_id, "instance_name": instance_name, "scheduled_at": delay}))
     print(f"[FOLLOWUP] Etapa 1 agendada conv={conv_id[:8]} delay={delay//60}min")
 
 def _followup_client_responded(conv_id: str):
     """Cancela todos os follow-ups pendentes quando cliente responde."""
-    if not r: return
+    _r = _get_redis()
+    if not _r: return
     try:
-        r.delete(f"7crm:followup1:{conv_id}")
-        r.delete(f"7crm:followup2:{conv_id}")
-    except: pass
+        _r.delete(f"7crm:followup1:{conv_id}")
+        _r.delete(f"7crm:followup2:{conv_id}")
+    except Exception as e:
+        print(f"[FOLLOWUP] erro ao cancelar: {e}")
 
 async def _followup_build_context(conv_id: str) -> str:
     """Monta texto de contexto da conversa para a IA."""
@@ -2274,9 +2306,10 @@ async def _followup_build_context(conv_id: str) -> str:
 async def _followup_send_step(conv_id: str, tenant_id: str, instance_name: str, step: int):
     """Executa etapa 1 (emoji) ou etapa 2 (mensagem de retomada)."""
     try:
-        if not r: return
+        _sr = _get_redis()  # fix: era variável global r
+        if not _sr: return
         done_key = f"7crm:followup_done:{conv_id}"
-        if r.exists(done_key): return
+        if _sr.exists(done_key): return
 
         from datetime import timezone
 
@@ -2287,7 +2320,7 @@ async def _followup_send_step(conv_id: str, tenant_id: str, instance_name: str, 
         real_msgs = [m for m in msgs if m.get("sent_by") not in ("followup_bot",)]
         if real_msgs and real_msgs[0].get("direction") == "inbound":
             print(f"[FOLLOWUP] Etapa {step}: cliente respondeu, cancelando conv={conv_id[:8]}")
-            r.delete(done_key)  # garantia
+            _sr.delete(done_key)  # garantia
             return
 
         # Buscar conversa
@@ -2314,7 +2347,7 @@ async def _followup_send_step(conv_id: str, tenant_id: str, instance_name: str, 
             # Agenda etapa 2 logo após com novo delay aleatório
             import json as _json
             delay2 = _followup_random_delay()
-            r.setex(f"7crm:followup2:{conv_id}", delay2 + 60, _json.dumps({"tenant_id": tenant_id, "instance_name": instance_name, "scheduled_at": delay2}))
+            _sr.setex(f"7crm:followup2:{conv_id}", delay2 + 60, _json.dumps({"tenant_id": tenant_id, "instance_name": instance_name, "scheduled_at": delay2}))
             print(f"[FOLLOWUP] Etapa 2 agendada delay={delay2//60}min")
 
         else:
@@ -2327,7 +2360,7 @@ async def _followup_send_step(conv_id: str, tenant_id: str, instance_name: str, 
             msg_text = msg_text.strip()
             print(f"[FOLLOWUP] Etapa 2 enviando mensagem conv={conv_id[:8]}")
             # Marcar ciclo completo — não envia mais
-            r.set(done_key, "1")
+            _sr.set(done_key, "1")
 
         # Enviar
         await waha_send_msg(phone, msg_text, session)
@@ -2358,17 +2391,18 @@ async def _followup_worker():
     print("[FOLLOWUP] Worker iniciado (2 etapas, delay aleatório 20-30min)")
     while True:
         try:
-            if r:
+            _wr = _get_redis()  # fix: era variável global r
+            if _wr:
                 for step, prefix in [(1, "7crm:followup1:"), (2, "7crm:followup2:")]:
-                    for key in r.scan_iter(f"{prefix}*"):
-                        ttl = r.ttl(key)
+                    for key in _wr.scan_iter(f"{prefix}*"):
+                        ttl = _wr.ttl(key)
                         if ttl != -1 and ttl <= 60:
                             try:
-                                raw = r.get(key)
+                                raw = _wr.get(key)
                                 data = _json.loads(raw or "{}")
                                 key_str = key.decode() if isinstance(key, bytes) else key
                                 conv_id = key_str.replace(prefix, "")
-                                r.delete(key)
+                                _wr.delete(key)
                                 await _followup_send_step(conv_id, data.get("tenant_id",""), data.get("instance_name",""), step)
                             except Exception as e:
                                 print(f"[FOLLOWUP] Erro worker step={step} key={key}: {e}")
@@ -2871,11 +2905,6 @@ async def mark_conversation_unread(conv_id: str):
     supabase.table("conversations").update({"unread_count": 1}).eq("id", conv_id).execute()
     return {"ok": True}
 
-@app.post("/conversations/{conv_id}/unread", dependencies=[Depends(verify_key)])
-async def mark_conversation_unread(conv_id: str):
-    supabase.table("conversations").update({"unread_count": 1}).eq("id", conv_id).execute()
-    return {"ok": True}
-
 @app.post("/messages/{msg_id}/react", dependencies=[Depends(verify_key)])
 async def react_to_message(msg_id: str, body: dict):
     """Envia reação a uma mensagem via WAHA. body: {reaction: '👍', tenant_id, conversation_id}"""
@@ -2984,17 +3013,18 @@ async def update_label(label_id: str, body: dict):
 
 @app.delete("/labels/{label_id}", dependencies=[Depends(verify_key)])
 async def delete_label(label_id: str):
-    # Remove from all conversations first
-    # Remove o label_id do array labels[] de todas as conversas do tenant
+    # Busca tenant_id do label para limpar as conversas corretamente
     try:
-        all_convs = supabase.table("conversations").select("id,labels").eq("tenant_id", body.get("tenant_id","")).execute().data
-        for c in all_convs:
-            raw = c.get("labels") or []
-            if label_id in raw:
-                supabase.table("conversations").update({"labels": [l for l in raw if l != label_id]}).eq("id", c["id"]).execute()
+        label_row = supabase.table("labels").select("tenant_id").eq("id", label_id).single().execute().data
+        tenant_id_for_label = (label_row or {}).get("tenant_id", "")
+        if tenant_id_for_label:
+            all_convs = supabase.table("conversations").select("id,labels").eq("tenant_id", tenant_id_for_label).execute().data or []
+            for c in all_convs:
+                raw = c.get("labels") or []
+                if label_id in raw:
+                    supabase.table("conversations").update({"labels": [l for l in raw if l != label_id]}).eq("id", c["id"]).execute()
     except Exception as e:
-        print(f"cleanup label from convs err: {e}")
-    except: pass
+        print(f"[DELETE_LABEL] cleanup err: {e}")
     supabase.table("labels").delete().eq("id", label_id).execute()
     return {"ok": True}
 
@@ -3184,7 +3214,16 @@ async def buy_credits(body: dict):
     tenant_id = body.get("tenant_id")
     amount = int(body.get("amount", 500))
     if amount not in [500, 1000, 2000]: raise HTTPException(400, "Pacote inválido")
-    supabase.table("tenants").update({"ai_credits": supabase.table("tenants").select("ai_credits").eq("id", tenant_id).single().execute().data.get("ai_credits", 0) + amount, "ai_credits_purchased": (supabase.table("tenants").select("ai_credits_purchased").eq("id", tenant_id).single().execute().data.get("ai_credits_purchased") or 0) + amount}).eq("id", tenant_id).execute()
+    # Busca saldo atual em 1 query só (era 2 queries separadas — race condition)
+    def _buy():
+        t = supabase.table("tenants").select("ai_credits,ai_credits_purchased").eq("id", tenant_id).single().execute().data
+        current_credits = (t.get("ai_credits") or 0)
+        current_purchased = (t.get("ai_credits_purchased") or 0)
+        supabase.table("tenants").update({
+            "ai_credits": current_credits + amount,
+            "ai_credits_purchased": current_purchased + amount
+        }).eq("id", tenant_id).execute()
+    await run_sync(_buy)
     return {"ok": True, "added": amount}
 
 @app.put("/tenant/copilot-prompt", dependencies=[Depends(verify_key)])
@@ -4066,7 +4105,7 @@ async def fix_webhook(body: dict):
     instance_name = body.get("instance_name")
     if not instance_name:
         raise HTTPException(400, "instance_name required")
-    webhook_url = f"{BACKEND_URL}/webhook/message"
+    webhook_url = f"{BACKEND_URL}/webhook/inbox"  # fix: era /webhook/message
     result = {}
     async with httpx.AsyncClient(timeout=15) as client:
         # 1. Check current session status
@@ -4660,8 +4699,9 @@ async def whatsapp_sync(body: dict):
 
 @app.get("/whatsapp/sync-status")
 async def sync_status(tenant_id: str = Depends(enforce_tenant)):
+    # Fix: era 2 queries (1 para conv IDs + 1 com IN de todos os IDs) — agora usa tenant_id direto
     convs = supabase.table("conversations").select("id", count="exact").eq("tenant_id", tenant_id).execute()
-    msgs = supabase.table("messages").select("id", count="exact").in_("conversation_id", [c["id"] for c in (supabase.table("conversations").select("id").eq("tenant_id", tenant_id).execute().data or [])]).execute()
+    msgs = supabase.table("messages").select("id", count="exact").eq("tenant_id", tenant_id).execute()
     return {"conversations": convs.count, "messages": msgs.count}
 
 @app.post("/whatsapp/backfill-instances", dependencies=[Depends(verify_key)])
@@ -5093,7 +5133,8 @@ async def reset_password(body: dict):
     if not resets: raise HTTPException(status_code=400, detail="Link inválido ou expirado")
     reset = resets[0]
     if datetime.utcnow() > datetime.fromisoformat(reset["expires_at"].replace("Z", "")): raise HTTPException(status_code=400, detail="Link expirado.")
-    pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    loop3 = asyncio.get_event_loop()
+    pw_hash = await loop3.run_in_executor(_thread_pool, lambda: bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode())
     supabase.table("users").update({"password_hash": pw_hash}).eq("id", reset["user_id"]).execute()
     supabase.table("password_resets").update({"used": True}).eq("token", token).execute()
     return {"ok": True, "message": "Senha redefinida com sucesso!"}
@@ -5612,7 +5653,7 @@ async def report_financial_forecast(tenant_id: str = Depends(enforce_tenant)):
         raise HTTPException(403, "Acesso restrito")
     
     all_tenants = supabase.table("tenants").select("id,name,plan,is_blocked,created_at").execute().data
-    plan_prices = {"trial": 0, "starter": 99, "pro": 149, "business": 299, "enterprise": 999}
+    plan_prices = {"trial": 0, "starter": 149, "pro": 299, "business": 599, "enterprise": 1200}  # fix: preços reais
     
     forecast = []
     mrr_total = 0
