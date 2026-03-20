@@ -1013,6 +1013,8 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
         else:
             raw_from = data.get("from", "")
         if "broadcast" in raw_from.lower(): return {"ok": True}  # ignora broadcast
+        if "status@broadcast" in raw_from.lower(): return {"ok": True}  # ignora status do WhatsApp
+        if raw_from.startswith("status@") or raw_from.endswith("@broadcast"): return {"ok": True}  # ignora status
 
         # Detecta se é grupo
         is_group = "@g.us" in raw_from or "@g." in raw_from
