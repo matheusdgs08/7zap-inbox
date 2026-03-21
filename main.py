@@ -1,6 +1,9 @@
 import asyncio
 import random
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body, UploadFile, File, Form, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import concurrent.futures
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
@@ -55,7 +58,7 @@ def cache_set(key, data, ttl=30):
         try:
             import pickle
             r.setex(f"7crm:{key}", ttl, pickle.dumps(data))
-        except: pass
+        except: pass  # redis indisponível — fallback em memória
     _cache[key] = {"data": data, "ts": datetime.utcnow().timestamp(), "ttl": ttl}
 
 def cache_del(key):
@@ -171,6 +174,11 @@ import httpx, os, jwt, bcrypt, asyncio, random, base64, json, secrets as _secret
 from datetime import datetime, timedelta
 
 app = FastAPI(title="7CRM API", version="1.0.0")
+
+# Rate limiting — protege endpoints de auth contra brute force e abuso
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware,
     allow_origins=[
         "https://7crm.com.br",
@@ -897,7 +905,8 @@ class ScheduledMessageCreate(BaseModel):
 
 # ── AUTH ─────────────────────────────────────────────────
 @app.post("/auth/login")
-async def login(body: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest):
     users = supabase.table("users").select("*").eq("email", body.email.lower().strip()).eq("is_active", True).execute().data
     if not users: raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     user = users[0]
@@ -1217,7 +1226,7 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                                     name = d.get("pushname") or d.get("name") or ""
                                     if name and not name.replace("+","").replace(" ","").replace("-","").isdigit():
                                         supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
-                        except: pass
+                        except Exception as _e: pass  # TODO: add logging if needed
                     asyncio.create_task(_update_name())
             else:
                 # Create contact with phone as placeholder name
@@ -1257,7 +1266,7 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                                     supabase.table("contacts").update({"name": name}).eq("id", contact_id).execute()
                                     return
                         # Fallback: try push_name from the webhook payload itself (passed via closure)
-                    except: pass
+                    except Exception as _e: pass  # TODO: add logging if needed
                 asyncio.create_task(_fetch_name())
             # Get most recent open conversation for this contact+instance (avoid cross-instance contamination)
             conv_query = supabase.table("conversations").select("id,unread_count").eq("contact_id", contact_id).neq("status", "resolved").order("created_at", desc=True)
@@ -1417,9 +1426,9 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                                     url = d.get("eurl") or d.get("url") or d.get("profilePictureUrl") or d.get("profilePictureURL")
                                     if url:
                                         supabase.table("contacts").update({"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}).eq("id", cid).execute()
-                        except: pass
+                        except Exception as _e: pass  # TODO: add logging if needed
                     asyncio.create_task(_sync_pic())
-            except: pass
+            except Exception as _e: pass  # TODO: add logging if needed
             # Invalida cache para forçar reload no frontend
             cache_del(f"msgs:{conv_id}:latest")  # Força reload imediato no próximo poll (3s)
             # Bust ALL conversation cache keys for this tenant (including per-user keys)
@@ -1429,7 +1438,7 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                 if r:
                     for k in r.scan_iter(f"7crm:convs:{tid}:*"):
                         r.delete(k)
-            except: pass
+            except Exception as _ecb: print(f"[CACHE_BUST] erro: {_ecb}")
             # Also bust in-memory cache for all known variants
             keys_to_del = [k for k in list(_cache.keys()) if k.startswith(f"convs:{tid}:")]
             for k in keys_to_del:
@@ -1444,7 +1453,7 @@ async def receive_message(payload: dict, bg: BackgroundTasks, x_api_key: str = H
                 # ── FOLLOW-UP: cancela pendentes se cliente respondeu ──
                 try:
                     _followup_client_responded(conv_id)
-                except: pass
+                except Exception as _e: pass  # TODO: add logging if needed
 
         return {"ok": True}
     except Exception as e:
@@ -1542,7 +1551,7 @@ async def full_diagnostics(tenant_id: str):
             try:
                 rows = supabase.table("conversations").select("last_message_at").eq("tenant_id", tenant_id).eq("instance_name", name).order("last_message_at", desc=True).limit(1).execute().data
                 last_msg = rows[0]["last_message_at"] if rows else None
-            except: pass
+            except Exception as _e: pass  # TODO: add logging if needed
             diag["waha"]["sessions"].append({
                 "name": name,
                 "phone": (s.get("me") or {}).get("id","").replace("@c.us",""),
@@ -1717,10 +1726,10 @@ async def delete_conversation(conv_id: str):
     """Delete a conversation and all its messages/tasks."""
     try:
         supabase.table("tasks").delete().eq("conversation_id", conv_id).execute()
-    except: pass
+    except Exception as _e: pass  # TODO: add logging if needed
     try:
         supabase.table("messages").delete().eq("conversation_id", conv_id).execute()
-    except: pass
+    except Exception as _e: pass  # TODO: add logging if needed
     supabase.table("conversations").delete().eq("id", conv_id).execute()
     return {"ok": True}
 
@@ -1768,7 +1777,7 @@ async def get_messages(
         try:
             data = q.order("created_at", desc=True).limit(limit).execute().data
             try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
-            except: pass
+            except Exception as _e: pass  # TODO: add logging if needed
             return list(reversed(data))
         except Exception as e:
             print(f"[MESSAGES] DB error for {conv_id}: {e}")
@@ -1861,7 +1870,7 @@ async def get_history(conv_id: str, limit: int = 50):
         db_msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at", desc=True).limit(limit).execute().data or []
         db_msgs = list(reversed(db_msgs))
         try: supabase.table("conversations").update({"unread_count": 0}).eq("id", conv_id).execute()
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
         return db_msgs
 
     msgs = await run_sync(_fetch_db)
@@ -1932,7 +1941,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
             def _save():
                 for i in range(0, len(to_insert), 50):
                     try: supabase.table("messages").insert(to_insert[i:i+50]).execute()
-                    except: pass
+                    except Exception as _e: pass  # TODO: add logging if needed
                 # Update last_message_preview with the most recent message
                 try:
                     last = sorted(to_insert, key=lambda m: m.get("created_at",""))[-1]
@@ -1941,7 +1950,7 @@ async def _waha_sync_chat_bg(conv_id: str, limit: int = 50):
                         "last_message_preview": preview,
                         "last_message_at": last.get("created_at")
                     }).eq("id", conv_id).execute()
-                except: pass
+                except Exception as _e: pass  # TODO: add logging if needed
             await run_sync(_save)
             # Invalidate cache so next poll picks up new messages
             cache_del(f"msgs:{conv_id}:latest")
@@ -2202,7 +2211,7 @@ async def _watchguard_reply(conv_id: str, tenant_id: str, instance_name: str, in
                     if secs_since < 180:
                         print(f"[WATCHGUARD] Outbound recente ({secs_since:.0f}s) — abortando para evitar duplo")
                         return
-                except: pass
+                except Exception as _e: pass  # TODO: add logging if needed
 
         history_lines = []
         for m in all_msgs[-(40):]:
@@ -2458,13 +2467,13 @@ async def _auto_pilot_watcher_no_redis(conv_id: str, tenant_id: str, instance_na
             break
         # Limpa flag
         try: delattr(_autopilot_debounce_trigger_async, lock_key_mem)
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
         # Delega para o watcher principal
         await _auto_pilot_watcher(conv_id, tenant_id, instance_name)
     except Exception as e:
         print(f"[AUTOPILOT/NoRedis] Erro: {e}")
         try: delattr(_autopilot_debounce_trigger_async, lock_key_mem)
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
 
 
 def _autopilot_debounce_trigger(conv_id: str, tenant_id: str, instance_name: str):
@@ -2725,7 +2734,7 @@ REGRAS:
                     await _tc.post(f"{WAHA_URL}/api/startTyping",
                         headers=waha_headers(),
                         json={"session": instance_name, "chatId": chat_id_t})
-            except: pass
+            except Exception as _e: pass  # TODO: add logging if needed
         await asyncio.sleep(typing_delay)
         # Para o indicador de digitação
         if phone_for_typing and instance_name:
@@ -2734,7 +2743,7 @@ REGRAS:
                     await _tc.post(f"{WAHA_URL}/api/stopTyping",
                         headers=waha_headers(),
                         json={"session": instance_name, "chatId": chat_id_t})
-            except: pass
+            except Exception as _e: pass  # TODO: add logging if needed
 
         # ── Fase 6: envia via WAHA primeiro, salva no banco só se OK ────────────
         phone = (conv.get("contacts") or {}).get("phone", "")
@@ -2789,7 +2798,7 @@ REGRAS:
             if _rf:
                 _rf.delete(lock_key)
                 _rf.delete(deadline_key)
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
 
 
 async def waha_send_msg(phone: str, text: str, session: str = "default"):
@@ -2958,7 +2967,7 @@ async def update_conversation_labels(conv_id: str, body: UpdateLabels, user=Depe
     # Invalidar cache
     for key in [f"convs:{conv_id}", "convs:*"]:
         try: cache_del(key)
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
     # Sync label names to contact.tags so label follows the phone number
     try:
         conv = supabase.table("conversations").select("contact_id").eq("id", conv_id).single().execute().data
@@ -3085,7 +3094,7 @@ async def get_profile_picture(phone: str, instance: str = "default"):
                     try:
                         clean = "".join(c for c in phone if c.isdigit())
                         supabase.table("contacts").update({"profile_picture_url": url, "last_sync_at": datetime.utcnow().isoformat()}).eq("phone", clean).execute()
-                    except: pass
+                    except Exception as _e: pass  # TODO: add logging if needed
                 return {"url": url}
     except Exception as e:
         print(f"[profile_picture] erro {phone}: {e}")
@@ -3418,7 +3427,7 @@ async def whatsapp_tenant_instances(tenant_id: str = Depends(enforce_tenant)):
                     me = data.get("me") or {}
                     phone = me.get("id","").replace("@c.us","").replace("@s.whatsapp.net","")
                     return {**inst, "connected": connected, "phone": phone or inst.get("phone", "")}
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
         return {**inst, "connected": False, "phone": inst.get("phone", "")}
 
     # Fetch all instances IN PARALLEL
@@ -3482,7 +3491,7 @@ async def whatsapp_delete_instance(body: dict):
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.delete(f"{WAHA_URL}/api/sessions/{inst_name}", headers=waha_headers())
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
 
     # 2. Cascata: apagar conversas/mensagens vinculadas a esta instância
     if delete_history and tenant_id:
@@ -3495,7 +3504,7 @@ async def whatsapp_delete_instance(body: dict):
                 try: supabase.table("messages").delete().in_("conversation_id", conv_ids).execute()
                 except Exception as e: print(f"delete messages err: {e}")
                 # labels agora são array na tabela conversations — não há conversation_labels
-                except Exception: pass
+                except Exception as _e3: print(f"[DELETE_INSTANCE] tasks err: {_e3}")
                 try: supabase.table("conversations").delete().in_("id", conv_ids).execute()
                 except Exception as e: print(f"delete convs err: {e}")
         await run_sync(_cascade)
@@ -3727,7 +3736,7 @@ async def run_broadcast(broadcast_id: str, interval_min: int, interval_max: int)
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(f"{WAHA_URL}/api/sendText", headers=waha_headers(), json={"session": instance_name, "chatId": f"{rec['phone']}@c.us", "text": msg})
                 ok = r.status_code in [200, 201]
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
         supabase.table("broadcast_recipients").update({"status": "sent" if ok else "failed", "sent_at": datetime.utcnow().isoformat() if ok else None, "sent_message": msg}).eq("id", rec["id"]).execute()
         if ok: sent += 1
         else: failed += 1
@@ -4291,7 +4300,7 @@ async def _deep_sync_progressive(tenant_id: str, instance: str):
                             _gr = await _gc.get(f"{WAHA_URL}/api/{instance}/groups/{phone}", headers=waha_headers())
                             if _gr.status_code == 200 and _gr.text.strip():
                                 name = _gr.json().get("subject", "") or ""
-                    except: pass
+                    except Exception as _e: pass  # TODO: add logging if needed
                 if not name:
                     name = phone
 
@@ -4587,7 +4596,7 @@ async def whatsapp_sync(body: dict):
                             _gr = await _gc.get(f"{WAHA_URL}/api/{instance}/groups/{phone}", headers=waha_headers())
                             if _gr.status_code == 200 and _gr.text.strip():
                                 name = _gr.json().get("subject", "") or ""
-                    except: pass
+                    except Exception as _e: pass  # TODO: add logging if needed
                 if not name: name = phone
 
                 # Upsert contact — always update name if it came from WhatsApp
@@ -4691,7 +4700,7 @@ async def whatsapp_sync(body: dict):
                         try:
                             supabase.table("messages").insert(chunk).execute()
                             stats["messages_saved"] += len(chunk)
-                        except: pass
+                        except Exception as _e: pass  # TODO: add logging if needed
 
             except: stats["skipped"] += 1; continue
 
@@ -4869,7 +4878,7 @@ async def deep_sync(body: dict):
                         def _insert(rows=to_insert):
                             for i in range(0, len(rows), 50):
                                 try: supabase.table("messages").insert(rows[i:i+50]).execute()
-                                except: pass
+                                except Exception as _e: pass  # TODO: add logging if needed
                         await run_sync(_insert)
                         stats["messages_saved"] += len(to_insert)
                         total_for_chat += len(to_insert)
@@ -4894,7 +4903,7 @@ async def deep_sync(body: dict):
                             "last_message_at": last_msg[0]["created_at"],
                             "last_message_preview": last_msg[0]["content"][:100]
                         }).eq("id", conv_id).execute()
-                except: pass
+                except Exception as _e: pass  # TODO: add logging if needed
 
     return {"ok": True, "stats": stats}
 
@@ -4995,7 +5004,7 @@ async def resolve_lids(body: dict):
             def _merge(kid=keep_id, mid=merge_id):
                 supabase.table("messages").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
                 try: supabase.table("tasks").update({"conversation_id": kid}).eq("conversation_id", mid).execute()
-                except: pass
+                except Exception as _e: pass  # TODO: add logging if needed
                 supabase.table("conversations").delete().eq("id", mid).execute()
             await run_sync(_merge)
             stats["duplicates_merged"] += 1
@@ -5010,7 +5019,8 @@ async def resolve_lids(body: dict):
 
 # ── AUTH — Recuperação de Senha ───────────────────────────
 @app.post("/auth/forgot-password")
-async def forgot_password(body: dict):
+@limiter.limit("5/minute")
+async def forgot_password(request: Request, body: dict):
     email = (body.get("email") or "").lower().strip()
     if not email: raise HTTPException(status_code=400, detail="Email obrigatório")
     users = supabase.table("users").select("id,name,email,tenant_id").eq("email", email).eq("is_active", True).execute().data
@@ -5035,11 +5045,12 @@ async def forgot_password(body: dict):
             with smtplib.SMTP_SSL(SMTP_HOST, 465) as smtp:
                 smtp.login(SMTP_USER, SMTP_PASS); smtp.sendmail(SMTP_USER, user["email"], msg.as_string())
             email_sent = True
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
     return {"ok": True, "message": "Se o email existir, você receberá as instruções.", "reset_url": reset_url if not email_sent else None, "email_sent": email_sent}
 
 @app.post("/auth/forgot-password-whatsapp")
-async def forgot_password_whatsapp(body: dict):
+@limiter.limit("5/minute")
+async def forgot_password_whatsapp(request: Request, body: dict):
     """
     Recuperação de senha via WhatsApp.
     O usuário informa o telefone cadastrado na conta e recebemos o link via WhatsApp.
@@ -5178,7 +5189,8 @@ async def register_with_invite(body: dict):
     return {"ok": True, "user": user, "message": "Conta criada com sucesso!"}
 
 @app.post("/auth/register-trial")
-async def register_trial(body: dict):
+@limiter.limit("3/hour")
+async def register_trial(request: Request, body: dict):
     """
     Auto-cadastro — cria tenant + admin sem convite.
     Plano: trial (7 dias). Bloqueado após expirar.
@@ -5484,7 +5496,7 @@ async def report_messages(tenant_id: str = Depends(enforce_tenant), days: int = 
             by_weekday[str(dt.weekday())] = by_weekday.get(str(dt.weekday()), 0) + 1
             if m["direction"] == "inbound": inbound += 1
             else: outbound += 1
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
     
     by_day_list = [{"date": k, "count": v} for k,v in sorted(by_day.items())]
     by_hour_list = [{"hour": int(k), "count": v} for k,v in sorted(by_hour.items(), key=lambda x: int(x[0]))]
@@ -5629,7 +5641,7 @@ async def report_credits(tenant_id: str = Depends(enforce_tenant), days: int = 3
         try:
             day = datetime.fromisoformat(m["created_at"].replace("Z","").replace("+00:00","")).strftime("%Y-%m-%d")
             by_day[day] = by_day.get(day, 0) + 1
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
     
     tenant_data = supabase.table("tenants").select("ai_credits,ai_credits_reset_at,plan").eq("id", tenant_id).single().execute().data
     credits_remaining, plan, limit = get_tenant_credits(tenant_id)
@@ -5880,7 +5892,7 @@ async def get_conv_auto_mode(conv_id: str):
     ttl = 0
     if paused and r:
         try: ttl = r.ttl(f"7crm:ap_pause:{conv_id}")
-        except: pass
+        except Exception as _e: pass  # TODO: add logging if needed
     return {
         "copilot_auto_mode": conv.get("copilot_auto_mode"),
         "paused_by_agent": paused,
